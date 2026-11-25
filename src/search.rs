@@ -6,6 +6,8 @@ struct Evidence {
     direct: f64,
     weak: f64,
     necessity: f64,
+    query_hits: usize,
+    context_hits: usize,
     reasons: Vec<String>,
 }
 
@@ -75,23 +77,43 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         reasons.extend(weak_reasons);
         reasons.sort();
         reasons.dedup();
+
+        let name_lower = skill.name.to_lowercase();
+        let description_lower = skill.description.to_lowercase();
+        let query_hits = query
+            .split_whitespace()
+            .filter(|term| term.len() >= 2)
+            .filter(|term| name_lower.contains(*term) || description_lower.contains(*term))
+            .count();
+        let context_hits = context
+            .split_whitespace()
+            .filter(|term| term.len() >= 2)
+            .filter(|term| description_lower.contains(*term))
+            .count();
+
         infos[index] = Some(Evidence {
             direct,
             weak,
             necessity: 0.0,
+            query_hits,
+            context_hits,
             reasons,
         });
     }
 
     // Admission is structural, not score-based:
-    // - direct relevance admits a skill;
+    // - query relevance (name/description) or at least two independent context
+    //   description matches admits a skill;
     // - an explicit `requires` declaration admits its dependency when the
     //   declaring skill is admitted (necessity, one hop only);
-    // - Markdown links, mentions, and backlinks never admit a skill.
+    // - Markdown links, mentions, body text, and backlinks never admit a skill.
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
     for (index, info) in infos.iter().enumerate() {
-        if info.as_ref().is_some_and(|e| e.direct > 0.0) {
+        if info
+            .as_ref()
+            .is_some_and(|e| e.query_hits > 0 || e.context_hits >= 2)
+        {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
@@ -115,7 +137,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             if graph.skills[target].parse_error.is_some() {
                 continue;
             }
-            let is_seed = infos[target].as_ref().is_some_and(|e| e.direct > 0.0);
+            let is_seed = infos[target]
+                .as_ref()
+                .is_some_and(|e| e.query_hits > 0 || e.context_hits >= 2);
             let entry = admitted.entry(target).or_default();
             entry.push(format!("required by {}", graph.skills[*seed].name));
             if !is_seed && let Some(info) = infos[target].as_mut() {

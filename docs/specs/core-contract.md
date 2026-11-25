@@ -37,7 +37,7 @@
 - 不要な skill を大量に読み込ませない。
 - 推薦処理の障害で通常開発を停止させない。
 - skill の読み込みを成果物品質の保証として扱わない。
-- 推薦 admission は direct relevance（name / description / context と description の一致）または、admitted skill が明示する `requires` 依存に限定する。Markdown link・名前言及・backlink は relatedness evidence であり、単独では推薦しない。body text や link target の一致は ranking を補助する weak evidence とし、admission 根拠にしない。
+- 推薦 admission は direct relevance（query が name / description に一致、または context が description に独立 2 語以上一致）または、admitted skill が明示する `requires` 依存に限定する。Markdown link・名前言及・backlink・body text・link target の一致は relatedness / weak evidence であり、単独では推薦しない。
 
 ## Storage modes
 
