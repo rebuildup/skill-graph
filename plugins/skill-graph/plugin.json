@@ -1,0 +1,13 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "skill-graph",
+  "version": "0.1.0",
+  "description": "Discover installed Agent Skills and recommend relevant skills with evidence for the current task.",
+  "license": "MIT",
+  "keywords": [
+    "agent-skills",
+    "skill-discovery",
+    "recommendation"
+  ],
+  "repository": "https://github.com/rebuildup/skill-graph"
+}
