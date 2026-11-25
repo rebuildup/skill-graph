@@ -1,5 +1,6 @@
 use crate::discovery::{discover, output};
 use crate::eval;
+use crate::perf;
 use crate::resolver::build;
 use crate::search::recommend;
 use clap::{Parser, Subcommand};
@@ -55,6 +56,12 @@ enum Command {
     Bench {
         dataset: PathBuf,
     },
+    Perf {
+        #[arg(long, value_delimiter = ',', default_value = "50,100,200,500")]
+        sizes: Vec<usize>,
+        #[arg(long, default_value_t = 30)]
+        iterations: usize,
+    },
 }
 
 pub fn run() -> Result<(), String> {
@@ -97,6 +104,14 @@ pub fn run() -> Result<(), String> {
         }
         Command::Bench { dataset } => {
             let result = eval::run(&dataset)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        Command::Perf { sizes, iterations } => {
+            let result = perf::run(&sizes, iterations)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?

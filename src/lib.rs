@@ -3,5 +3,6 @@ pub mod discovery;
 pub mod eval;
 pub mod model;
 pub mod parser;
+pub mod perf;
 pub mod resolver;
 pub mod search;
