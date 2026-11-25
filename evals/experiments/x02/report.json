@@ -1,0 +1,2116 @@
+{
+  "cases": [
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill",
+            "gamma-skill"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill",
+            "gamma-skill"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "rust-impl"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "release-notes"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "beta-skill",
+            "alpha-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "tests"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill",
+            "gamma-skill"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "rust-checks"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "release-announcement"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 1,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill",
+            "alpha-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "verification-only"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill",
+            "gamma-skill"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "rust-dependency"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "delta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "delta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "delta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "docs-review"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "ui-component"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "zeta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "zeta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "zeta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "incident-recovery"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "eta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "eta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "eta-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "parallel-worktrees"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        }
+      },
+      "id": "schema-migration-none"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        }
+      },
+      "id": "none"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-release-notes"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        }
+      },
+      "id": "jp-local-edit-none"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "agent-session-recovery"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance",
+            "interaction-discipline"
+          ],
+          "recommended_count": 4,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance",
+            "interaction-discipline"
+          ],
+          "recommended_count": 4,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance",
+            "interaction-discipline"
+          ],
+          "recommended_count": 4,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-agent-session-recovery"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "code-naming-review"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-code-naming"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "pr-review"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "correctness-assurance",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "correctness-assurance",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "correctness-assurance",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "correctness-assurance",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "correctness-assurance",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "correctness-invariants"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline",
+            "system-quality"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline",
+            "system-quality"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 1,
+          "optional_hits": 1,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "design-refinement"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "bug-diagnosis"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "github-delivery-work"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "user-facing-progress"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "japanese-prose"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-natural-japanese"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "reference_added": 0,
+          "required_hits": 0
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "onboarding-docs"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-onboarding"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "policy-evaluation",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "policy-evaluation",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "policy-evaluation",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "policy-evaluation",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "policy-evaluation",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "policy-evaluation"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "correctness-assurance"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "correctness-assurance",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "correctness-assurance",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "quality-gate"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-quality-gate"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 4,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "security-maintenance"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "skill-selection",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "skill-selection",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "skill-selection",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "skill-selection",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "skill-selection",
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "skill-selection"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "system-quality",
+            "design-refinement",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "system-quality",
+            "code-naming"
+          ],
+          "recommended_count": 2,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "system-quality",
+            "design-refinement",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "system-quality",
+            "design-refinement",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "system-quality"
+    },
+    {
+      "arms": {
+        "baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_plus_reference": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "compact_start": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "reference_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        },
+        "requires_from_baseline": {
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "reference_added": 0,
+          "required_hits": 1
+        }
+      },
+      "id": "writing-discipline"
+    }
+  ],
+  "summary": {
+    "baseline": {
+      "cases": 36,
+      "empty_recommendations": 3,
+      "forbidden_hits": 0,
+      "optional_hits": 14,
+      "optional_total": 21,
+      "precision_acceptable": 0.8703703703703703,
+      "precision_required": 0.6111111111111112,
+      "recommended_total": 54,
+      "reference_added": 0,
+      "required_hits": 33,
+      "required_recall": 1.0,
+      "required_total": 33
+    },
+    "compact_plus_reference": {
+      "cases": 36,
+      "empty_recommendations": 11,
+      "forbidden_hits": 2,
+      "optional_hits": 10,
+      "optional_total": 21,
+      "precision_acceptable": 0.7142857142857143,
+      "precision_required": 0.5102040816326531,
+      "recommended_total": 49,
+      "reference_added": 8,
+      "required_hits": 25,
+      "required_recall": 0.7575757575757576,
+      "required_total": 33
+    },
+    "compact_start": {
+      "cases": 36,
+      "empty_recommendations": 11,
+      "forbidden_hits": 0,
+      "optional_hits": 10,
+      "optional_total": 21,
+      "precision_acceptable": 0.8536585365853658,
+      "precision_required": 0.6097560975609756,
+      "recommended_total": 41,
+      "reference_added": 0,
+      "required_hits": 25,
+      "required_recall": 0.7575757575757576,
+      "required_total": 33
+    },
+    "reference_from_baseline": {
+      "cases": 36,
+      "empty_recommendations": 3,
+      "forbidden_hits": 5,
+      "optional_hits": 15,
+      "optional_total": 21,
+      "precision_acceptable": 0.7272727272727273,
+      "precision_required": 0.5,
+      "recommended_total": 66,
+      "reference_added": 12,
+      "required_hits": 33,
+      "required_recall": 1.0,
+      "required_total": 33
+    },
+    "requires_from_baseline": {
+      "cases": 36,
+      "empty_recommendations": 3,
+      "forbidden_hits": 1,
+      "optional_hits": 14,
+      "optional_total": 21,
+      "precision_acceptable": 0.7704918032786885,
+      "precision_required": 0.5409836065573771,
+      "recommended_total": 61,
+      "reference_added": 7,
+      "required_hits": 33,
+      "required_recall": 1.0,
+      "required_total": 33
+    }
+  }
+}
