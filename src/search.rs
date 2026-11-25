@@ -1,13 +1,14 @@
 use crate::model::{LinkKind, Recommendation};
 use crate::resolver::Graph;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 struct Evidence {
     direct: f64,
     weak: f64,
     necessity: f64,
-    query_hits: usize,
-    context_hits: usize,
+    name_hits: Vec<(String, usize)>,
+    description_hits: Vec<(String, usize)>,
+    context_hits: Vec<(String, usize)>,
     reasons: Vec<String>,
 }
 
@@ -18,6 +19,25 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         return Vec::new();
     }
 
+    let query_terms = terms(&query);
+    let context_terms = terms(&context);
+    let skill_names: Vec<String> = graph
+        .skills
+        .iter()
+        .map(|skill| skill.name.to_lowercase())
+        .collect();
+    let skill_descriptions: Vec<String> = graph
+        .skills
+        .iter()
+        .map(|skill| skill.description.to_lowercase())
+        .collect();
+    let document_frequency = document_frequency(
+        graph,
+        &skill_names,
+        &skill_descriptions,
+        query_terms.iter().chain(context_terms.iter()),
+    );
+
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
 
@@ -25,6 +45,8 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         if skill.parse_error.is_some() {
             continue;
         }
+        let name_lower = &skill_names[index];
+        let description_lower = &skill_descriptions[index];
         let mut direct_reasons = Vec::new();
         let mut weak_reasons = Vec::new();
 
@@ -78,42 +100,62 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         reasons.sort();
         reasons.dedup();
 
-        let name_lower = skill.name.to_lowercase();
-        let description_lower = skill.description.to_lowercase();
-        let query_hits = query
-            .split_whitespace()
-            .filter(|term| term.len() >= 2)
-            .filter(|term| name_lower.contains(*term) || description_lower.contains(*term))
-            .count();
-        let context_hits = context
-            .split_whitespace()
-            .filter(|term| term.len() >= 2)
-            .filter(|term| description_lower.contains(*term))
-            .count();
+        let name_hits = query_terms
+            .iter()
+            .filter(|term| name_lower.contains(term.as_str()))
+            .map(|term| {
+                (
+                    term.clone(),
+                    *document_frequency.get(term).unwrap_or(&usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        let description_hits = query_terms
+            .iter()
+            .filter(|term| description_lower.contains(term.as_str()))
+            .map(|term| {
+                (
+                    term.clone(),
+                    *document_frequency.get(term).unwrap_or(&usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        let context_hits = context_terms
+            .iter()
+            .filter(|term| description_lower.contains(term.as_str()))
+            .map(|term| {
+                (
+                    term.clone(),
+                    *document_frequency.get(term).unwrap_or(&usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
 
         infos[index] = Some(Evidence {
             direct,
             weak,
             necessity: 0.0,
-            query_hits,
+            name_hits,
+            description_hits,
             context_hits,
             reasons,
         });
     }
 
     // Admission is structural, not score-based:
-    // - query relevance (name/description) or at least two independent context
-    //   description matches admits a skill;
+    // - a name hit admits when it is specific enough (multiple name terms or a
+    //   single low-df term of meaningful length);
+    // - description hits admit when at least two independent query terms match
+    //   and at least one is low-df, so generic words in broad descriptions do
+    //   not admit by themselves;
+    // - at least two independent context-term hits in the description admit;
     // - an explicit `requires` declaration admits its dependency when the
     //   declaring skill is admitted (necessity, one hop only);
-    // - Markdown links, mentions, body text, and backlinks never admit a skill.
+    // - Markdown links, mentions, body text, and backlinks never admit.
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
     for (index, info) in infos.iter().enumerate() {
-        if info
-            .as_ref()
-            .is_some_and(|e| e.query_hits > 0 || e.context_hits >= 2)
-        {
+        if info.as_ref().is_some_and(directly_admitted) {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
@@ -137,9 +179,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             if graph.skills[target].parse_error.is_some() {
                 continue;
             }
-            let is_seed = infos[target]
-                .as_ref()
-                .is_some_and(|e| e.query_hits > 0 || e.context_hits >= 2);
+            let is_seed = infos[target].as_ref().is_some_and(directly_admitted);
             let entry = admitted.entry(target).or_default();
             entry.push(format!("required by {}", graph.skills[*seed].name));
             if !is_seed && let Some(info) = infos[target].as_mut() {
@@ -180,6 +220,44 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     out
 }
 
+fn directly_admitted(info: &Evidence) -> bool {
+    let unique_name_hit =
+        info.name_hits.len() == 1 && info.name_hits[0].1 == 1 && info.name_hits[0].0.len() >= 4;
+    let multiple_name_hits =
+        info.name_hits.len() >= 2 && info.name_hits.iter().any(|(_, df)| *df == 1);
+    let description_admitted =
+        info.description_hits.len() >= 2 && info.description_hits.iter().any(|(_, df)| *df == 1);
+    let context_admitted = info.context_hits.len() >= 2;
+    unique_name_hit || multiple_name_hits || description_admitted || context_admitted
+}
+
+fn document_frequency<'a>(
+    graph: &Graph,
+    skill_names: &[String],
+    skill_descriptions: &[String],
+    terms: impl Iterator<Item = &'a String>,
+) -> HashMap<String, usize> {
+    let mut unique = HashSet::new();
+    for term in terms {
+        unique.insert(term.as_str());
+    }
+    let mut frequencies = HashMap::new();
+    for term in unique {
+        let count = graph
+            .skills
+            .iter()
+            .enumerate()
+            .filter(|(index, skill)| {
+                skill.parse_error.is_none()
+                    && (skill_names[*index].contains(term)
+                        || skill_descriptions[*index].contains(term))
+            })
+            .count();
+        frequencies.insert(term.to_string(), count);
+    }
+    frequencies
+}
+
 fn field_score(
     query: &str,
     field: &str,
@@ -210,4 +288,11 @@ fn field_score(
 
 fn matches_query(query: &str, target: &str) -> bool {
     !query.is_empty() && target.to_lowercase().contains(query)
+}
+
+fn terms(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter(|term| term.len() >= 2)
+        .map(str::to_lowercase)
+        .collect()
 }
