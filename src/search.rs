@@ -31,8 +31,25 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         .iter()
         .map(|skill| skill.description.to_lowercase())
         .collect();
+    // Recommendation identity is the skill name: duplicate installs of the
+    // same skill across roots collapse to one candidate. The representative is
+    // the first copy without a parse error (discovery order is deterministic).
+    let mut rep_of_name: HashMap<&str, usize> = HashMap::new();
+    for (index, skill) in graph.skills.iter().enumerate() {
+        let replace = match rep_of_name.get(skill.name.as_str()) {
+            None => true,
+            Some(&prev) => graph.skills[prev].parse_error.is_some() && skill.parse_error.is_none(),
+        };
+        if replace {
+            rep_of_name.insert(skill.name.as_str(), index);
+        }
+    }
+    let mut candidates: Vec<usize> = rep_of_name.values().copied().collect();
+    candidates.sort_unstable();
+
     let document_frequency = document_frequency(
         graph,
+        &candidates,
         &skill_names,
         &skill_descriptions,
         query_terms.iter().chain(context_terms.iter()),
@@ -41,7 +58,8 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
 
-    for (index, skill) in graph.skills.iter().enumerate() {
+    for &index in &candidates {
+        let skill = &graph.skills[index];
         if skill.parse_error.is_some() {
             continue;
         }
@@ -169,13 +187,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             let Some(name) = &link.resolved_name else {
                 continue;
             };
-            let Some(targets) = graph.by_name.get(name) else {
+            let Some(&target) = rep_of_name.get(name.as_str()) else {
                 continue;
             };
-            if targets.len() != 1 {
-                continue;
-            }
-            let target = targets[0];
             if graph.skills[target].parse_error.is_some() {
                 continue;
             }
@@ -233,6 +247,7 @@ fn directly_admitted(info: &Evidence) -> bool {
 
 fn document_frequency<'a>(
     graph: &Graph,
+    candidates: &[usize],
     skill_names: &[String],
     skill_descriptions: &[String],
     terms: impl Iterator<Item = &'a String>,
@@ -243,14 +258,12 @@ fn document_frequency<'a>(
     }
     let mut frequencies = HashMap::new();
     for term in unique {
-        let count = graph
-            .skills
+        let count = candidates
             .iter()
-            .enumerate()
-            .filter(|(index, skill)| {
-                skill.parse_error.is_none()
-                    && (skill_names[*index].contains(term)
-                        || skill_descriptions[*index].contains(term))
+            .filter(|&&index| {
+                graph.skills[index].parse_error.is_none()
+                    && (skill_names[index].contains(term)
+                        || skill_descriptions[index].contains(term))
             })
             .count();
         frequencies.insert(term.to_string(), count);
