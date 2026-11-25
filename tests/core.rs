@@ -12,7 +12,7 @@ fn fixture_root() -> PathBuf {
 #[test]
 fn discovers_fixture_skills() {
     let discovery = discover(&[fixture_root()]);
-    assert_eq!(discovery.skills.len(), 7);
+    assert_eq!(discovery.skills.len(), 8);
     assert!(discovery.errors.is_empty());
 }
 
@@ -263,4 +263,15 @@ fn ambiguous_names_are_reported_not_uniquified() {
     let graph = build(discover(&[root]));
     assert!(graph.ambiguous_names.contains(&"dup-skill".to_string()));
     assert_eq!(graph.by_name["dup-skill"].len(), 2);
+}
+
+#[test]
+fn cjk_terms_and_keywords_admit_crosslingual_match() {
+    let graph = build(discover(&[fixture_root()]));
+    let recs = recommend(&graph, "不具合報告をトリアージして", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "kappa-skill"),
+        "expected kappa-skill via keywords, got: {:?}",
+        recs.iter().map(|r| &r.skill.name).collect::<Vec<_>>()
+    );
 }

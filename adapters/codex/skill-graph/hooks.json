@@ -1,0 +1,28 @@
+{
+  "description": "skill-graph recommendations for Codex (opt-in).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${SKILL_GRAPH_HOOK_BIN} prompt",
+            "statusMessage": "Recommending skills"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${SKILL_GRAPH_HOOK_BIN} skill-load",
+            "statusMessage": "Resolving skill dependencies"
+          }
+        ]
+      }
+    ]
+  }
+}
