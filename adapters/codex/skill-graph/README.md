@@ -42,12 +42,13 @@ Verified against the Codex hooks documentation (2026-11):
    and trust the new hook definitions (they are recorded against their hash;
    edits require re-trust).
 
-## Known limitations (pending live verification)
+## Verified live (codex-cli 0.171.0, ChatGPT auth)
 
-- Codex skills are invoked via `$name` mention or `/skills`, not necessarily
-  through a `Skill` tool call. The `PostToolUse`/`Skill` matcher may never
-  fire; dependency injection on skill load is unverified for Codex. The
-  `UserPromptSubmit` path is the primary recommendation channel.
+- `UserPromptSubmit` fires; `additionalContext` confirmed in rollout JSONL.
+- Multi-turn via `exec resume` works; ~33ms/hook.
+- `PostToolUse`/`Skill` does NOT fire: Codex has no Skill tool — skills are
+  read via ordinary file/Bash calls. Dependency injection on skill load is
+  unavailable in Codex (see docs/evidence/2026-11-25-v020-codex-live-verification.md).
 - Codex's own skill discovery (`~/.agents/skills`, `.agents/skills`,
   `~/.codex/skills` legacy) overlaps with the hook's default roots; duplicates
   are handled by the engine's name-grouping contract.
