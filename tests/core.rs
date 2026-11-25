@@ -92,6 +92,44 @@ fn digest_is_stable_and_content_derived() {
 }
 
 #[test]
+fn duplicate_installs_recommend_once_and_keep_requires() {
+    let temp = tempfile::tempdir().unwrap();
+    for copy in ["root-a", "root-b"] {
+        let root = temp.path().join(copy);
+        let parent = root.join("parent-skill");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(
+            parent.join("SKILL.md"),
+            "---\nname: parent-skill\ndescription: Use for parent orchestration work.\nmetadata:\n  requires-skills: child-skill\n---\n\nbody\n",
+        )
+        .unwrap();
+        write_skill_md(
+            &root.join("child-skill"),
+            "child-skill",
+            "Use for child execution work.",
+        );
+    }
+    let graph = build(discover(&[
+        temp.path().join("root-a"),
+        temp.path().join("root-b"),
+    ]));
+    assert_eq!(graph.by_name["parent-skill"].len(), 2);
+
+    let recs = recommend(&graph, "parent-skill", "", 5);
+    let names: Vec<&str> = recs.iter().map(|r| r.skill.name.as_str()).collect();
+    assert_eq!(names.iter().filter(|n| **n == "parent-skill").count(), 1);
+    assert!(names.contains(&"child-skill"));
+    assert!(
+        recs.iter()
+            .find(|r| r.skill.name == "child-skill")
+            .is_some_and(|r| r
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("required by")))
+    );
+}
+
+#[test]
 fn ambiguous_names_are_reported_not_uniquified() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("skills");
