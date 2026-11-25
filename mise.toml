@@ -17,6 +17,10 @@ run = "cargo test"
 description = "Run evaluation and benchmark harness"
 run = "cargo run --quiet -- bench evals/dataset/cases.jsonl"
 
+[tasks.perf]
+description = "Run synthetic corpus performance benchmark"
+run = "cargo run --quiet -- perf"
+
 [tasks.check]
 description = "Run formatting check, lint, and tests"
 run = ["cargo fmt --all -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
