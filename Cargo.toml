@@ -1,6 +1,6 @@
 [package]
 name = "skill-graph"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Agent-agnostic discovery, resolution, and recommendation for installed Agent Skills"
