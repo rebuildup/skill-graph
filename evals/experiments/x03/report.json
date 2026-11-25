@@ -1,0 +1,958 @@
+{
+  "cases": [
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 99,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "alpha-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 85,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "rust-impl"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 66,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 65,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "release-notes"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 62,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 62,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "tests"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 78,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "alpha-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 80,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "rust-checks"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 72,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 71,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "release-announcement"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 68,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 68,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "beta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "verification-only"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 59,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "alpha-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 62,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "alpha-skill",
+            "beta-skill"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "rust-dependency"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 145,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "delta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 78,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "delta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "docs-review"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 75,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 71,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "epsilon-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "ui-component"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 65,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "zeta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 65,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "zeta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "incident-recovery"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 66,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "eta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 89,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "eta-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "parallel-worktrees"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 57,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "required_hits": 0
+        },
+        "F_text_graph": {
+          "elapsed_us": 54,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "required_hits": 0
+        }
+      },
+      "id": "schema-migration-none"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 30,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "required_hits": 0
+        },
+        "F_text_graph": {
+          "elapsed_us": 31,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "required_hits": 0
+        }
+      },
+      "id": "none"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 75,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 72,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "gamma-skill"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-release-notes"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 38,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "required_hits": 0
+        },
+        "F_text_graph": {
+          "elapsed_us": 38,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [],
+          "recommended_count": 0,
+          "required_hits": 0
+        }
+      },
+      "id": "jp-local-edit-none"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3537,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3481,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "security-maintenance"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "agent-session-recovery"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 5240,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 5810,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "agent-recovery",
+            "code-review",
+            "security-maintenance"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-agent-session-recovery"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3984,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3951,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "code-naming-review"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 4258,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 4099,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "code-naming",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-code-naming"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 4491,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3595,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "code-review"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "pr-review"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3992,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "correctness-assurance"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3974,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "correctness-assurance",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "correctness-invariants"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3560,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3368,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "design-refinement",
+            "interaction-discipline",
+            "system-quality"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        }
+      },
+      "id": "design-refinement"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3861,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 4092,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "diagnosing-bugs"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "bug-diagnosis"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 4167,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 4193,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "github-delivery"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "github-delivery-work"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3877,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 4045,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "interaction-discipline"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "user-facing-progress"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 4664,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3852,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "japanese-prose"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3725,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3717,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "natural-japanese"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-natural-japanese"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3864,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3719,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "onboarding-docs"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3605,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3579,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "onboarding"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-onboarding"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 4789,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "policy-evaluation"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 4490,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "policy-evaluation",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "policy-evaluation"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3351,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "correctness-assurance"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3577,
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "quality-gate",
+            "system-quality",
+            "correctness-assurance"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        }
+      },
+      "id": "quality-gate"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3825,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "quality-gate"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3260,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "jp-quality-gate"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3704,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3577,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "security-maintenance",
+            "quality-gate",
+            "system-quality"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        }
+      },
+      "id": "security-maintenance"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3770,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "skill-selection"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3755,
+          "forbidden_hits": 0,
+          "optional_hits": 1,
+          "recommended": [
+            "skill-selection",
+            "system-quality"
+          ],
+          "recommended_count": 2,
+          "required_hits": 1
+        }
+      },
+      "id": "skill-selection"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 3714,
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "system-quality",
+            "design-refinement",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3502,
+          "forbidden_hits": 0,
+          "optional_hits": 2,
+          "recommended": [
+            "system-quality",
+            "design-refinement",
+            "code-naming"
+          ],
+          "recommended_count": 3,
+          "required_hits": 1
+        }
+      },
+      "id": "system-quality"
+    },
+    {
+      "arms": {
+        "E_text_search": {
+          "elapsed_us": 4400,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        },
+        "F_text_graph": {
+          "elapsed_us": 3694,
+          "forbidden_hits": 0,
+          "optional_hits": 0,
+          "recommended": [
+            "writing-discipline"
+          ],
+          "recommended_count": 1,
+          "required_hits": 1
+        }
+      },
+      "id": "writing-discipline"
+    }
+  ],
+  "summary": {
+    "E_text_search": {
+      "cases": 36,
+      "empty_recommendations": 3,
+      "forbidden_hits": 0,
+      "optional_hits": 5,
+      "optional_total": 21,
+      "precision_acceptable": 0.8837209302325582,
+      "precision_required": 0.7674418604651163,
+      "recommend_us_avg": 2373,
+      "recommend_us_max": 5240,
+      "recommend_us_p50": 3605,
+      "recommend_us_p95": 4664,
+      "recommended_total": 43,
+      "required_hits": 33,
+      "required_recall": 1.0,
+      "required_total": 33
+    },
+    "F_text_graph": {
+      "cases": 36,
+      "empty_recommendations": 3,
+      "forbidden_hits": 0,
+      "optional_hits": 14,
+      "optional_total": 21,
+      "precision_acceptable": 0.8867924528301887,
+      "precision_required": 0.6226415094339622,
+      "recommend_us_avg": 2286,
+      "recommend_us_max": 5810,
+      "recommend_us_p50": 3502,
+      "recommend_us_p95": 4193,
+      "recommended_total": 53,
+      "required_hits": 33,
+      "required_recall": 1.0,
+      "required_total": 33
+    }
+  }
+}

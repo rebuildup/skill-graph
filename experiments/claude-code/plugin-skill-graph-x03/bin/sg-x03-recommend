@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+input="$(cat)"
+log="${SG_X03_LOG:-${TMPDIR:-/tmp}/skill-graph-x03-hooks.jsonl}"
+state_dir="${SG_X03_STATE:-${TMPDIR:-/tmp}/skill-graph-x03-state}"
+bin="${SG_X03_BIN:?SG_X03_BIN must point to the x03-hook binary}"
+root="${SG_X03_ROOT:?SG_X03_ROOT must point to a skills root}"
+mode="${SG_X03_MODE:-graph}"
+mkdir -p "$(dirname "$log")" "$state_dir"
+
+start_ns="$(date +%s%N)"
+
+session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"')"
+prompt="$(printf '%s' "$input" | jq -r '.prompt // ""')"
+prompt_hash="$(printf '%s' "$prompt" | cksum | cut -d' ' -f1)"
+marker="$state_dir/$session_id.$prompt_hash"
+
+log_event() {
+  printf '%s' "$input" | jq -c --arg hook "user-prompt-recommend" --arg mode "$mode" \
+    --argjson emitted "$1" --argjson recommend_ms "$2" --argjson elapsed_ms "$3" \
+    --arg names "$4" --arg reason "$5" \
+    '{hook: $hook, mode: $mode, hook_event_name: .hook_event_name, session_id,
+      prompt_preview: (.prompt // "" | .[0:120]), emitted: $emitted,
+      recommend_ms: $recommend_ms, elapsed_ms: $elapsed_ms,
+      recommended: ($names | split(",") | map(select(length > 0))),
+      reason: $reason}' >> "$log"
+}
+
+if [ -e "$marker" ]; then
+  elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+  log_event false 0 "$elapsed_ms" "" "dedup_skip"
+  exit 0
+fi
+touch "$marker"
+
+text_flag=()
+if [ "$mode" = "text" ]; then
+  text_flag=(--text-only)
+fi
+
+recommend_start_ns="$(date +%s%N)"
+if ! names="$("$bin" "$prompt" --root "$root" --max 3 "${text_flag[@]}" 2>/dev/null)"; then
+  recommend_ms=0
+  elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+  log_event false "$recommend_ms" "$elapsed_ms" "" "recommender_error"
+  exit 0
+fi
+recommend_ms=$(( ($(date +%s%N) - recommend_start_ns) / 1000000 ))
+elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+
+count="$(printf '%s' "$names" | jq 'length')"
+if [ "$count" -eq 0 ]; then
+  log_event false "$recommend_ms" "$elapsed_ms" "" "no_recommendations"
+  exit 0
+fi
+
+name_list="$(printf '%s' "$names" | jq -r 'join(", ")')"
+context="skill-graph recommend ($mode): $name_list"
+jq -nc --arg ctx "$context" \
+  '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$ctx}}'
+log_event true "$recommend_ms" "$elapsed_ms" "$name_list" "recommended"

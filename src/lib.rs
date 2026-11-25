@@ -7,3 +7,4 @@ pub mod perf;
 pub mod resolver;
 pub mod search;
 pub mod x02;
+pub mod x03;
