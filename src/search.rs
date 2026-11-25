@@ -68,32 +68,46 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let mut weak_reasons = Vec::new();
 
         // Direct applicability evidence: the skill's own name/description.
-        let direct = field_score(&query, &skill.name, 20.0, "name", &mut direct_reasons)
-            + field_score(
-                &query,
-                &skill.description,
-                8.0,
-                "description",
-                &mut direct_reasons,
-            )
-            + field_score(
-                &context,
-                &skill.description,
-                4.0,
-                "context+description",
-                &mut direct_reasons,
-            );
+        let direct = field_score(
+            &query,
+            &query_terms,
+            &skill.name,
+            20.0,
+            "name",
+            &mut direct_reasons,
+        ) + field_score(
+            &query,
+            &query_terms,
+            &skill.description,
+            8.0,
+            "description",
+            &mut direct_reasons,
+        ) + field_score(
+            &context,
+            &context_terms,
+            &skill.description,
+            4.0,
+            "context+description",
+            &mut direct_reasons,
+        );
 
         // Weak relatedness evidence: body text and link targets. This can rank
         // an admitted skill but cannot admit one by itself.
-        let mut weak = field_score(&query, &skill.body_text, 2.0, "body", &mut weak_reasons)
-            + field_score(
-                &context,
-                &skill.body_text,
-                1.0,
-                "context+body",
-                &mut weak_reasons,
-            );
+        let mut weak = field_score(
+            &query,
+            &query_terms,
+            &skill.body_text,
+            2.0,
+            "body",
+            &mut weak_reasons,
+        ) + field_score(
+            &context,
+            &context_terms,
+            &skill.body_text,
+            1.0,
+            "context+body",
+            &mut weak_reasons,
+        );
         for link in &skill.links {
             match link.kind {
                 LinkKind::Requires | LinkKind::Markdown if matches_query(&query, &link.target) => {
@@ -305,6 +319,7 @@ fn document_frequency<'a>(
 
 fn field_score(
     query: &str,
+    query_terms: &[String],
     field: &str,
     weight: f64,
     label: &str,
@@ -315,11 +330,8 @@ fn field_score(
     }
     let field_lower = field.to_lowercase();
     let mut score = 0.0;
-    for term in query.split_whitespace() {
-        if term.len() < 2 {
-            continue;
-        }
-        if field_lower.contains(term) {
+    for term in query_terms {
+        if field_lower.contains(term.as_str()) {
             score += weight;
             reasons.push(format!("{label}: {term}"));
         }
@@ -335,9 +347,163 @@ fn matches_query(query: &str, target: &str) -> bool {
     !query.is_empty() && target.to_lowercase().contains(query)
 }
 
+// English function words and generic prompt filler carry no skill-selection
+// signal; matching them against descriptions produces noise admissions on
+// non-task prompts (observed in S02 live verification, issue #46). Terms are
+// compared after lowercasing, so the list is lowercase.
+const STOPWORDS: &[&str] = &[
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "all",
+    "also",
+    "am",
+    "an",
+    "and",
+    "answer",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "get",
+    "got",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "just",
+    "keep",
+    "keeps",
+    "let",
+    "like",
+    "me",
+    "more",
+    "most",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "now",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "please",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "within",
+    "without",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+];
+
 fn terms(text: &str) -> Vec<String> {
     text.split_whitespace()
-        .filter(|term| term.len() >= 2)
-        .map(str::to_lowercase)
+        .filter_map(|term| {
+            // Strip surrounding punctuation so tokens like `->` or `"word,`
+            // cannot match description text.
+            let term = term.trim_matches(|c: char| !c.is_alphanumeric());
+            if term.chars().count() < 2 {
+                return None;
+            }
+            let lower = term.to_lowercase();
+            if STOPWORDS.contains(&lower.as_str()) {
+                return None;
+            }
+            Some(lower)
+        })
         .collect()
 }

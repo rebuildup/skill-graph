@@ -64,6 +64,25 @@ fn recommends_with_reasons_and_empty_when_no_match() {
     assert!(recommend(&graph, "quantum gardening", "", 3).is_empty());
 }
 
+#[test]
+fn stopword_and_punctuation_only_queries_do_not_recommend() {
+    // Regression for #46: generic English function words and punctuation
+    // matched description text and admitted irrelevant skills on real
+    // non-task prompts during S02 live verification.
+    let graph = build(discover(&[fixture_root()]));
+    for query in [
+        "the and of to in for with it is on",
+        "What is 17 * 23? Answer with just the number.",
+        "-> -> ->",
+        "the",
+    ] {
+        assert!(
+            recommend(&graph, query, "", 5).is_empty(),
+            "query should produce no recommendations: {query}"
+        );
+    }
+}
+
 fn write_skill_md(dir: &Path, name: &str, description: &str) {
     fs::create_dir_all(dir).unwrap();
     fs::write(
