@@ -1,4 +1,7 @@
 import { Plugin } from "@opencode/plugin"
+import { appendFileSync } from "node:fs"
+const DBG = process.env.SKILL_GRAPH_DEBUG === "1" ? "/tmp/sg-oc-plugin.log" : ""
+const dbg = (m: string) => { if (DBG) try { appendFileSync(DBG, m + "\n") } catch {} }
 
 // skill-graph adapter for OpenCode.
 //
@@ -41,14 +44,17 @@ async function recommend(promptText: string): Promise<string[]> {
 export default Plugin.define({
   id: "skill-graph",
   async setup(ctx) {
+    dbg("setup called, bun=" + (typeof Bun))
     const pending = new Map<string, string[]>()
 
     await ctx.session.hook("prompt", async (event) => {
+      dbg("prompt hook keys=" + JSON.stringify(Object.keys(event)) + " sid=" + JSON.stringify((event as any).sessionID))
       const text = event.prompt.text ?? ""
       const key = `${event.sessionID}:${text.length}:${text.slice(0, 64)}`
       if (emitted.has(key)) return
       emitted.add(key)
-      const names = await recommend(text).catch(() => [])
+      const names = await recommend(text).catch((e) => { dbg("recommend err " + e); return [] })
+      dbg("recommend -> " + JSON.stringify(names))
       if (names.length > 0) {
         pending.set(event.sessionID, names)
         console.log(`[skill-graph] recommended: ${names.join(", ")}`)
@@ -56,6 +62,7 @@ export default Plugin.define({
     })
 
     await ctx.session.hook("context", (event) => {
+      dbg("context hook")
       const names = pending.get(event.sessionID)
       if (!names?.length) return
       pending.delete(event.sessionID)
