@@ -1,6 +1,7 @@
 use crate::discovery::{discover, output};
 use crate::eval;
 use crate::model::ResolveResult;
+use crate::observe;
 use crate::perf;
 use crate::resolver::build;
 use crate::search::recommend;
@@ -63,6 +64,11 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         iterations: usize,
     },
+    Observe {
+        path: PathBuf,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
 }
 
 pub fn run() -> Result<(), String> {
@@ -110,6 +116,10 @@ pub fn run() -> Result<(), String> {
                 serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
             );
             Ok(())
+        }
+        Command::Observe { path, format } => {
+            let obs = observe::observe_path(&path)?;
+            print_result(json!(obs), &format)
         }
         Command::Perf { sizes, iterations } => {
             let result = perf::run(&sizes, iterations)?;
