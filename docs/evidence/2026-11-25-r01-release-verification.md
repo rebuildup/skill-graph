@@ -20,11 +20,11 @@ Auth-independent release verification for the `release-0-1-0` candidate. Updated
 | 9 | Silent no-output when no recommendation | verified | `recommend` returns `[]`; hook exits 0 silently on `no_recommendations`/`no_input_or_roots` (P02/X04 logs) |
 | 10 | Fail-open on internal error | verified | `SKILL_GRAPH_BIN=/nonexistent` → `recommender_error`, exit 0, no output (P02 evidence) |
 | 11 | Duplicate multi-root installs | verified | C04 (#35): name-dedup recommend + name-based requires resolution; regression test + real corpus check |
-| 12 | Mid-work dependency surfacing | implemented, live-pending | X04 (#34): `PostToolUse/Skill` hook emits declared `requires` deps; script-level verified on real corpus. Real payload shape & `PostToolUse`-for-`Skill` firing **blocked** on auth |
+| 12 | Mid-work dependency surfacing | verified (mock runtime); live-model pending | X04 (#34) + C06 (#43): `PostToolUse/Skill` hook emits declared `requires` deps; mock Claude Code run confirmed payload, `additionalContext` injection, no-output, fail-open, and session dedup (`docs/evidence/2026-11-25-c06-hook-command-quoting.md`, S02 mock-runtime section). Real-model drift response remains unmeasured |
 | 12b | Same-name skill identification contract | verified | C05 (#39): recommend evaluates all copies, groups by name, flags distinct-digest collisions in reasons; identical duplicates dedupe silently; resolve still reports ambiguity (`docs/evidence/2026-11-25-c05-identification-contract.md`) |
 | 13 | Recommendation quality (dataset) | verified | 36-case eval: required_recall 1.0, forbidden_hits 0 (`evals/experiments/x02|x03/report.json`, `bench`) |
 | 14 | Performance targets (ADR-0002) | verified | recommend warm p95 ~0.7 ms @500 skills, CLI process p95 ~13 ms (release), hook end-to-end ~29–42 ms — all within p95<100 ms / hook<250 ms / max 3 (`c03`, `x03`, `p02` evidence) |
-| 15 | Invocation recall / timeliness / artifact quality | **blocked** | Requires authenticated Claude Code session; S02 (#4) remains open. Recommendation metrics above must not be read as invocation evidence |
+| 15 | Invocation recall / timeliness / artifact quality | **blocked** | Requires an authenticated external-provider route. Mock runtime verified hook mechanics only; Baseline/E/F live comparison and recommendation→actual-load conversion remain unmeasured. Recommendation metrics above must not be read as invocation evidence |
 | 16 | release→main merge, external publish, permanent install | not attempted | Explicit approval boundary — unchanged |
 
 ## Distinctions (per operating rules)
@@ -43,7 +43,7 @@ Auth-independent release verification for the `release-0-1-0` candidate. Updated
 
 ## Resume procedure (post-auth)
 
-Blocked on: Claude Code authentication. As of 2026-11-25, `claude auth status` → `loggedIn:false`; `agent claude <provider>` routes need an interactive `infisical login` (session expired); `codex` not logged in. No credential copying/extraction was performed.
+Blocked on: external-provider credentials. As of 2026-11-25, `claude auth status` → `loggedIn:false` (OAuth expired, no subscription); Agent Router free routes exist (`agent routes`), but the Infisical user session is expired so `script/with-secrets` cannot inject `KILO_API_KEY`/`REQUESTY_API_KEY`/`MODELSCOPE_API_KEY`/`OPENROUTER_API_KEY`. No credential copying/extraction was performed. Hook mechanics were verified with a deterministic local mock endpoint instead (C06 evidence); real-model verification still needs a provider route.
 
 Once either path is available, run the S02 verification (`docs/evidence/2026-11-25-s02-runtime-feasibility.md` "Next verification"):
 
@@ -58,8 +58,13 @@ cd /tmp/sg-s02/project && env SKILL_GRAPH_BIN=/home/basic/work/skill-graph/targe
   --output-format stream-json --include-hook-events --verbose \
   --permission-mode bypassPermissions
 
-# Option B — provider route (requires `infisical login` first):
-agent claude kilo -- -p "<task>" --plugin-dir ... (same flags as above)
+# Option B — Agent Router external provider (requires `infisical login` first;
+# pick ONE free route and keep it fixed across Baseline/E/F):
+agent claude kilo -- -p "<task>" --plugin-dir /home/basic/work/skill-graph/adapters/claude-code/skill-graph \
+  --setting-sources project --no-session-persistence \
+  --output-format stream-json --include-hook-events --verbose \
+  --permission-mode bypassPermissions
+# alternatives: agent claude requesty ... / agent claude modelscope ... / agent claude openrouter-free ...
 ```
 
-Pending live items: `PostToolUse`/`PreToolUse` payload shape for `Skill`/`Bash`, whether `PostToolUse` fires for `Skill`, `tool_input.skill` field name, recommendation→actual-load conversion (Invocation Recall), Baseline/E/F live comparison, mid-work task-drift coverage, re-recommendation/context cost, timeliness, and artifact-quality effect. X04's unconditional-dependency concern (declared `requires` vs actual need) is evaluated there — the hook emits names only, never forces loads.
+Pending live items: `PreToolUse`/`PostToolUse` payload shape for `Bash` on a real provider, recommendation→actual-load conversion (Invocation Recall), Baseline/E/F live comparison, mid-work task-drift response under a real model, re-recommendation/context cost, timeliness, and artifact-quality effect. `PostToolUse` firing for `Skill` and `tool_input.skill` are already verified by the mock runtime (C06 evidence). X04's unconditional-dependency concern (declared `requires` vs actual need) is evaluated there — the hook emits names only, never forces loads.
