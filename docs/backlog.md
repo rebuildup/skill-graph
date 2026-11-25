@@ -1,6 +1,6 @@
 # Issue Drafts
 
-GitHub repository が未作成のため、以下は登録予定の draft である。repository 作成後、GitHub Issue へ転記し、GitHub Issue を正本とする。
+GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C03 / X01–X03 を Issue #1–#13 として登録済み。P01 / P02 / O01 / O02 / I01 は E03 の結果を見てから登録する。GitHub Issue を正本とし、以下は依存関係と acceptance の対応表である。
 
 | Draft | Title | Depends | Acceptance summary |
 |---|---|---|---|
