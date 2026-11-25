@@ -18,12 +18,11 @@ Test project: `/tmp/sg-oc-proj` (`opencode.json` → `plugins: ["file://.../adap
 
 ## Partially verified / open
 
-- **Injection visibility**: `event.system.push({type:"text",text})` executed
-  without error and matches the documented shape, but the model's reply did
-  not clearly reflect the injected text (it answered from its own skill
-  listing). Whether the pushed text reliably reaches the model on every
-  provider/model needs one more targeted check (e.g. ask the model to quote
-  the injected line).
+- **Injection visibility — VERIFIED (follow-up)**: asked the model to quote
+  `skill-graph:` lines verbatim; it reproduced
+  `skill-graph: skills relevant to this task — alpha-skill, beta-skill.`
+  exactly. `event.system.push` delivery confirmed end-to-end on
+  `hungerg-free`.
 - **`event.prompt.skills` direct injection**: not tested; remains the
   preferred upgrade if the ID format is stable.
 - Skill-load observation: OpenCode `tool.execute.*` events exist; whether
