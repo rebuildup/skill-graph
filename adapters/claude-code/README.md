@@ -6,7 +6,7 @@ Opt-in adapter that recommends installed Agent Skills for each user prompt via a
 
 - A `skill-graph` binary (release build) on `PATH`, or an absolute path via `SKILL_GRAPH_BIN`.
 - `jq` on `PATH` (used to parse hook payloads).
-- Agent Skills installed under conventional roots: `~/.claude/skills`, `~/.agents/skills`, `<cwd>/skills`, `<cwd>/.claude/skills`, `<cwd>/.agents/skills`. Override with `SKILL_GRAPH_ROOTS` (colon-separated absolute paths).
+- Agent Skills installed under conventional roots: `~/.claude/skills`, `~/.agents/skills`, `<cwd>/skills`, `<cwd>/.claude/skills`, `<cwd>/.agents/skills`. Override with `SKILL_GRAPH_ROOTS` (colon-separated absolute paths). Duplicate installs across roots are deduplicated by skill name (C04).
 
 ## Install / enable (explicit opt-in)
 
@@ -18,10 +18,15 @@ For repeated use, install through your usual Claude Code plugin flow pointing at
 
 ## Behavior
 
-- Emits `additionalContext` with up to 3 recommended skill names only when the recommender returns candidates; otherwise silent.
-- Dedups per `session_id` + prompt hash.
-- Fails open: missing binary, parse errors, or empty roots → exit 0 with no output.
-- Latency budget: hook total < 250 ms (measured ~40 ms end-to-end on a 7-skill fixture, debug build; see evidence).
+Two selective hooks (ADR-0003):
+
+- `UserPromptSubmit` (`prompt` mode): recommends up to 3 skills relevant to the submitted prompt.
+- `PostToolUse` matcher `Skill` (`skill-load` mode): when a skill finishes loading, surfaces its declared `requires` dependencies (up to 3) so mid-work dependency gaps are visible without a new prompt.
+
+Both emit `additionalContext` only on hits; silent on no recommendations, dedup repeats (per session + prompt/skill), missing binary, or empty roots — fail-open, exit 0. No hooks on Bash/Edit/Write or other unconditional matchers.
+
+- Latency: ~10–40 ms per hook invocation measured (release binary, real duplicated skill corpus).
+- No-save mode: `SKILL_GRAPH_HOOK_NOSTATE=1` disables dedup markers and log writes entirely.
 
 ## Disable / remove
 
