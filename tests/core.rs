@@ -1,7 +1,9 @@
 use skill_graph::discovery::discover;
+use skill_graph::parser::parse_skill;
 use skill_graph::resolver::build;
 use skill_graph::search::recommend;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/skills")
@@ -60,4 +62,42 @@ fn recommends_with_reasons_and_empty_when_no_match() {
     );
     assert!(!recs[0].reasons.is_empty());
     assert!(recommend(&graph, "quantum gardening", "", 3).is_empty());
+}
+
+fn write_skill_md(dir: &Path, name: &str, description: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: {description}\n---\n\nbody\n"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn digest_is_stable_and_content_derived() {
+    let root = fixture_root();
+    let path = root.join("alpha-skill/SKILL.md");
+    let first = parse_skill(&path, &root).unwrap();
+    let second = parse_skill(&path, &root).unwrap();
+    assert_eq!(first.digest, second.digest);
+    assert_eq!(first.digest.len(), 64);
+
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("alpha-skill");
+    fs::create_dir_all(&dir).unwrap();
+    let original = fs::read_to_string(&path).unwrap();
+    fs::write(dir.join("SKILL.md"), format!("{original}\nextra\n")).unwrap();
+    let changed = parse_skill(&dir.join("SKILL.md"), temp.path()).unwrap();
+    assert_ne!(first.digest, changed.digest);
+}
+
+#[test]
+fn ambiguous_names_are_reported_not_uniquified() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("skills");
+    write_skill_md(&root.join("one"), "dup-skill", "first duplicate");
+    write_skill_md(&root.join("two"), "dup-skill", "second duplicate");
+    let graph = build(discover(&[root]));
+    assert!(graph.ambiguous_names.contains(&"dup-skill".to_string()));
+    assert_eq!(graph.by_name["dup-skill"].len(), 2);
 }
