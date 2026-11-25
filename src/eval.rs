@@ -21,6 +21,12 @@ struct Case {
     expected_optional: Vec<String>,
     #[serde(default)]
     forbidden: Vec<String>,
+    #[serde(default)]
+    timing: Option<String>,
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    case_kind: Option<String>,
 }
 
 pub fn run(dataset: &Path) -> Result<Value, String> {
@@ -106,6 +112,9 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
             "required_total": case.expected_required.len(),
             "forbidden_hits": forbidden_hits,
             "optional_hits": optional_hits,
+            "timing": case.timing,
+            "rationale": case.rationale,
+            "case_kind": case.case_kind,
         }));
     }
 
