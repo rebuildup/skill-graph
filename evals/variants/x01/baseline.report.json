@@ -1,0 +1,225 @@
+{
+  "cases": [
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "rust-impl",
+      "optional_hits": 1,
+      "rationale": "Rust implementation task; alpha owns implementation, beta is the declared test dependency.",
+      "recommended": [
+        "alpha-skill",
+        "beta-skill"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "release-notes",
+      "optional_hits": 0,
+      "rationale": "Release communication task; only gamma matches release notes/changelog.",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "tests",
+      "optional_hits": 0,
+      "rationale": "Verification task; beta owns tests, alpha is the implementation context.",
+      "recommended": [
+        "beta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "rust-checks",
+      "optional_hits": 1,
+      "rationale": "Cargo/module-boundary inspection is alpha's stated scope.",
+      "recommended": [
+        "alpha-skill",
+        "beta-skill"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "release-announcement",
+      "optional_hits": 0,
+      "rationale": "Version announcement is release communication, not implementation.",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "verification-only",
+      "optional_hits": 0,
+      "rationale": "Harness repair is verification-only; implementation skill is not required.",
+      "recommended": [
+        "beta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "rust-dependency",
+      "optional_hits": 1,
+      "rationale": "Session-start Rust services/CLI task maps to alpha.",
+      "recommended": [
+        "alpha-skill",
+        "beta-skill"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "session_start"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "docs-review",
+      "optional_hits": 0,
+      "rationale": "Reader-facing prose review is delta's scope.",
+      "recommended": [
+        "delta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "ui-component",
+      "optional_hits": 0,
+      "rationale": "Frontend component/styling change is epsilon's scope.",
+      "recommended": [
+        "epsilon-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "incident-recovery",
+      "optional_hits": 0,
+      "rationale": "Incident recovery/rollback is zeta's scope.",
+      "recommended": [
+        "zeta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "positive",
+      "forbidden_hits": 0,
+      "id": "parallel-worktrees",
+      "optional_hits": 0,
+      "rationale": "Parallel worktree/agent coordination is eta's scope.",
+      "recommended": [
+        "eta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "session_start"
+    },
+    {
+      "case_kind": "negative",
+      "forbidden_hits": 0,
+      "id": "schema-migration-none",
+      "optional_hits": 0,
+      "rationale": "No fixture skill covers database schema migration; empty recommendation is acceptable.",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_total": 0,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "negative",
+      "forbidden_hits": 0,
+      "id": "none",
+      "optional_hits": 0,
+      "rationale": "Unrelated task should produce no recommendation.",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_total": 0,
+      "timing": "session_start"
+    },
+    {
+      "case_kind": "cross-lingual",
+      "forbidden_hits": 0,
+      "id": "jp-release-notes",
+      "optional_hits": 0,
+      "rationale": "Japanese task text with English context keywords should still reach the English-described release skill.",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_total": 1,
+      "timing": "mid_task"
+    },
+    {
+      "case_kind": "negative",
+      "forbidden_hits": 0,
+      "id": "jp-local-edit-none",
+      "optional_hits": 0,
+      "rationale": "Vague local edit without skill-specific context should not force a recommendation.",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_total": 0,
+      "timing": "mid_task"
+    }
+  ],
+  "summary": {
+    "cases": 15,
+    "elapsed_ms": 7,
+    "empty_recommendations": 3,
+    "forbidden_hits": 0,
+    "optional_hits": 3,
+    "optional_total": 4,
+    "precision_acceptable": 1.0,
+    "precision_required": 0.8,
+    "recommended_total": 15,
+    "required_hits": 12,
+    "required_recall": 1.0,
+    "required_total": 12
+  }
+}
