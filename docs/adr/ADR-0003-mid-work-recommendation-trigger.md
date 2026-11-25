@@ -1,6 +1,6 @@
 # ADR-0003: Mid-work recommendation trigger via Skill-load observation
 
-Status: accepted for implementation; live verification pending Claude Code auth  
+Status: accepted; live-verified on Claude Code 2.1.329 (S02, 2026-11-25)  
 Date: 2026-11-25
 
 ## Context
@@ -27,5 +27,4 @@ Explicitly not adopted:
 
 - Adapter now has two hook modes: `prompt` (UserPromptSubmit) and `skill-load` (PostToolUse/Skill). Both share dedup, fail-open, and no-output behavior.
 - `SKILL_GRAPH_HOOK_NOSTATE=1` provides a no-save mode (no markers, no log).
-- Live verification (real `tool_input` payload shape, whether `PostToolUse` fires for `Skill`, whether injected names convert to loads) is pending Claude Code authentication — tracked under S02 (#4) / X04 (#34).
-- If live payloads show `PostToolUse` does not fire for `Skill` or `tool_input.skill` is absent, fall back to `UserPromptExpansion` observation or document the gap; do not add broader tool matchers without evidence.
+- Live verification (S02, Kilo anonymous route, real model): `PostToolUse` fires for `Skill` with `tool_input.skill`; the t5 chain converted end-to-end — `quality-gate` load → dep `system-quality` recommended and loaded → `code-naming` recommended and correctly not loaded. This is the only verified mid-work trigger: it fires on skill loads, so intra-turn work changes that never load a skill have no coverage, and multi-turn changes are covered by `UserPromptSubmit` instead (t4 drift verified). Evidence: `docs/evidence/2026-11-25-s02-runtime-feasibility.md`.

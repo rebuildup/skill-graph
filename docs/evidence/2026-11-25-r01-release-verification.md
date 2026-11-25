@@ -3,7 +3,7 @@
 Issue: #33
 Branch: `33` → `release-0-1-0`
 
-Auth-independent release verification for the `release-0-1-0` candidate. Updated 2026-11-25 after S02 live-runtime verification on the Kilo anonymous free route — see "Resume procedure" for the remaining cells.
+Auth-independent release verification for the `release-0-1-0` candidate at head `80f8424` (v0.1.0 candidate). Updated 2026-11-25 after S02 live-runtime verification on the Kilo anonymous free route — see "Resume procedure" for remaining gaps and the S02 evidence "Verified scope" section for exact coverage boundaries (same-turn vs multi-turn triggers, same-name identification).
 
 ## Checklist
 

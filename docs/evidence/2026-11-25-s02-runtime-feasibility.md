@@ -192,6 +192,32 @@ cells" above. Raw logs: `/tmp/sg-live/out/*.jsonl`,
 | Existing-config non-pollution | Verified for experiment | Only `--plugin-dir` session load; temp cwd; logs/state under `/tmp`. |
 | Codex / OpenCode | Not tested | Installed CLIs noted only; Claude Code was the priority target. |
 
+## Verified scope (explicit)
+
+What the live runs actually establish, and what they do not:
+
+- **Multi-turn work changes**: covered and verified. Each new user prompt
+  fires `UserPromptSubmit` and receives a fresh recommendation (t4 turn 2
+  re-recommended `natural-japanese`/`code-review`; session dedup is per
+  prompt hash, not per session).
+- **Same-turn work changes**: covered only at skill-load events.
+  `PostToolUse` matcher `Skill` fires mid-turn and injected dep names
+  reached the model in the same session (t5 chain). Work that changes
+  mid-turn *without* loading a skill has no trigger — the adapter
+  deliberately does not hook `Edit`/`Write`/`Bash` (ADR-0003). This gap is
+  a design boundary, not a verified capability.
+- **Same-name skill identification**: verified at the engine layer only
+  (C04/C05 unit tests + bench: name-grouped output, distinct-digest
+  collision flag, identical-digest dedup, `requires` admits all copies,
+  resolve reports ambiguity). The live corpus contained single copies, so
+  live-runtime behavior for same-name duplicates/collisions was NOT
+  exercised; namespaced plugin-skill name normalization
+  (`sg-s02-probe:alpha-skill` → `alpha-skill`) was verified on the mock
+  runtime only.
+- **Invocation conversion**: verified for declared dependencies
+  (system-quality loaded via injection). Prompt-mode → load conversion was
+  observed only for already-description-matched skills; n=1 per cell.
+
 ## Next verification
 
 S02's required live checks are complete: Baseline/E/F ran on the fixed
