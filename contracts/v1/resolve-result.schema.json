@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-graph.local/contracts/v1/resolve-result.schema.json",
+  "title": "ResolveResult",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["kind", "ambiguous", "skills"],
+      "properties": {
+        "kind": { "const": "name" },
+        "ambiguous": { "type": "boolean" },
+        "skills": {
+          "type": "array",
+          "items": { "$ref": "skill-summary.schema.json" }
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["kind", "skill"],
+      "properties": {
+        "kind": { "const": "path" },
+        "skill": { "$ref": "skill-summary.schema.json" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["kind", "target"],
+      "properties": {
+        "kind": { "const": "unresolved" },
+        "target": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  ]
+}
