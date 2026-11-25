@@ -1,6 +1,6 @@
 ---
 name: zeta-skill
-description: Use when recovering from incidents, rolling back changes, or debugging production failures.
+description: Use for incident recovery, rollback, and production failure debugging.
 ---
 
 # Zeta Skill
