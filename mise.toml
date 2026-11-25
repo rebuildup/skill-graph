@@ -1,0 +1,22 @@
+[tools]
+rust = "1.100.0"
+
+[tasks.fmt]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Run Rust lints"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.test]
+description = "Run Rust tests"
+run = "cargo test"
+
+[tasks.bench]
+description = "Run evaluation and benchmark harness"
+run = "cargo run --quiet -- bench evals/dataset/cases.jsonl"
+
+[tasks.check]
+description = "Run formatting check, lint, and tests"
+run = ["cargo fmt --all -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]

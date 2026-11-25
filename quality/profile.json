@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "project": "skill-graph",
+  "applied_project_init_revision": "285b139b01c199d3d4135d90f3cc3f6a932eff3b",
+  "runtime": {
+    "primary": "rust",
+    "version_source": "rust-toolchain.toml",
+    "auxiliary": ["bun"]
+  },
+  "commands": {
+    "fmt": "cargo fmt --all -- --check",
+    "lint": "cargo clippy --all-targets -- -D warnings",
+    "test": "cargo test",
+    "bench": "cargo run --quiet -- bench evals/dataset",
+    "check": "mise run check"
+  },
+  "boundaries": {
+    "no_project_writes": true,
+    "no_global_install": true,
+    "no_shell_profile_changes": true,
+    "no_unrequested_network": true,
+    "no_script_execution_from_skill_docs": true
+  }
+}

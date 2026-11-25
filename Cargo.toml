@@ -1,0 +1,18 @@
+[package]
+name = "skill-graph"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Agent-agnostic discovery, resolution, and recommendation for installed Agent Skills"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+pulldown-cmark = "0.13"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

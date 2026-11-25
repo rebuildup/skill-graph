@@ -1,0 +1,4 @@
+{"id":"rust-impl","query":"Rust CLI implementation","context":"cargo test module boundaries","skill_root":"fixtures/skills","expected_required":["alpha-skill"],"expected_optional":["beta-skill"],"forbidden":[]}
+{"id":"release-notes","query":"release notes changelog","context":"version announcement","skill_root":"fixtures/skills","expected_required":["gamma-skill"],"expected_optional":[],"forbidden":["alpha-skill"]}
+{"id":"tests","query":"write tests verification","context":"failing harness","skill_root":"fixtures/skills","expected_required":["beta-skill"],"expected_optional":["alpha-skill"],"forbidden":[]}
+{"id":"none","query":"quantum gardening","context":"","skill_root":"fixtures/skills","expected_required":[],"expected_optional":[],"forbidden":[]}
