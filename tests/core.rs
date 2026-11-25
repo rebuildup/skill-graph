@@ -51,8 +51,13 @@ fn resolves_links_requires_and_backlinks() {
 #[test]
 fn recommends_with_reasons_and_empty_when_no_match() {
     let graph = build(discover(&[fixture_root()]));
-    let recs = recommend(&graph, "release notes changelog", "", 3);
-    assert_eq!(recs[0].skill.name, "gamma-skill");
+    let recs = recommend(&graph, "release notes changelog", "version announcement", 3);
+    assert_eq!(
+        recs.iter()
+            .map(|r| r.skill.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["gamma-skill"]
+    );
     assert!(!recs[0].reasons.is_empty());
     assert!(recommend(&graph, "quantum gardening", "", 3).is_empty());
 }
