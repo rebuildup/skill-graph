@@ -24,6 +24,7 @@
 - スキル文書を信頼できない解析データとして扱う。
 - 解析対象の script を実行しない。
 - 探索範囲外への path traversal と symlink 越境を防ぐ。
+- Discovery は symlink 化した `SKILL.md` と symlink directory を辿らず、Markdown link resolution は発見済み skill root 配下に限定する。
 - 外部 link を無断取得しない。
 - 外部 API / network を中核機能の必須条件にしない。
 - ユーザープロンプト、会話全文、秘密情報を永続保存・外部送信しない。
