@@ -32,6 +32,13 @@ pub enum LinkKind {
     External,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Availability {
+    Available,
+    ParseError,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct SkillSummary {
     pub name: String,
@@ -39,7 +46,7 @@ pub struct SkillSummary {
     pub path: PathBuf,
     pub root: PathBuf,
     pub digest: String,
-    pub availability: String,
+    pub availability: Availability,
 }
 
 impl Skill {
@@ -51,9 +58,9 @@ impl Skill {
             root: self.root.clone(),
             digest: self.digest.clone(),
             availability: if self.parse_error.is_some() {
-                "parse_error".to_string()
+                Availability::ParseError
             } else {
-                "available".to_string()
+                Availability::Available
             },
         }
     }
@@ -71,4 +78,19 @@ pub struct Recommendation {
 pub struct DiscoveryOutput {
     pub skills: Vec<SkillSummary>,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResolveResult {
+    Name {
+        ambiguous: bool,
+        skills: Vec<SkillSummary>,
+    },
+    Path {
+        skill: SkillSummary,
+    },
+    Unresolved {
+        target: String,
+    },
 }
