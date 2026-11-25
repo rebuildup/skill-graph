@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# skill-graph Claude Code UserPromptSubmit hook.
+# Recommends installed Agent Skills for the submitted prompt and injects
+# them via additionalContext. Silent (exit 0, no output) when there are no
+# recommendations, on repeats within a session, or on any internal error —
+# a hook failure must never block the session.
+set -uo pipefail
+
+input="$(cat)"
+log="${SKILL_GRAPH_HOOK_LOG:-${TMPDIR:-/tmp}/skill-graph-hook.jsonl}"
+state_dir="${SKILL_GRAPH_HOOK_STATE:-${TMPDIR:-/tmp}/skill-graph-hook-state}"
+bin="${SKILL_GRAPH_BIN:-skill-graph}"
+mkdir -p "$(dirname "$log")" "$state_dir"
+
+start_ns="$(date +%s%N)"
+
+session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"')"
+prompt="$(printf '%s' "$input" | jq -r '.prompt // ""')"
+
+log_event() {
+  printf '%s' "$input" | jq -c --argjson emitted "$1" --argjson recommend_ms "$2" \
+    --argjson elapsed_ms "$3" --arg names "$4" --arg reason "$5" \
+    '{hook:"user-prompt-recommend", hook_event_name: .hook_event_name, session_id,
+      prompt_preview: (.prompt // "" | .[0:120]), emitted: $emitted,
+      recommend_ms: $recommend_ms, elapsed_ms: $elapsed_ms,
+      recommended: ($names | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
+      reason: $reason}' >> "$log"
+}
+
+finish() {
+  local emitted="$1" recommend_ms="$2" names="$3" reason="$4"
+  local elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+  log_event "$emitted" "$recommend_ms" "$elapsed_ms" "$names" "$reason"
+}
+
+# Build skill roots: explicit override, else conventional locations.
+if [ -n "${SKILL_GRAPH_ROOTS:-}" ]; then
+  IFS=':' read -r -a roots <<< "$SKILL_GRAPH_ROOTS"
+else
+  roots=(
+    "$HOME/.claude/skills"
+    "$HOME/.agents/skills"
+    "$PWD/skills"
+    "$PWD/.claude/skills"
+    "$PWD/.agents/skills"
+  )
+fi
+root_args=()
+existing_roots=()
+for root in "${roots[@]}"; do
+  if [ -d "$root" ]; then
+    root_args+=(--root "$root")
+    existing_roots+=("$root")
+  fi
+done
+
+if [ -z "$prompt" ] || [ "${#root_args[@]}" -eq 0 ]; then
+  finish false 0 "" "no_input_or_roots"
+  exit 0
+fi
+
+# Dedup: one recommendation per session+prompt.
+prompt_hash="$(printf '%s' "$prompt" | cksum | cut -d' ' -f1)"
+marker="$state_dir/$session_id.$prompt_hash"
+if [ -e "$marker" ]; then
+  finish false 0 "" "dedup_skip"
+  exit 0
+fi
+touch "$marker"
+
+recommend_start_ns="$(date +%s%N)"
+if ! recs="$("$bin" recommend "$prompt" "${root_args[@]}" --max 3 --format json 2>/dev/null)"; then
+  finish false 0 "" "recommender_error"
+  exit 0
+fi
+recommend_ms=$(( ($(date +%s%N) - recommend_start_ns) / 1000000 ))
+
+if ! count="$(printf '%s' "$recs" | jq 'length' 2>/dev/null)" || [ "$count" -eq 0 ]; then
+  finish false "$recommend_ms" "" "no_recommendations"
+  exit 0
+fi
+
+names="$(printf '%s' "$recs" | jq -r '[.[].skill.name] | join(", ")')"
+context="skill-graph: skills relevant to this task — $names. Read the matching SKILL.md before relying on it."
+jq -nc --arg ctx "$context" \
+  '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$ctx}}'
+finish true "$recommend_ms" "$names" "recommended"
