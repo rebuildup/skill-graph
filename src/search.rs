@@ -58,8 +58,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
 
-    for &index in &candidates {
-        let skill = &graph.skills[index];
+    for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
             continue;
         }
@@ -187,17 +186,19 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             let Some(name) = &link.resolved_name else {
                 continue;
             };
-            let Some(&target) = rep_of_name.get(name.as_str()) else {
+            let Some(targets) = graph.by_name.get(name) else {
                 continue;
             };
-            if graph.skills[target].parse_error.is_some() {
-                continue;
-            }
-            let is_seed = infos[target].as_ref().is_some_and(directly_admitted);
-            let entry = admitted.entry(target).or_default();
-            entry.push(format!("required by {}", graph.skills[*seed].name));
-            if !is_seed && let Some(info) = infos[target].as_mut() {
-                info.necessity += 2.0;
+            for &target in targets {
+                if graph.skills[target].parse_error.is_some() {
+                    continue;
+                }
+                let is_seed = infos[target].as_ref().is_some_and(directly_admitted);
+                let entry = admitted.entry(target).or_default();
+                entry.push(format!("required by {}", graph.skills[*seed].name));
+                if !is_seed && let Some(info) = infos[target].as_mut() {
+                    info.necessity += 2.0;
+                }
             }
         }
     }
@@ -230,6 +231,29 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         })
         .collect();
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    // Recommendation identity is the skill name, but same-name copies are not
+    // silently conflated: the highest-scoring copy represents the name, and a
+    // name shared by distinct digests is reported as a collision in reasons.
+    for rec in &mut out {
+        if let Some(indexes) = graph.by_name.get(&rec.skill.name) {
+            let distinct: HashSet<&str> = indexes
+                .iter()
+                .filter(|&&i| graph.skills[i].parse_error.is_none())
+                .map(|&i| graph.skills[i].digest.as_str())
+                .collect();
+            if distinct.len() > 1 {
+                rec.reasons.push(format!(
+                    "name collision: {} distinct versions installed",
+                    distinct.len()
+                ));
+                rec.reasons.sort();
+                rec.reasons.dedup();
+            }
+        }
+    }
+    let mut seen_names = HashSet::new();
+    out.retain(|rec| seen_names.insert(rec.skill.name.clone()));
     out.truncate(max);
     out
 }
@@ -258,12 +282,20 @@ fn document_frequency<'a>(
     }
     let mut frequencies = HashMap::new();
     for term in unique {
+        // df counts distinct skill names: a term matches a name when any
+        // installed copy of that name contains it, so duplicate installs do
+        // not inflate frequency.
         let count = candidates
             .iter()
             .filter(|&&index| {
-                graph.skills[index].parse_error.is_none()
-                    && (skill_names[index].contains(term)
-                        || skill_descriptions[index].contains(term))
+                let Some(copies) = graph.by_name.get(&graph.skills[index].name) else {
+                    return false;
+                };
+                copies.iter().any(|&copy| {
+                    graph.skills[copy].parse_error.is_none()
+                        && (skill_names[copy].contains(term)
+                            || skill_descriptions[copy].contains(term))
+                })
             })
             .count();
         frequencies.insert(term.to_string(), count);

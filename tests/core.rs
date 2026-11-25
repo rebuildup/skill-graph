@@ -130,6 +130,112 @@ fn duplicate_installs_recommend_once_and_keep_requires() {
 }
 
 #[test]
+fn same_name_distinct_versions_are_flagged_not_merged_silently() {
+    let temp = tempfile::tempdir().unwrap();
+    write_skill_md(
+        &temp.path().join("root-a/collide-skill"),
+        "collide-skill",
+        "Use for orchestration work.",
+    );
+    write_skill_md(
+        &temp.path().join("root-b/collide-skill"),
+        "collide-skill",
+        "Use for sourdough baking work.",
+    );
+    let graph = build(discover(&[
+        temp.path().join("root-a"),
+        temp.path().join("root-b"),
+    ]));
+
+    // Query matches only the second copy's description; the name is still
+    // recommended once, with the collision surfaced in reasons.
+    let recs = recommend(&graph, "sourdough baking", "", 5);
+    let collide: Vec<_> = recs
+        .iter()
+        .filter(|r| r.skill.name == "collide-skill")
+        .collect();
+    assert_eq!(collide.len(), 1);
+    assert!(
+        collide[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("name collision"))
+    );
+
+    // Resolution still reports both distinct copies, not a silent merge.
+    let resolved =
+        serde_json::to_value(skill_graph::cli::resolve_target(&graph, "collide-skill")).unwrap();
+    assert_eq!(resolved["kind"], "name");
+    assert_eq!(resolved["ambiguous"], true);
+    assert_eq!(resolved["skills"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn identical_duplicate_copies_do_not_flag_collision() {
+    let temp = tempfile::tempdir().unwrap();
+    for copy in ["root-a", "root-b"] {
+        write_skill_md(
+            &temp.path().join(format!("{copy}/same-skill")),
+            "same-skill",
+            "Use for identical duplicated work.",
+        );
+    }
+    let graph = build(discover(&[
+        temp.path().join("root-a"),
+        temp.path().join("root-b"),
+    ]));
+    let recs = recommend(&graph, "same-skill", "", 5);
+    let same: Vec<_> = recs
+        .iter()
+        .filter(|r| r.skill.name == "same-skill")
+        .collect();
+    assert_eq!(same.len(), 1);
+    assert!(
+        !same[0]
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("name collision"))
+    );
+}
+
+#[test]
+fn requires_to_ambiguous_name_admits_once_with_collision_note() {
+    let temp = tempfile::tempdir().unwrap();
+    for copy in ["root-a", "root-b"] {
+        let root = temp.path().join(copy);
+        let parent = root.join("parent-skill");
+        fs::create_dir_all(&parent).unwrap();
+        fs::write(
+            parent.join("SKILL.md"),
+            "---\nname: parent-skill\ndescription: Use for parent work.\nmetadata:\n  requires-skills: dep-skill\n---\n\nbody\n",
+        )
+        .unwrap();
+        // Two genuinely different dep-skill versions.
+        write_skill_md(
+            &root.join("dep-skill"),
+            "dep-skill",
+            if copy == "root-a" {
+                "Use for dep variant alpha."
+            } else {
+                "Use for dep variant beta."
+            },
+        );
+    }
+    let graph = build(discover(&[
+        temp.path().join("root-a"),
+        temp.path().join("root-b"),
+    ]));
+    let recs = recommend(&graph, "parent-skill", "", 5);
+    let deps: Vec<_> = recs
+        .iter()
+        .filter(|r| r.skill.name == "dep-skill")
+        .collect();
+    assert_eq!(deps.len(), 1);
+    assert!(deps[0].reasons.iter().any(|r| r.contains("required by")));
+    assert!(deps[0].reasons.iter().any(|r| r.contains("name collision")));
+}
+
+#[test]
 fn ambiguous_names_are_reported_not_uniquified() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("skills");
