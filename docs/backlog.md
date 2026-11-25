@@ -1,6 +1,32 @@
 # Issue Drafts
 
-GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C03 / X01–X03 を Issue #1–#13 として登録済み。E03 完了により P01 / P02 を Issue #28 / #29 として登録済み。O01 / O02 / I01 は発動条件未達のため deferred を維持する。GitHub Issue を正本とし、以下は依存関係と acceptance の対応表である。
+GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C07 / X01–X04 / P01 / P02 / R01–R03 を登録・完了済み（R03 = Issue #50、v0.1.0 候補確定）。v0.1.0 は `release-0-1-0` @ `80f8424` を実験的初期リリース候補とする。O01 / O02 / I01 は発動条件未達のため deferred を維持する。v0.2.0 の要求は GitHub Issue を正本とし、下表は対応関係である。
+
+## v0.1.0 (release-0-1-0) — 完了
+
+| Issue | Title | Status |
+|---|---|---|
+| #1–#13 | E01–E03 / S01–S04 / C01–C03 / X01–X03 | closed |
+| #28 / #29 | P01 CLI・Plugin 配布 / P02 Claude Code adapter | closed |
+| #33 / #34 | R01 リリース候補検証 / X04 mid-work trigger | closed |
+| #35 / #39 / #41 / #43 / #46 | C04–C07 識別・重複・hook quoting・stopword 修正、R02 | closed |
+| #4 / #50 | S02 ランタイム実現可能性 / R03 v0.1.0 確定 | closed |
+
+## v0.2.0 drafts（Issue 登録済み）
+
+| Issue | Title | Depends | Acceptance summary |
+|---|---|---|---|
+| #51 | V01 Codex adapter 実現可能性と実装 | — | Codex hooks/payload 実測、adapter、live 検証 |
+| #52 | V02 OpenCode adapter 実現可能性と実装 | — | OpenCode hooks/payload 実測、adapter、live 検証 |
+| #53 | V03 PATH 不要の導入・配布経路 | #51, #52 | runtime 別の opt-in 導入手順と検証 |
+| #54 | V04 実コーパスでの検索性能 | — | 実規模 corpus で p95 目標を再計測 |
+| #55 | V05 利用実績の観測（opt-in） | — | 推薦→ロード転換の実測手段と privacy 境界 |
+| #56 | V06 project-init との統合 | #55 | skills-lock/requires 連携の設計と検証 |
+| #57 | V07 190-session 統計との比較可能な評価設計 | #55 | 対照条件・指標・ラベル規則の Spec |
+
+O01 / O02 / I01 は v0.2.0 でも deferred を維持（永続キャッシュ・MCP・高度なグラフ処理・上流標準化は効果実証まで着手しない）。
+
+## v0.1.0 draft→issue 対応（履歴）
 
 | Draft | Title | Depends | Acceptance summary |
 |---|---|---|---|
