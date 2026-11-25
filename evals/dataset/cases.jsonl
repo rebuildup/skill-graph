@@ -1,4 +1,7 @@
-{"id":"rust-impl","query":"Rust CLI implementation","context":"cargo test module boundaries","skill_root":"fixtures/skills","expected_required":["alpha-skill"],"expected_optional":["beta-skill"],"forbidden":[]}
+{"id":"rust-impl","query":"Rust CLI implementation","context":"cargo test module boundaries","skill_root":"fixtures/skills","expected_required":["alpha-skill"],"expected_optional":["beta-skill"],"forbidden":["gamma-skill"]}
 {"id":"release-notes","query":"release notes changelog","context":"version announcement","skill_root":"fixtures/skills","expected_required":["gamma-skill"],"expected_optional":[],"forbidden":["alpha-skill"]}
-{"id":"tests","query":"write tests verification","context":"failing harness","skill_root":"fixtures/skills","expected_required":["beta-skill"],"expected_optional":["alpha-skill"],"forbidden":[]}
+{"id":"tests","query":"write tests verification","context":"failing harness","skill_root":"fixtures/skills","expected_required":["beta-skill"],"expected_optional":["alpha-skill"],"forbidden":["gamma-skill"]}
+{"id":"rust-checks","query":"cargo checks module boundaries","context":"crate layout inspection","skill_root":"fixtures/skills","expected_required":["alpha-skill"],"expected_optional":["beta-skill"],"forbidden":["gamma-skill"]}
+{"id":"release-announcement","query":"version announcement changelog","context":"release notes draft","skill_root":"fixtures/skills","expected_required":["gamma-skill"],"expected_optional":[],"forbidden":["alpha-skill","beta-skill"]}
+{"id":"verification-only","query":"verification harness repair","context":"failing tests","skill_root":"fixtures/skills","expected_required":["beta-skill"],"expected_optional":[],"forbidden":["gamma-skill"]}
 {"id":"none","query":"quantum gardening","context":"","skill_root":"fixtures/skills","expected_required":[],"expected_optional":[],"forbidden":[]}
