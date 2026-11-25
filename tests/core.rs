@@ -10,7 +10,7 @@ fn fixture_root() -> PathBuf {
 #[test]
 fn discovers_fixture_skills() {
     let discovery = discover(&[fixture_root()]);
-    assert_eq!(discovery.skills.len(), 3);
+    assert_eq!(discovery.skills.len(), 7);
     assert!(discovery.errors.is_empty());
 }
 
