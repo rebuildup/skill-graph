@@ -26,3 +26,5 @@ Agent Skills の存在をエージェントが自発的に認識できない問�
 ## MVP
 
 評価ハーネス、オンメモリ Discovery / Parser / Resolver、テキスト検索と参照関係による推薦、最小 CLI、既存開始経路を使う実験、単一ランタイム向け最小 Hook 実験、比較評価を含む。
+
+E03（ADR-0002）で採用方式を確定済み: group F の推薦ポリシー（直接適合 admission + 1-hop `requires` necessity）を `UserPromptSubmit` hook から top-3 で注入する。製品化は P01（#28）・P02（#29）で行う。
