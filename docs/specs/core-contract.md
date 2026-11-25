@@ -24,6 +24,7 @@
 - スキル文書を信頼できない解析データとして扱う。
 - 解析対象の script を実行しない。
 - 探索範囲外への path traversal と symlink 越境を防ぐ。
+- Discovery は symlink 化した `SKILL.md` と symlink directory を辿らず、Markdown link resolution は発見済み skill root 配下に限定する。
 - 外部 link を無断取得しない。
 - 外部 API / network を中核機能の必須条件にしない。
 - ユーザープロンプト、会話全文、秘密情報を永続保存・外部送信しない。
@@ -37,6 +38,7 @@
 - 不要な skill を大量に読み込ませない。
 - 推薦処理の障害で通常開発を停止させない。
 - skill の読み込みを成果物品質の保証として扱わない。
+- 推薦 admission は direct relevance または explicit `requires` dependency に限定する。direct relevance は、query term が skill name に specific に一致する場合、query term が description に 2 語以上一致し少なくとも 1 語が corpus 内で低頻度の場合、または context term が description に 2 語以上一致する場合とする。document frequency は name + description を対象に計算する。Markdown link・名前言及・backlink・body text・link target の一致は relatedness / weak evidence であり、単独では推薦しない。
 
 ## Storage modes
 

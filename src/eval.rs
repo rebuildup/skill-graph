@@ -21,6 +21,12 @@ struct Case {
     expected_optional: Vec<String>,
     #[serde(default)]
     forbidden: Vec<String>,
+    #[serde(default)]
+    timing: Option<String>,
+    #[serde(default)]
+    rationale: Option<String>,
+    #[serde(default)]
+    case_kind: Option<String>,
 }
 
 pub fn run(dataset: &Path) -> Result<Value, String> {
@@ -45,6 +51,7 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         "forbidden_hits": 0,
         "optional_hits": 0,
         "optional_total": 0,
+        "recommended_total": 0,
         "empty_recommendations": 0,
         "elapsed_ms": 0,
     });
@@ -99,13 +106,20 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         totals["optional_total"] = json!(
             totals["optional_total"].as_u64().unwrap_or(0) + case.expected_optional.len() as u64
         );
+        let recommended_count = names.len();
+        totals["recommended_total"] =
+            json!(totals["recommended_total"].as_u64().unwrap_or(0) + recommended_count as u64);
         results.push(json!({
             "id": case.id,
             "recommended": names,
+            "recommended_count": recommended_count,
             "required_hits": required_hits,
             "required_total": case.expected_required.len(),
             "forbidden_hits": forbidden_hits,
             "optional_hits": optional_hits,
+            "timing": case.timing,
+            "rationale": case.rationale,
+            "case_kind": case.case_kind,
         }));
     }
 
@@ -116,6 +130,18 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         1.0
     } else {
         required_hits as f64 / required_total as f64
+    });
+    let recommended_total = totals["recommended_total"].as_u64().unwrap_or(0);
+    let optional_hits = totals["optional_hits"].as_u64().unwrap_or(0);
+    totals["precision_required"] = json!(if recommended_total == 0 {
+        1.0
+    } else {
+        required_hits as f64 / recommended_total as f64
+    });
+    totals["precision_acceptable"] = json!(if recommended_total == 0 {
+        1.0
+    } else {
+        (required_hits + optional_hits) as f64 / recommended_total as f64
     });
     totals["cases"] = json!(results.len());
 

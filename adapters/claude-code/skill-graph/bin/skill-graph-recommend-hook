@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# skill-graph Claude Code hook.
+#   prompt     (UserPromptSubmit): recommend skills for the submitted prompt.
+#   skill-load (PostToolUse/Skill): surface declared dependencies of a just-loaded skill.
+# Emits additionalContext only on hits; silent (exit 0, no output) on no
+# recommendations, repeats within a session, or any internal error — a hook
+# failure must never block the session.
+#
+# Env:
+#   SKILL_GRAPH_BIN       path/name of the skill-graph binary (default: skill-graph)
+#   SKILL_GRAPH_ROOTS     colon-separated skill roots (default: conventional dirs)
+#   SKILL_GRAPH_HOOK_LOG  JSONL log path (default: ${TMPDIR}/skill-graph-hook.jsonl)
+#   SKILL_GRAPH_HOOK_STATE dedup state dir (default: ${TMPDIR}/skill-graph-hook-state)
+#   SKILL_GRAPH_HOOK_NOSTATE=1  no-save mode: no markers, no log writes
+set -uo pipefail
+
+mode="${1:-prompt}"
+input="$(cat)"
+nostate="${SKILL_GRAPH_HOOK_NOSTATE:-0}"
+log="${SKILL_GRAPH_HOOK_LOG:-${TMPDIR:-/tmp}/skill-graph-hook.jsonl}"
+state_dir="${SKILL_GRAPH_HOOK_STATE:-${TMPDIR:-/tmp}/skill-graph-hook-state}"
+bin="${SKILL_GRAPH_BIN:-skill-graph}"
+if [ "$nostate" != "1" ]; then
+  mkdir -p "$(dirname "$log")" "$state_dir"
+fi
+
+start_ns="$(date +%s%N)"
+
+session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"')"
+
+if [ "$mode" = "skill-load" ]; then
+  query="$(printf '%s' "$input" | jq -r '.tool_input.skill // .tool_input.name // .tool_input.skill_name // ""')"
+  query="${query##*/}"
+  query="${query##*:}"
+  dedup_key="skill:$query"
+else
+  query="$(printf '%s' "$input" | jq -r '.prompt // ""')"
+  dedup_key="prompt:$(printf '%s' "$query" | cksum | cut -d' ' -f1)"
+fi
+
+log_event() {
+  [ "$nostate" = "1" ] && return 0
+  printf '%s' "$input" | jq -c --arg mode "$mode" --argjson emitted "$1" \
+    --argjson recommend_ms "$2" --argjson elapsed_ms "$3" --arg names "$4" \
+    --arg reason "$5" \
+    '{hook:"skill-graph-recommend", mode: $mode, hook_event_name: .hook_event_name,
+      session_id, prompt_preview: (.prompt // "" | .[0:120]),
+      tool_name, emitted: $emitted, recommend_ms: $recommend_ms,
+      elapsed_ms: $elapsed_ms,
+      recommended: ($names | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
+      reason: $reason}' >> "$log"
+}
+
+finish() {
+  local emitted="$1" recommend_ms="$2" names="$3" reason="$4"
+  local elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
+  log_event "$emitted" "$recommend_ms" "$elapsed_ms" "$names" "$reason"
+}
+
+# Build skill roots: explicit override, else conventional locations.
+if [ -n "${SKILL_GRAPH_ROOTS:-}" ]; then
+  IFS=':' read -r -a roots <<< "$SKILL_GRAPH_ROOTS"
+else
+  roots=(
+    "$HOME/.claude/skills"
+    "$HOME/.agents/skills"
+    "$PWD/skills"
+    "$PWD/.claude/skills"
+    "$PWD/.agents/skills"
+  )
+fi
+root_args=()
+for root in "${roots[@]}"; do
+  if [ -d "$root" ]; then
+    root_args+=(--root "$root")
+  fi
+done
+
+if [ -z "$query" ] || [ "${#root_args[@]}" -eq 0 ]; then
+  finish false 0 "" "no_input_or_roots"
+  exit 0
+fi
+
+# Dedup: one emission per session+key.
+marker="$state_dir/$session_id.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
+if [ "$nostate" != "1" ]; then
+  if [ -e "$marker" ]; then
+    finish false 0 "" "dedup_skip"
+    exit 0
+  fi
+  touch "$marker"
+fi
+
+recommend_start_ns="$(date +%s%N)"
+if ! recs="$("$bin" recommend "$query" "${root_args[@]}" --max 5 --format json 2>/dev/null)"; then
+  finish false 0 "" "recommender_error"
+  exit 0
+fi
+recommend_ms=$(( ($(date +%s%N) - recommend_start_ns) / 1000000 ))
+
+# skill-load: drop the just-loaded skill itself; keep declared deps only.
+if [ "$mode" = "skill-load" ]; then
+  names="$(printf '%s' "$recs" | jq -r --arg self "$query" \
+    '[.[].skill.name | select(. != $self)] | .[0:3] | join(", ")')"
+else
+  names="$(printf '%s' "$recs" | jq -r '[.[].skill.name] | .[0:3] | join(", ")')"
+fi
+
+if [ -z "$names" ]; then
+  finish false "$recommend_ms" "" "no_recommendations"
+  exit 0
+fi
+
+if [ "$mode" = "skill-load" ]; then
+  context="skill-graph: '$query' declares dependencies — $names. Read the matching SKILL.md files if the task needs them."
+  event="PostToolUse"
+else
+  context="skill-graph: skills relevant to this task — $names. Read the matching SKILL.md before relying on it."
+  event="UserPromptSubmit"
+fi
+jq -nc --arg ctx "$context" --arg ev "$event" \
+  '{hookSpecificOutput:{hookEventName:$ev,additionalContext:$ctx}}'
+finish true "$recommend_ms" "$names" "recommended"

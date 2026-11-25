@@ -47,7 +47,7 @@
 - project / 既存環境への書き込み
 - 未許可 network 通信
 
-性能目標は baseline と初期 benchmark に基づいて確定する。候補値は推薦 p95 100ms 以下、Hook 全体 250ms 以下、推薦最大 3 件だが、実測なしに固定しない。
+性能目標は E03（ADR-0002）で確定した: 推薦 warm p95 100ms 以下、Hook 全体 250ms 以下、推薦最大 3 件。C03（500 skills、release で process p95 約 13ms）と X03（hook end-to-end 約 42ms）の実測で予算内を確認済み。実 corpus での再計測は P01/P02 で行う。
 
 ## Experiment groups
 

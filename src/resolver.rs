@@ -47,9 +47,9 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
         for link in &skill.links {
             if let Some(name) = &link.resolved_name
                 && let Some(targets) = by_name.get(name)
-                && targets.len() == 1
+                && let Some(&target) = targets.first()
             {
-                backlinks.entry(targets[0]).or_default().push(source);
+                backlinks.entry(target).or_default().push(source);
             }
         }
     }
@@ -96,9 +96,10 @@ fn resolve_markdown(
 }
 
 fn resolve_requires(link: &mut SkillLink, by_name: &HashMap<String, Vec<usize>>) {
-    if let Some(indexes) = by_name.get(&link.target)
-        && indexes.len() == 1
-    {
+    // Resolution is to the skill *name*: duplicate installs across roots share
+    // the name, so the link resolves even when copies are ambiguous. Consumers
+    // decide how to handle multiplicity.
+    if by_name.contains_key(&link.target) {
         link.resolved_name = Some(link.target.clone());
     }
 }

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-graph.local/contracts/v1/recommendation.schema.json",
+  "title": "RecommendationList",
+  "type": "array",
+  "items": {
+    "type": "object",
+    "required": ["skill", "score", "reasons", "observation"],
+    "properties": {
+      "skill": { "$ref": "skill-summary.schema.json" },
+      "score": { "type": "number" },
+      "reasons": { "type": "array", "items": { "type": "string" } },
+      "observation": { "type": "string" }
+    },
+    "additionalProperties": false
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-graph.local/contracts/v1/discovery-output.schema.json",
+  "title": "DiscoveryOutput",
+  "type": "object",
+  "required": ["skills", "errors"],
+  "properties": {
+    "skills": {
+      "type": "array",
+      "items": { "$ref": "skill-summary.schema.json" }
+    },
+    "errors": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}

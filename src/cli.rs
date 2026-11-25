@@ -1,5 +1,7 @@
 use crate::discovery::{discover, output};
 use crate::eval;
+use crate::model::ResolveResult;
+use crate::perf;
 use crate::resolver::build;
 use crate::search::recommend;
 use clap::{Parser, Subcommand};
@@ -55,6 +57,12 @@ enum Command {
     Bench {
         dataset: PathBuf,
     },
+    Perf {
+        #[arg(long, value_delimiter = ',', default_value = "50,100,200,500")]
+        sizes: Vec<usize>,
+        #[arg(long, default_value_t = 30)]
+        iterations: usize,
+    },
 }
 
 pub fn run() -> Result<(), String> {
@@ -103,6 +111,14 @@ pub fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        Command::Perf { sizes, iterations } => {
+            let result = perf::run(&sizes, iterations)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
     }
 }
 
@@ -118,19 +134,22 @@ fn graph_for(roots: Vec<PathBuf>) -> Result<crate::resolver::Graph, String> {
     Ok(build(discover(&roots)))
 }
 
-fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> serde_json::Value {
+pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveResult {
     if let Some(indexes) = graph.by_name.get(target) {
-        return json!({
-            "kind": "name",
-            "ambiguous": indexes.len() > 1,
-            "skills": indexes.iter().map(|i| graph.skills[*i].summary()).collect::<Vec<_>>(),
-        });
+        return ResolveResult::Name {
+            ambiguous: indexes.len() > 1,
+            skills: indexes.iter().map(|i| graph.skills[*i].summary()).collect(),
+        };
     }
     let path = crate::resolver::normalize_path(&std::path::PathBuf::from(target));
     if let Some(index) = graph.by_path.get(&path) {
-        return json!({ "kind": "path", "skill": graph.skills[*index].summary() });
+        return ResolveResult::Path {
+            skill: graph.skills[*index].summary(),
+        };
     }
-    json!({ "kind": "unresolved", "target": target })
+    ResolveResult::Unresolved {
+        target: target.to_string(),
+    }
 }
 
 fn print_result(value: impl serde::Serialize, format: &str) -> Result<(), String> {

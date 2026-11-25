@@ -1,6 +1,16 @@
 use crate::model::{LinkKind, Recommendation};
 use crate::resolver::Graph;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+struct Evidence {
+    direct: f64,
+    weak: f64,
+    necessity: f64,
+    name_hits: Vec<(String, usize)>,
+    description_hits: Vec<(String, usize)>,
+    context_hits: Vec<(String, usize)>,
+    reasons: Vec<String>,
+}
 
 pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<Recommendation> {
     let query = query.trim().to_lowercase();
@@ -9,75 +19,216 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         return Vec::new();
     }
 
-    let mut scored: Vec<(usize, f64, Vec<String>)> = Vec::new();
+    let query_terms = terms(&query);
+    let context_terms = terms(&context);
+    let skill_names: Vec<String> = graph
+        .skills
+        .iter()
+        .map(|skill| skill.name.to_lowercase())
+        .collect();
+    let skill_descriptions: Vec<String> = graph
+        .skills
+        .iter()
+        .map(|skill| skill.description.to_lowercase())
+        .collect();
+    // Recommendation identity is the skill name: duplicate installs of the
+    // same skill across roots collapse to one candidate. The representative is
+    // the first copy without a parse error (discovery order is deterministic).
+    let mut rep_of_name: HashMap<&str, usize> = HashMap::new();
+    for (index, skill) in graph.skills.iter().enumerate() {
+        let replace = match rep_of_name.get(skill.name.as_str()) {
+            None => true,
+            Some(&prev) => graph.skills[prev].parse_error.is_some() && skill.parse_error.is_none(),
+        };
+        if replace {
+            rep_of_name.insert(skill.name.as_str(), index);
+        }
+    }
+    let mut candidates: Vec<usize> = rep_of_name.values().copied().collect();
+    candidates.sort_unstable();
+
+    let document_frequency = document_frequency(
+        graph,
+        &candidates,
+        &skill_names,
+        &skill_descriptions,
+        query_terms.iter().chain(context_terms.iter()),
+    );
+
+    let mut infos: Vec<Option<Evidence>> = Vec::new();
+    infos.resize_with(graph.skills.len(), || None);
+
     for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
             continue;
         }
-        let mut reasons = Vec::new();
-        let mut score = 0.0;
+        let name_lower = &skill_names[index];
+        let description_lower = &skill_descriptions[index];
+        let mut direct_reasons = Vec::new();
+        let mut weak_reasons = Vec::new();
 
-        score += field_score(&query, &skill.name, 20.0, "name", &mut reasons);
-        score += field_score(&query, &skill.description, 8.0, "description", &mut reasons);
-        score += field_score(&query, &skill.body_text, 2.0, "body", &mut reasons);
-        score += field_score(
+        // Direct applicability evidence: the skill's own name/description.
+        let direct = field_score(
+            &query,
+            &query_terms,
+            &skill.name,
+            20.0,
+            "name",
+            &mut direct_reasons,
+        ) + field_score(
+            &query,
+            &query_terms,
+            &skill.description,
+            8.0,
+            "description",
+            &mut direct_reasons,
+        ) + field_score(
             &context,
+            &context_terms,
             &skill.description,
             4.0,
             "context+description",
-            &mut reasons,
+            &mut direct_reasons,
         );
-        score += field_score(
+
+        // Weak relatedness evidence: body text and link targets. This can rank
+        // an admitted skill but cannot admit one by itself.
+        let mut weak = field_score(
+            &query,
+            &query_terms,
+            &skill.body_text,
+            2.0,
+            "body",
+            &mut weak_reasons,
+        ) + field_score(
             &context,
+            &context_terms,
             &skill.body_text,
             1.0,
             "context+body",
-            &mut reasons,
+            &mut weak_reasons,
         );
-
         for link in &skill.links {
             match link.kind {
                 LinkKind::Requires | LinkKind::Markdown if matches_query(&query, &link.target) => {
-                    score += 3.0;
-                    reasons.push(format!("{:?} link/dependency: {}", link.kind, link.target));
+                    weak += if link.kind == LinkKind::Requires {
+                        3.0
+                    } else {
+                        1.0
+                    };
+                    weak_reasons.push(format!("{:?} link target: {}", link.kind, link.target));
                 }
                 LinkKind::Mention if matches_query(&query, &link.target) => {
-                    score += 1.0;
-                    reasons.push(format!("mention: {}", link.target));
+                    weak += 1.0;
+                    weak_reasons.push(format!("mention: {}", link.target));
                 }
                 _ => {}
             }
         }
 
-        if score > 0.0 {
-            scored.push((index, score, reasons));
+        let mut reasons = direct_reasons;
+        reasons.extend(weak_reasons);
+        reasons.sort();
+        reasons.dedup();
+
+        let name_hits = query_terms
+            .iter()
+            .filter(|term| name_lower.contains(term.as_str()))
+            .map(|term| {
+                (
+                    term.clone(),
+                    *document_frequency.get(term).unwrap_or(&usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        let description_hits = query_terms
+            .iter()
+            .filter(|term| description_lower.contains(term.as_str()))
+            .map(|term| {
+                (
+                    term.clone(),
+                    *document_frequency.get(term).unwrap_or(&usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+        let context_hits = context_terms
+            .iter()
+            .filter(|term| description_lower.contains(term.as_str()))
+            .map(|term| {
+                (
+                    term.clone(),
+                    *document_frequency.get(term).unwrap_or(&usize::MAX),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        infos[index] = Some(Evidence {
+            direct,
+            weak,
+            necessity: 0.0,
+            name_hits,
+            description_hits,
+            context_hits,
+            reasons,
+        });
+    }
+
+    // Admission is structural, not score-based:
+    // - a name hit admits when it is specific enough (multiple name terms or a
+    //   single low-df term of meaningful length);
+    // - description hits admit when at least two independent query terms match
+    //   and at least one is low-df, so generic words in broad descriptions do
+    //   not admit by themselves;
+    // - at least two independent context-term hits in the description admit;
+    // - an explicit `requires` declaration admits its dependency when the
+    //   declaring skill is admitted (necessity, one hop only);
+    // - Markdown links, mentions, body text, and backlinks never admit.
+    let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
+    let mut seeds = Vec::new();
+    for (index, info) in infos.iter().enumerate() {
+        if info.as_ref().is_some_and(directly_admitted) {
+            admitted.insert(index, Vec::new());
+            seeds.push(index);
         }
     }
 
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut boosted: HashMap<usize, f64> =
-        scored.iter().take(5).map(|(i, s, _)| (*i, *s)).collect();
-    for (index, _, _) in scored.iter().take(5) {
-        for link in &graph.skills[*index].links {
-            if let Some(name) = &link.resolved_name
-                && let Some(targets) = graph.by_name.get(name)
-                && targets.len() == 1
-            {
-                let target = targets[0];
-                if graph.skills[target].parse_error.is_none() {
-                    *boosted.entry(target).or_insert(0.0) += 1.5;
+    for seed in &seeds {
+        for link in &graph.skills[*seed].links {
+            if link.kind != LinkKind::Requires {
+                continue;
+            }
+            let Some(name) = &link.resolved_name else {
+                continue;
+            };
+            let Some(targets) = graph.by_name.get(name) else {
+                continue;
+            };
+            for &target in targets {
+                if graph.skills[target].parse_error.is_some() {
+                    continue;
+                }
+                let is_seed = infos[target].as_ref().is_some_and(directly_admitted);
+                let entry = admitted.entry(target).or_default();
+                entry.push(format!("required by {}", graph.skills[*seed].name));
+                if !is_seed && let Some(info) = infos[target].as_mut() {
+                    info.necessity += 2.0;
                 }
             }
         }
     }
 
-    let mut out: Vec<Recommendation> = scored
-        .into_iter()
-        .filter_map(|(index, base_score, mut reasons)| {
-            let score = boosted.get(&index).copied().unwrap_or(base_score);
+    let mut out: Vec<Recommendation> = infos
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(index, info)| {
+            let info = info.as_mut()?;
+            let mut extra_reasons = admitted.get(&index)?.clone();
+            let score = info.direct + info.weak + info.necessity;
             if score <= 0.0 {
                 return None;
             }
+            let mut reasons = std::mem::take(&mut info.reasons);
+            reasons.append(&mut extra_reasons);
             if let Some(backlinks) = graph.backlinks.get(&index)
                 && !backlinks.is_empty()
             {
@@ -94,12 +245,81 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         })
         .collect();
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
+
+    // Recommendation identity is the skill name, but same-name copies are not
+    // silently conflated: the highest-scoring copy represents the name, and a
+    // name shared by distinct digests is reported as a collision in reasons.
+    for rec in &mut out {
+        if let Some(indexes) = graph.by_name.get(&rec.skill.name) {
+            let distinct: HashSet<&str> = indexes
+                .iter()
+                .filter(|&&i| graph.skills[i].parse_error.is_none())
+                .map(|&i| graph.skills[i].digest.as_str())
+                .collect();
+            if distinct.len() > 1 {
+                rec.reasons.push(format!(
+                    "name collision: {} distinct versions installed",
+                    distinct.len()
+                ));
+                rec.reasons.sort();
+                rec.reasons.dedup();
+            }
+        }
+    }
+    let mut seen_names = HashSet::new();
+    out.retain(|rec| seen_names.insert(rec.skill.name.clone()));
     out.truncate(max);
     out
 }
 
+fn directly_admitted(info: &Evidence) -> bool {
+    let unique_name_hit =
+        info.name_hits.len() == 1 && info.name_hits[0].1 == 1 && info.name_hits[0].0.len() >= 4;
+    let multiple_name_hits =
+        info.name_hits.len() >= 2 && info.name_hits.iter().any(|(_, df)| *df == 1);
+    let description_admitted =
+        info.description_hits.len() >= 2 && info.description_hits.iter().any(|(_, df)| *df == 1);
+    let context_admitted = info.context_hits.len() >= 2;
+    unique_name_hit || multiple_name_hits || description_admitted || context_admitted
+}
+
+fn document_frequency<'a>(
+    graph: &Graph,
+    candidates: &[usize],
+    skill_names: &[String],
+    skill_descriptions: &[String],
+    terms: impl Iterator<Item = &'a String>,
+) -> HashMap<String, usize> {
+    let mut unique = HashSet::new();
+    for term in terms {
+        unique.insert(term.as_str());
+    }
+    let mut frequencies = HashMap::new();
+    for term in unique {
+        // df counts distinct skill names: a term matches a name when any
+        // installed copy of that name contains it, so duplicate installs do
+        // not inflate frequency.
+        let count = candidates
+            .iter()
+            .filter(|&&index| {
+                let Some(copies) = graph.by_name.get(&graph.skills[index].name) else {
+                    return false;
+                };
+                copies.iter().any(|&copy| {
+                    graph.skills[copy].parse_error.is_none()
+                        && (skill_names[copy].contains(term)
+                            || skill_descriptions[copy].contains(term))
+                })
+            })
+            .count();
+        frequencies.insert(term.to_string(), count);
+    }
+    frequencies
+}
+
 fn field_score(
     query: &str,
+    query_terms: &[String],
     field: &str,
     weight: f64,
     label: &str,
@@ -110,11 +330,8 @@ fn field_score(
     }
     let field_lower = field.to_lowercase();
     let mut score = 0.0;
-    for term in query.split_whitespace() {
-        if term.len() < 2 {
-            continue;
-        }
-        if field_lower.contains(term) {
+    for term in query_terms {
+        if field_lower.contains(term.as_str()) {
             score += weight;
             reasons.push(format!("{label}: {term}"));
         }
@@ -128,4 +345,165 @@ fn field_score(
 
 fn matches_query(query: &str, target: &str) -> bool {
     !query.is_empty() && target.to_lowercase().contains(query)
+}
+
+// English function words and generic prompt filler carry no skill-selection
+// signal; matching them against descriptions produces noise admissions on
+// non-task prompts (observed in S02 live verification, issue #46). Terms are
+// compared after lowercasing, so the list is lowercase.
+const STOPWORDS: &[&str] = &[
+    "a",
+    "about",
+    "above",
+    "after",
+    "again",
+    "all",
+    "also",
+    "am",
+    "an",
+    "and",
+    "answer",
+    "any",
+    "are",
+    "as",
+    "at",
+    "be",
+    "because",
+    "been",
+    "before",
+    "being",
+    "below",
+    "between",
+    "both",
+    "but",
+    "by",
+    "can",
+    "could",
+    "did",
+    "do",
+    "does",
+    "doing",
+    "down",
+    "during",
+    "each",
+    "few",
+    "for",
+    "from",
+    "further",
+    "get",
+    "got",
+    "had",
+    "has",
+    "have",
+    "having",
+    "he",
+    "her",
+    "here",
+    "hers",
+    "herself",
+    "him",
+    "himself",
+    "his",
+    "how",
+    "i",
+    "if",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "itself",
+    "just",
+    "keep",
+    "keeps",
+    "let",
+    "like",
+    "me",
+    "more",
+    "most",
+    "my",
+    "myself",
+    "no",
+    "nor",
+    "not",
+    "now",
+    "of",
+    "off",
+    "on",
+    "once",
+    "only",
+    "or",
+    "other",
+    "our",
+    "ours",
+    "ourselves",
+    "out",
+    "over",
+    "own",
+    "please",
+    "same",
+    "she",
+    "should",
+    "so",
+    "some",
+    "such",
+    "than",
+    "that",
+    "the",
+    "their",
+    "theirs",
+    "them",
+    "themselves",
+    "then",
+    "there",
+    "these",
+    "they",
+    "this",
+    "those",
+    "through",
+    "to",
+    "too",
+    "under",
+    "until",
+    "up",
+    "very",
+    "was",
+    "we",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "while",
+    "who",
+    "whom",
+    "why",
+    "will",
+    "with",
+    "within",
+    "without",
+    "would",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+];
+
+fn terms(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .filter_map(|term| {
+            // Strip surrounding punctuation so tokens like `->` or `"word,`
+            // cannot match description text.
+            let term = term.trim_matches(|c: char| !c.is_alphanumeric());
+            if term.chars().count() < 2 {
+                return None;
+            }
+            let lower = term.to_lowercase();
+            if STOPWORDS.contains(&lower.as_str()) {
+                return None;
+            }
+            Some(lower)
+        })
+        .collect()
 }
