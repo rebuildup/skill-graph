@@ -1,6 +1,6 @@
 # Issue Drafts
 
-GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C03 / X01–X03 を Issue #1–#13 として登録済み。P01 / P02 / O01 / O02 / I01 は E03 の結果を見てから登録する。GitHub Issue を正本とし、以下は依存関係と acceptance の対応表である。
+GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C03 / X01–X03 を Issue #1–#13 として登録済み。E03 完了により P01 / P02 を Issue #28 / #29 として登録済み。O01 / O02 / I01 は発動条件未達のため deferred を維持する。GitHub Issue を正本とし、以下は依存関係と acceptance の対応表である。
 
 | Draft | Title | Depends | Acceptance summary |
 |---|---|---|---|
@@ -17,8 +17,8 @@ GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C
 | X02 | Bootstrap・既存 skill 経由の推薦実験 | C02 | group C/D の隔離環境で検証 |
 | X03 | 単一ランタイム向け最小 Hook 実験 | S02, C02 | group E/F の最小実装と計測 |
 | E03 | 比較評価とMVP方式の確定 | X01–X03 | 採用方式、残課題、製品化 Issue を決定 |
-| P01 | CLI・標準 Plugin 配布 | E03 | Agent Plugins v1.0.0 準拠 package を検証 |
-| P02 | 必要なランタイム Adapter の製品化 | E03 | 実測で必要性が確認された adapter のみ実装 |
+| P01 | CLI・標準 Plugin 配布 | E03 (#13) | Issue #28: Agent Plugins v1.0.0 準拠 package を検証 |
+| P02 | 必要なランタイム Adapter の製品化 | E03 (#13), P01 (#28) | Issue #29: 実測で必要性が確認された adapter のみ実装 |
 | O01 | 永続キャッシュ | 性能不足が確認された場合 | cache key、無効化、意味同値性を検証 |
 | O02 | MCP 連携 | 利用価値が確認された場合 | read-only tool surface と権限境界を設計 |
 | I01 | 相互運用仕様と上流標準化 | 実装・運用実績確立後 | 実装実績を根拠に提案 |
