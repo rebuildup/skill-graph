@@ -24,7 +24,18 @@ GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C
 | #56 | V06 project-init との統合 | #55 | skills-lock/requires 連携の設計と検証 |
 | #57 | V07 190-session 統計との比較可能な評価設計 | #55 | 対照条件・指標・ラベル規則の Spec |
 
-O01 / O02 / I01 は v0.2.0 でも deferred を維持（永続キャッシュ・MCP・高度なグラフ処理・上流標準化は効果実証まで着手しない）。
+## v0.3.0 drafts（Spec: docs/specs/v0.3.0.md）
+
+| Workstream | 内容 | Depends |
+|---|---|---|
+| W01 | ランタイム別スキル読み込み検出方式の比較調査 | — |
+| W02 | 共通 Skill Usage Event 契約 + observe 拡張 | W01 |
+| W03 | 標準スキル向け多言語推薦改善（keywords 非依存） | — |
+| W04 | 実環境向け導入・更新・削除経路の整備と検証 | — |
+| W05 | project-init / dotfiles / pc-setup 疎結合統合設計 | W02 |
+| W06 | 実運用観測パイロットと継続改善サイクル | W02, W04 |
+
+O01 / O02 / I01 は v0.2.0/v0.3.0 でも deferred を維持（永続キャッシュ・MCP・高度なグラフ処理・上流標準化は効果実証まで着手しない）。
 
 ## v0.1.0 draft→issue 対応（履歴）
 
