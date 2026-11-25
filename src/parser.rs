@@ -11,6 +11,8 @@ struct Frontmatter {
     name: Option<String>,
     description: Option<String>,
     #[serde(default)]
+    keywords: Vec<String>,
+    #[serde(default)]
     metadata: HashMap<String, String>,
     #[serde(rename = "allowed-tools")]
     #[allow(dead_code)]
@@ -79,6 +81,7 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
     Ok(Skill {
         name,
         description,
+        keywords: meta.keywords,
         path: path.to_path_buf(),
         root: root.to_path_buf(),
         digest,

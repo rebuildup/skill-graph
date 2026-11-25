@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub struct Skill {
     pub name: String,
     pub description: String,
+    pub keywords: Vec<String>,
     pub path: PathBuf,
     pub root: PathBuf,
     pub digest: String,

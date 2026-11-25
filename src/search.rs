@@ -26,10 +26,20 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         .iter()
         .map(|skill| skill.name.to_lowercase())
         .collect();
+    // Match text for description-level evidence: the description plus any
+    // declared `keywords` (e.g. translations or aliases). Keywords are
+    // opt-in frontmatter, so corpus df stays honest.
     let skill_descriptions: Vec<String> = graph
         .skills
         .iter()
-        .map(|skill| skill.description.to_lowercase())
+        .map(|skill| {
+            let mut text = skill.description.to_lowercase();
+            for keyword in &skill.keywords {
+                text.push(' ');
+                text.push_str(&keyword.to_lowercase());
+            }
+            text
+        })
         .collect();
     // Recommendation identity is the skill name: duplicate installs of the
     // same skill across roots collapse to one candidate. The representative is
@@ -63,7 +73,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             continue;
         }
         let name_lower = &skill_names[index];
-        let description_lower = &skill_descriptions[index];
+        let description_lower = skill_descriptions[index].as_str();
         let mut direct_reasons = Vec::new();
         let mut weak_reasons = Vec::new();
 
@@ -78,14 +88,14 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         ) + field_score(
             &query,
             &query_terms,
-            &skill.description,
+            skill_descriptions[index].as_str(),
             8.0,
             "description",
             &mut direct_reasons,
         ) + field_score(
             &context,
             &context_terms,
-            &skill.description,
+            skill_descriptions[index].as_str(),
             4.0,
             "context+description",
             &mut direct_reasons,
@@ -273,14 +283,25 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 }
 
 fn directly_admitted(info: &Evidence) -> bool {
+    // The skill name is the skill's identity: two or more query terms inside
+    // one name is specific regardless of corpus-wide document frequency.
+    // A single name hit stays conservative (low df, meaningful length).
+    let multiple_name_hits = info.name_hits.len() >= 2;
     let unique_name_hit =
         info.name_hits.len() == 1 && info.name_hits[0].1 == 1 && info.name_hits[0].0.len() >= 4;
-    let multiple_name_hits =
-        info.name_hits.len() >= 2 && info.name_hits.iter().any(|(_, df)| *df == 1);
+    // A name hit plus independent description evidence admits: the name anchors
+    // identity while the description confirms topical fit. This keeps high-df
+    // description terms from admitting alone but lets e.g. "PR review" reach
+    // `code-review` on real-size corpora.
+    let name_plus_description = !info.name_hits.is_empty() && info.description_hits.len() >= 2;
     let description_admitted =
         info.description_hits.len() >= 2 && info.description_hits.iter().any(|(_, df)| *df == 1);
     let context_admitted = info.context_hits.len() >= 2;
-    unique_name_hit || multiple_name_hits || description_admitted || context_admitted
+    multiple_name_hits
+        || unique_name_hit
+        || name_plus_description
+        || description_admitted
+        || context_admitted
 }
 
 fn document_frequency<'a>(
@@ -491,19 +512,67 @@ const STOPWORDS: &[&str] = &[
 ];
 
 fn terms(text: &str) -> Vec<String> {
-    text.split_whitespace()
-        .filter_map(|term| {
-            // Strip surrounding punctuation so tokens like `->` or `"word,`
-            // cannot match description text.
-            let term = term.trim_matches(|c: char| !c.is_alphanumeric());
-            if term.chars().count() < 2 {
-                return None;
+    let mut out = Vec::new();
+    let mut ascii_run = String::new();
+    let mut cjk_run = String::new();
+    let mut flush = |ascii: &mut String, cjk: &mut String| {
+        if ascii.chars().count() >= 2 {
+            let lower = ascii.to_lowercase();
+            if !STOPWORDS.contains(&lower.as_str()) {
+                out.push(lower);
             }
-            let lower = term.to_lowercase();
-            if STOPWORDS.contains(&lower.as_str()) {
-                return None;
+        }
+        ascii.clear();
+        // CJK has no whitespace and no case: emit character bigrams so
+        // substring matching works against Japanese descriptions (#61).
+        let chars: Vec<char> = cjk.chars().collect();
+        for window in chars.windows(2) {
+            out.push(window.iter().collect());
+        }
+        cjk.clear();
+    };
+    for raw in text.split_whitespace() {
+        // Strip surrounding punctuation so tokens like `->` or `"word,`
+        // cannot match description text, then split script runs: ASCII
+        // words stay whole, CJK runs become bigrams. Mixed tokens like
+        // "Herdrでworkerを並列に" yield both "herdr"/"worker" and CJK
+        // bigrams.
+        for c in raw.trim_matches(|c: char| !c.is_alphanumeric()).chars() {
+            if c.is_ascii_alphanumeric() {
+                if !cjk_run.is_empty() {
+                    flush(&mut ascii_run, &mut cjk_run);
+                }
+                ascii_run.push(c);
+            } else if is_cjk(c) {
+                if !ascii_run.is_empty() {
+                    flush(&mut ascii_run, &mut cjk_run);
+                }
+                cjk_run.push(c);
+            } else {
+                flush(&mut ascii_run, &mut cjk_run);
             }
-            Some(lower)
-        })
-        .collect()
+        }
+        flush(&mut ascii_run, &mut cjk_run);
+    }
+    out
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0x1100..=0x11FF
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terms;
+
+    #[test]
+    fn cjk_query_produces_bigrams() {
+        let t = terms("不具合報告をトリアージして");
+        eprintln!("terms={t:?}");
+        assert!(t.iter().any(|x| x == "不具"), "{t:?}");
+        assert!(t.iter().any(|x| x == "報告"), "{t:?}");
+    }
 }
