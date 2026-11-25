@@ -24,14 +24,14 @@ Auth-independent release verification for the `release-0-1-0` candidate. Updated
 | 12b | Same-name skill identification contract | verified | C05 (#39): recommend evaluates all copies, groups by name, flags distinct-digest collisions in reasons; identical duplicates dedupe silently; resolve still reports ambiguity (`docs/evidence/2026-11-25-c05-identification-contract.md`) |
 | 13 | Recommendation quality (dataset) | verified | 36-case eval: required_recall 1.0, forbidden_hits 0 (`evals/experiments/x02|x03/report.json`, `bench`) |
 | 14 | Performance targets (ADR-0002) | verified | recommend warm p95 ~0.7 ms @500 skills, CLI process p95 ~13 ms (release), hook end-to-end ~29–42 ms — all within p95<100 ms / hook<250 ms / max 3 (`c03`, `x03`, `p02` evidence) |
-| 15 | Invocation recall / timeliness / artifact quality | partially verified | S02 live (Kilo anonymous, fixed model/route): dep-chain load conversion observed (system-quality via `requires` injection); prompt-mode emissions were mostly stopword noise (#46) but the model suppressed all bad loads; hook latency 24–47 ms. Baseline-vs-F comparison incomplete — baseline-t5 hit the 200 req/hour anonymous quota (429); artifact-quality comparison pending. Recommendation metrics above must not be read as invocation evidence |
+| 15 | Invocation recall / timeliness / artifact quality | verified (live, n=1/cell) | S02 live (Kilo anonymous, fixed model/route): Baseline/E/F all completed on t5 — only arm F loaded the declared dep `system-quality` (graph-attributable); model suppressed all unnecessary loads; hook latency 24–47 ms; #46 noise fix live-verified (previously-noisy prompts now emit nothing). Caveats: one sample per cell, nondeterministic model, qualitative artifact comparison |
 | 16 | release→main merge, external publish, permanent install | not attempted | Explicit approval boundary — unchanged |
 
 ## Distinctions (per operating rules)
 
 - **Implementation complete / integrated**: items 1–14 above (code + evidence merged to `release-0-1-0`).
 - **Recommendation performance**: dataset metrics only; fixture-based, deterministic.
-- **Actual invocation performance**: partially measured — S02 live run on Kilo anonymous free route verified dep-chain load conversion and model-level suppression of noisy recommendations; full Baseline/E/F comparison incomplete (anonymous quota exhausted; see Resume procedure).
+- **Actual invocation performance**: measured on one fixed route/model — dep-chain load conversion verified and isolated to the graph arm (S02 t5: A/E loaded entry skill only, F additionally loaded `system-quality`); model suppressed all unnecessary loads; n=1 per cell so treat as directional, not statistical.
 - **Release verification**: this document; CI green on all merged PRs (#21–#37 range).
 
 ## Known residual gaps
@@ -43,21 +43,6 @@ Auth-independent release verification for the `release-0-1-0` candidate. Updated
 
 ## Resume procedure
 
-The OAuth/Infisical blocker is resolved for verification purposes: the Kilo Gateway anonymous free tier accepts Anthropic-protocol requests with the non-secret placeholder `ANTHROPIC_AUTH_TOKEN=anonymous` (any other dummy value → 401). No credential is used. Quota is ~200 requests/hour per IP; the 2026-11-25 experiment exhausted the window (`baseline-t5` → HTTP 429). The Agent Router `claude.*` authenticated routes remain Infisical-blocked, and `agent task run` supports the `omp` adapter only — the env-var path below is the working route. Full commands and raw-log locations: `docs/evidence/2026-11-25-s02-runtime-feasibility.md` "Live-provider verification".
+Completed 2026-11-25. The working verification route is the Kilo Gateway anonymous free tier — Anthropic-protocol requests with the non-secret placeholder `ANTHROPIC_AUTH_TOKEN=anonymous` (any other dummy value → 401; no credential used). Quota ~200 requests/hour per IP; two windows were needed for the full cell set. The Agent Router `claude.*` authenticated routes remain Infisical-blocked and `agent task run` supports the `omp` adapter only. Full commands, corpus setup, and raw-log locations: `docs/evidence/2026-11-25-s02-runtime-feasibility.md` "Live-provider verification".
 
-```bash
-cd /tmp/sg-live/project-t5-base   # fresh corpus copy; see S02 evidence for setup
-ANTHROPIC_BASE_URL=https://api.kilo.ai/api/gateway ANTHROPIC_AUTH_TOKEN=anonymous \
-ANTHROPIC_SMALL_FAST_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free \
-CLAUDE_CODE_SUBAGENT_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free \
-env -u CLAUDE_CODE_OAUTH_TOKEN claude -p --input-format stream-json \
-  --model nvidia/nemotron-3-ultra-550b-a55b:free \
-  --setting-sources project --no-session-persistence \
-  --output-format stream-json --include-hook-events --verbose \
-  --permission-mode bypassPermissions \
-  < /tmp/sg-live/in-plugin-t5.jsonl > /tmp/sg-live/out/baseline-t5-fresh2.jsonl
-# add --plugin-dir /home/basic/work/skill-graph/adapters/claude-code/skill-graph
-# plus SKILL_GRAPH_* env for the plugin arm (see /tmp/sg-live/run.sh)
-```
-
-Pending live items: `baseline-t5` completion (Baseline-vs-F artifact comparison on the dep-chain task), optional group-E approximation (graph-stripped corpus), Bash `PreToolUse` payload shape (adapter does not hook Bash; mock covered PostToolUse mechanics), and re-run of prompt cells after #46 lands. X04's unconditional-dependency concern resolved positively in t5: `code-naming` was recommended via the dep chain but the model correctly did not load it — the hook emits names only, never forces loads.
+Residual live-verification gaps (non-blocking): statistical power beyond n=1/cell, longer multi-turn sessions, Bash/`PreToolUse` payload shapes (adapter does not hook Bash), and Codex/OpenCode adapters.
