@@ -325,8 +325,8 @@ fn opencode_plugin_spec() -> String {
     format!("file://{}", opencode_plugin_dir().display())
 }
 
-/// Embedded OpenCode plugin source (v0.3.x adapters/opencode/skill-graph).
-const OPENCODE_PLUGIN_TS: &str = include_str!("../adapters/opencode/skill-graph/index.ts");
+/// Embedded OpenCode plugin source, materialized on `adapter enable opencode`.
+const OPENCODE_PLUGIN_TS: &str = include_str!("assets/opencode-plugin.ts");
 
 fn materialize_opencode_plugin() -> Result<PathBuf, String> {
     let dir = opencode_plugin_dir();
