@@ -100,8 +100,9 @@ jobs:
       - name: Bundle portable plugin into metapackage
         run: |
           set -euo pipefail
-          rm -rf npm/skill-graph/plugin
+          rm -rf npm/skill-graph/plugin npm/skill-graph/contracts
           cp -r plugins/skill-graph npm/skill-graph/plugin
+          cp -r contracts npm/skill-graph/contracts
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

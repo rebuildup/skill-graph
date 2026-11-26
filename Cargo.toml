@@ -9,7 +9,8 @@ repository = "https://github.com/rebuildup/skill-graph"
 readme = "README.md"
 keywords = ["agent-skills", "cli", "recommendation"]
 categories = ["command-line-utilities"]
-include = ["src/**/*", "contracts/**/*", "Cargo.toml", "LICENSE", "README.md"]
+include = ["/src/**/*", "/contracts/**/*", "/Cargo.toml", "/LICENSE", "/README.md"]
+exclude = ["/npm/**", "/examples/**", "/tests/**", "/evals/**", "/docs/**", "/adapters/**", "/experiments/**", "/.github/**", "/.agents/**", "/.claude/**", "/.devin/**"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

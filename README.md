@@ -62,9 +62,10 @@ skill-graph discover [--root <dir>]...                  # スキル列挙
 skill-graph search <query> [--root ...]                  # キーワード検索
 skill-graph recommend <query> [--root ...]               # 推薦（--format json）
 skill-graph resolve <target> [--root ...]                # 名前/リンク解決
-skill-graph observe <path>                               # transcript/DB/イベントログの観測集計
+skill-graph observe <path> [--summary]                     # transcript/DB/イベントログの観測集計（--summary で funnel 指標）
 skill-graph detect --runtime <rt> --via <via>            # hook/plugin 用イベント正規化（stdin）
 skill-graph hook <claude-code|codex> <prompt|skill-load> # ランタイム hook 入口（stdin、fail-open）
+skill-graph mcp                                          # stdio MCP server（read-only tools）
 skill-graph adapter <enable|disable|status> <rt>         # adapter ライフサイクル管理
 skill-graph bench <dataset> / perf                       # 評価・性能ハーネス
 ```
@@ -72,6 +73,37 @@ skill-graph bench <dataset> / perf                       # 評価・性能ハー
 既定の探索 root: `~/.claude/skills`、`~/.agents/skills`、`./skills`、
 `./.claude/skills`、`./.agents/skills` 等。`--root` / `SKILL_GRAPH_ROOTS`
 で上書き可能。永続キャッシュ・daemon・PATH 変更は行わない。
+
+## MCP server
+
+`skill-graph mcp` は stdio トランスポートの MCP server。CLI と同一の
+Discovery → Resolver → Recommendation エンジンを read-only tool として
+公開する（ADR-0005）。tool は `recommend` / `discover` / `resolve` の
+3 つで、状態変更・イベント書き込みは行わない。
+
+```bash
+skill-graph mcp   # stdio。JSON-RPC を stdin/stdout で話す
+```
+
+各クライアントの MCP 設定例（`command` はインストール済み
+`skill-graph` のパス）:
+
+```jsonc
+// Claude Code: ~/.claude.json またはプロジェクト .mcp.json
+{ "mcpServers": { "skill-graph": { "command": "skill-graph", "args": ["mcp"] } } }
+
+// OpenCode: opencode.json
+{ "mcp": { "skill-graph": { "type": "local", "command": ["skill-graph", "mcp"] } } }
+
+// Codex: ~/.codex/config.toml
+[mcp_servers.skill-graph]
+command = "skill-graph"
+args = ["mcp"]
+```
+
+`observe --summary` は observation-pilot の funnel 指標
+（delivery / conversion / unnecessary-load / timeliness / context
+consumption、runtime 別内訳つき）を算出する。
 
 ## Runtime adapters（opt-in）
 
@@ -158,7 +190,8 @@ Codex の `/hooks` trust はコマンド文字列の hash-pin のため、移行
   （Codex に Skill tool は存在しない）。
 - bun は os/cpu gating を適用しないため全 platform package を取得する
   （shim が正しい arch を選択するため動作上の問題はない）。
-- 永続キャッシュ・MCP・Embedding は意図的に未実装（効果実証まで保留）。
+- 永続キャッシュ・Embedding・グラフDB は意図的に未実装（v1.0.0 spec で
+  非採用を確定。MCP server は実装済み）。
 
 ## Development
 
