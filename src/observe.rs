@@ -812,20 +812,21 @@ impl CodexScan {
     }
 
     fn finish(self, obs: &mut Observation) {
-        for event in self.injected {
-            record_event(event, obs);
-        }
+        // Emit in encounter (timestamp) order, not collection order:
+        // injected recommendations, prompts, and exec loads are gathered
+        // from different payload types, and downstream funnel logic
+        // falls back to vector order when a timestamp is unparseable.
+        // A stable sort keeps same-timestamp events in feed order.
+        let mut events: Vec<SkillUsageEvent> = Vec::new();
+        events.extend(self.injected);
         for (session, ts, text) in &self.prompts {
-            record_event(
-                SkillUsageEvent::prompt_submit(
-                    Runtime::Codex,
-                    ObservedVia::Transcript,
-                    session,
-                    ts,
-                    text,
-                ),
-                obs,
-            );
+            events.push(SkillUsageEvent::prompt_submit(
+                Runtime::Codex,
+                ObservedVia::Transcript,
+                session,
+                ts,
+                text,
+            ));
         }
         for pending in &self.pending {
             let output = self
@@ -860,21 +861,22 @@ impl CodexScan {
                         confidence: Confidence::Low,
                     },
                 };
-                record_event(
-                    SkillUsageEvent::skill_load(
-                        Runtime::Codex,
-                        ObservedVia::Transcript,
-                        &pending.session_id,
-                        &pending.timestamp,
-                        Some("exec".to_string()),
-                        c.skill_name,
-                        c.skill_path,
-                        c.detection,
-                        c.confidence,
-                    ),
-                    obs,
-                );
+                events.push(SkillUsageEvent::skill_load(
+                    Runtime::Codex,
+                    ObservedVia::Transcript,
+                    &pending.session_id,
+                    &pending.timestamp,
+                    Some("exec".to_string()),
+                    c.skill_name,
+                    c.skill_path,
+                    c.detection,
+                    c.confidence,
+                ));
             }
+        }
+        events.sort_by_cached_key(|e| rfc3339_ms(&e.timestamp).unwrap_or(i64::MAX));
+        for event in events {
+            record_event(event, obs);
         }
     }
 }

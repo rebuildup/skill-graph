@@ -495,7 +495,12 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     // path -> index into `out`; keeps dedup O(1) per candidate so a
     // command stuffed with distinct SKILL.md paths cannot go quadratic.
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for segment in command.split(['&', ';', '|', '\n']) {
+    // path -> segment index of the access that determined its strength.
+    // A path first mentioned by `ls` but read later (`ls a; cat b; cat a`)
+    // is ordered by its READ segment, not its first mention — tool output
+    // follows command order, so this is the order files' contents appear.
+    let mut decisive: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (seq, segment) in command.split(['&', ';', '|', '\n']).enumerate() {
         let access = if segment_has_read_verb(segment) {
             Access::Read
         } else {
@@ -511,15 +516,21 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
                 Some(&i) => {
                     if access == Access::Read && out[i].1 == Access::Reference {
                         out[i].1 = Access::Read;
+                        decisive.insert(path, seq);
                     }
                 }
                 None => {
                     index.insert(path.clone(), out.len());
+                    decisive.insert(path.clone(), seq);
                     out.push((path, access));
                 }
             }
         }
     }
+    // Order by decisive-access position (stable: same-segment paths keep
+    // argument order). Consumers that attribute a single tool output to
+    // the first-read file depend on this matching emission order.
+    out.sort_by_key(|(path, _)| decisive.get(path).copied().unwrap_or(usize::MAX));
     out
 }
 

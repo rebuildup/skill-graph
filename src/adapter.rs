@@ -366,12 +366,70 @@ fn v040_hook_parts(command: &str) -> Option<(String, bool)> {
     }
 }
 
-/// True when some whitespace-separated command token is the v0.3.x
+/// Split a shell command into words honoring single/double quotes and
+/// backslash escapes, returning unquoted words. `split_whitespace`
+/// shatters quoted paths containing spaces (`'/tmp/sg home/bin/…'`),
+/// which would hide a legacy hook binary from ownership/status checks.
+fn shell_words(command: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                for c2 in chars.by_ref() {
+                    if c2 == '\'' {
+                        break;
+                    }
+                    cur.push(c2);
+                }
+            }
+            '"' => {
+                in_word = true;
+                while let Some(c2) = chars.next() {
+                    if c2 == '"' {
+                        break;
+                    }
+                    if c2 == '\\' {
+                        if let Some(e) = chars.next() {
+                            cur.push(e);
+                        }
+                    } else {
+                        cur.push(c2);
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                if let Some(e) = chars.next() {
+                    cur.push(e);
+                }
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            _ => {
+                in_word = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_word {
+        words.push(cur);
+    }
+    words
+}
+
+/// True when some shell word is the v0.3.x
 /// `skill-graph-recommend-hook` binary (matched by file name, so a
 /// foreign command merely mentioning the string is not claimed).
 fn has_legacy_hook_bin(command: &str) -> bool {
-    command.split_whitespace().any(|tok| {
-        let tok = tok.trim_matches(|c| c == '\'' || c == '"');
+    shell_words(command).iter().any(|tok| {
         // A URL merely ending in the marker filename (e.g. a curl|sh
         // one-liner) must not be claimed for deletion.
         if tok.contains("://") {
@@ -551,19 +609,35 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
 /// A project symlink that stays inside the project (e.g. a shared base
 /// file next to the config) is allowed.
 fn check_project_symlink(path: &Path, scope: Scope) -> Result<(), String> {
-    if scope != Scope::Project || !path.is_symlink() {
+    if scope != Scope::Project {
         return Ok(());
     }
-    let target = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    let root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    if !target.starts_with(&root) {
-        return Err(format!(
-            "{}: project config is a symlink resolving outside the project ({}); \
-             refusing to write through it — replace the link with a regular file",
-            path.display(),
-            target.display()
-        ));
+    let root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+    // `path.is_symlink()` only inspects the final component: a symlinked
+    // PARENT (`proj/.claude -> /etc`) with a regular `settings.json`
+    // inside would slip through and write outside the project. Walk the
+    // ancestors that exist (the config or its parent dir may not exist
+    // yet on first enable) and require each to canonicalize inside the
+    // project root.
+    for ancestor in path.ancestors() {
+        if ancestor == cwd || !ancestor.starts_with(&cwd) {
+            break;
+        }
+        if std::fs::symlink_metadata(ancestor).is_err() {
+            continue;
+        }
+        let real =
+            std::fs::canonicalize(ancestor).map_err(|e| format!("{}: {e}", ancestor.display()))?;
+        if !real.starts_with(&root) {
+            return Err(format!(
+                "{}: project config path {} resolves outside the project ({}); \
+                 refusing to write — replace the link with a real path",
+                path.display(),
+                ancestor.display(),
+                real.display()
+            ));
+        }
     }
     Ok(())
 }
@@ -1115,15 +1189,13 @@ fn legacy_hook_bins(config: &Value) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     hook_commands(config)
         .iter()
-        .flat_map(|c| c.split_whitespace())
-        .map(|tok| tok.trim_matches(|c| c == '\'' || c == '"'))
+        .flat_map(|c| shell_words(c))
         .filter(|tok| {
             !tok.contains("://")
                 && tok.contains('/')
                 && Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
         })
-        .filter(|b| seen.insert(b.to_string()))
-        .map(str::to_string)
+        .filter(|b| seen.insert(b.clone()))
         .collect()
 }
 

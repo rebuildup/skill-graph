@@ -101,9 +101,11 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // budget. Estimate first and degrade uniformly (literal text only)
     // rather than hanging or expanding an arbitrary prefix.
     let skill_descriptions: Vec<String> = {
+        // gloss_terms scans every GLOSS key for ANY non-ASCII text
+        // (its fast path is is_ascii, not is_cjk) — count all of it.
         let cjk_work: usize = skill_descriptions_base
             .iter()
-            .filter(|d| d.chars().any(is_cjk))
+            .filter(|d| !d.is_ascii())
             .map(|d| d.len().saturating_mul(GLOSS.len()))
             .fold(0usize, usize::saturating_add);
         if cjk_work <= MAX_MATCH_TERM_WORK {
@@ -842,21 +844,30 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // CJK has no whitespace and no case: emit character bigrams so
         // substring matching works against Japanese descriptions (#61),
         // plus English glossary terms for known dev vocabulary so queries
-        // can reach English-only skill text (#78). Bigram terms share the
-        // whole run as provenance — one run's bigram cluster is a single
-        // piece of literal-text evidence and cannot satisfy the
-        // two-independent-sources admission rule by itself (#144). Gloss
-        // expansions keep per-key provenance: distinct dictionary words
-        // inside one run (e.g. 不具合…再現) are independent evidence, while
-        // a lone word still collapses to one source because its bigram
-        // source equals the key string.
+        // can reach English-only skill text (#78). Provenance is scoped
+        // to the evidence unit: a bigram inside a recognized dictionary
+        // word shares that word's source, bigrams outside every key (and
+        // spanning key boundaries) share the whole run, and gloss
+        // expansions keep their key. One CJK word's literal bigrams and
+        // its gloss expansion are therefore ONE evidence unit and cannot
+        // satisfy the two-independent-sources admission rule by
+        // themselves; distinct dictionary words in one run (e.g.
+        // 不具合…再現) remain independent (#144).
         let run: String = cjk.chars().collect();
+        let gloss = gloss_terms(&run);
+        let keys: Vec<&str> = gloss.iter().map(|(_, key)| key.as_str()).collect();
         let chars: Vec<char> = run.chars().collect();
         for window in chars.windows(2) {
             let bigram: String = window.iter().collect();
-            out.push((bigram, run.clone()));
+            let source = keys
+                .iter()
+                .filter(|key| key.contains(bigram.as_str()))
+                .min_by_key(|key| key.len())
+                .map(|key| (*key).to_string())
+                .unwrap_or_else(|| run.clone());
+            out.push((bigram, source));
         }
-        for (gloss, key) in gloss_terms(&run) {
+        for (gloss, key) in gloss {
             if !STOPWORDS.contains(&gloss.as_str()) {
                 out.push((gloss, key));
             }
@@ -1295,12 +1306,15 @@ mod tests {
     fn cjk_provenance_splits_bigrams_from_gloss_keys() {
         let tagged = terms_tagged("文章を自然にしたい");
         let sources = term_sources(&tagged);
-        // Round-9: the run's bigram cluster shares the whole run as one
-        // provenance, while each glossary expansion keeps its dictionary
-        // key — distinct words in one run are independent evidence.
+        // Round-10: provenance is scoped to the evidence unit — a bigram
+        // inside a recognized dictionary word shares that word's source
+        // (so the word's literal bigrams and its gloss expansion count as
+        // ONE evidence unit), bigrams outside every key share the run,
+        // and distinct words in one run stay independent.
         let run = "文章を自然にしたい";
-        assert_eq!(sources.get("文章").map(String::as_str), Some(run));
+        assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("章を").map(String::as_str), Some(run));
+        assert_eq!(sources.get("自然").map(String::as_str), Some("自然"));
         assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
     }

@@ -944,3 +944,41 @@ fn status_reports_broken_for_missing_legacy_bin() {
     assert!(out.contains("broken"), "{out}");
     assert!(out.contains("not found"), "{out}");
 }
+
+/// A symlinked PARENT directory (`.claude -> /outside`) with a regular
+/// settings.json inside must also be refused — `is_symlink()` on the
+/// final component alone would miss it and write outside the project.
+#[test]
+fn project_config_parent_symlink_outside_project_is_refused() {
+    let f = Fixture::new();
+    let outside = f.home.path().join("outside-claude");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("settings.json"), "{\"hooks\":{}}\n").unwrap();
+    let link = f.proj.path().join(".claude");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let (_, stderr, rc) = f.run_full(&["adapter", "enable", "claude-code", "--project"]);
+    assert_ne!(rc, 0, "enable should refuse: {stderr}");
+    assert!(stderr.contains("outside the project"), "{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("settings.json")).unwrap(),
+        "{\"hooks\":{}}\n"
+    );
+}
+
+/// Legacy hook detection must survive quoted paths containing spaces —
+/// naive whitespace splitting would hide the binary from status.
+#[test]
+fn status_reports_broken_for_quoted_legacy_bin_with_spaces() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"'/tmp/sg home/0.3.0/bin/skill-graph-recommend-hook' prompt"}]}]}}"#,
+    )
+    .unwrap();
+    let (out, _) = f.run(&["adapter", "status", "claude-code", "--user"]);
+    assert!(out.contains("broken"), "{out}");
+    assert!(out.contains("not found"), "{out}");
+}
