@@ -1152,3 +1152,70 @@ fn relative_home_is_rejected() {
     assert_ne!(rc, 0, "{err}");
     assert!(err.contains("HOME"), "{err}");
 }
+
+/// #144 r12 CodeRabbit: `env` consumes its own `name=value` operands
+/// after quote removal — `env 'FOO=bar' <legacy-bin>` is a real legacy
+/// invocation and must be claimed, not mistaken for a foreign command.
+#[test]
+fn env_operand_legacy_invocation_is_ours() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"env 'FOO=bar' '/x/0.3.0/bin/skill-graph-recommend-hook' prompt"}]}]}}"#;
+    std::fs::write(&path, body).unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    if path.exists() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("skill-graph-recommend-hook"), "{text}");
+    }
+}
+
+/// #144 r12 CodeRabbit: an unreadable project-scope opencode config must
+/// not collapse to "unreferenced" — disable keeps the shared plugin
+/// payload rather than breaking the scope that still references it.
+#[test]
+fn disable_keeps_payload_when_project_config_unreadable() {
+    let f = Fixture::new();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let payload = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin");
+    assert!(payload.exists());
+    // Corrupt the PROJECT-scope config after enable: disable --user
+    // succeeds on the user config, but the shared-payload reference
+    // check can no longer prove the project scope is clean.
+    let proj_cfg = f.proj.path().join("opencode.json");
+    std::fs::write(&proj_cfg, "{ not json").unwrap();
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(payload.exists(), "payload must be kept: {out}");
+    assert!(
+        out.contains("keeping the materialized plugin payload"),
+        "{out}"
+    );
+}
+
+/// #144 r12 CodeRabbit: config reads are strict UTF-8 — invalid bytes
+/// must error out instead of being lossy-rewritten and persisted.
+#[test]
+fn invalid_utf8_config_is_rejected_not_rewritten() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes =
+        br#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo "#.to_vec();
+    bytes.push(0xff);
+    bytes.extend_from_slice(br#""}]}]}}"#);
+    std::fs::write(&path, &bytes).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let (out, rc) = f.run(&["adapter", "enable", "claude-code", "--user"]);
+    assert_ne!(rc, 0, "{out}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "config must be untouched"
+    );
+}

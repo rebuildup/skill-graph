@@ -823,16 +823,44 @@ struct CodexScan {
     /// String copied out of the input (multi-MB amplification on a
     /// hostile rollout).
     pending_accesses: usize,
+    /// Compact records for accesses beyond the pending cap: the SKILL.md
+    /// path is dropped but everything needed to emit the same
+    /// skill_load event (minus skill_path) is kept, so runtimes /
+    /// skill_loads counters and the funnel stay exact.
+    overflow: Vec<OverflowAccess>,
+    /// Accesses dropped beyond BOTH caps — finish() reports the
+    /// residual count rather than silently losing the loads.
+    overflow_dropped: usize,
     outputs: HashMap<String, String>,
     /// (session, timestamp, text)
     prompts: Vec<(String, String, String)>,
     injected: Vec<SkillUsageEvent>,
 }
 
+/// A retained skill-load access without its SKILL.md path. `first_read`
+/// marks the call's first Read — the only access allowed to claim the
+/// captured output's frontmatter, mirroring the pending path's
+/// `frontmatter_available` rule.
+struct OverflowAccess {
+    session_id: String,
+    timestamp: String,
+    call_id: String,
+    access: events::Access,
+    first_read: bool,
+    /// Path-derived skill name; None means unattributable unless a
+    /// first-read frontmatter upgrade supplies one (record_event drops
+    /// nameless loads either way).
+    name_hint: Option<String>,
+}
+
 /// Aggregate cap on retained pending accesses per rollout file.
 /// ~64K paths of ≤4 KiB each stays well under the observe retained
 /// budget's intent while covering any realistic session.
 const MAX_PENDING_ACCESSES_TOTAL: usize = 65_536;
+/// Second-tier cap for compact overflow records (no path Strings —
+/// ~150 B/access worst case), keeping counters exact for corpora that
+/// exceed the detailed pending budget.
+const MAX_OVERFLOW_ACCESSES: usize = 65_536;
 
 impl CodexScan {
     fn feed(&mut self, value: &Value) {
@@ -938,18 +966,45 @@ impl CodexScan {
                         }
                     }
                     deduped.sort_by_key(|&(_, _, seq)| seq);
-                    let deduped: Vec<(String, events::Access)> =
+                    let mut deduped: Vec<(String, events::Access)> =
                         deduped.into_iter().map(|(p, a, _)| (p, a)).collect();
-                    if !deduped.is_empty()
-                        && self.pending_accesses + deduped.len() <= MAX_PENDING_ACCESSES_TOTAL
-                    {
-                        self.pending_accesses += deduped.len();
-                        self.pending.push(PendingCall {
-                            call_id,
-                            session_id: self.session_id.clone(),
-                            timestamp: timestamp.clone(),
-                            accesses: deduped,
-                        });
+                    if !deduped.is_empty() {
+                        // Split at the remaining pending budget: the
+                        // prefix keeps full path detail; the suffix is
+                        // retained compactly so runtimes/skill_loads
+                        // counters and the funnel still see every load.
+                        let first_read_pos =
+                            deduped.iter().position(|(_, a)| *a == events::Access::Read);
+                        let room = MAX_PENDING_ACCESSES_TOTAL.saturating_sub(self.pending_accesses);
+                        let fit = deduped.len().min(room);
+                        let rest = if fit < deduped.len() {
+                            deduped.split_off(fit)
+                        } else {
+                            Vec::new()
+                        };
+                        if !deduped.is_empty() {
+                            self.pending_accesses += deduped.len();
+                            self.pending.push(PendingCall {
+                                call_id: call_id.clone(),
+                                session_id: self.session_id.clone(),
+                                timestamp: timestamp.clone(),
+                                accesses: deduped,
+                            });
+                        }
+                        for (k, (path, access)) in rest.iter().enumerate() {
+                            if self.overflow.len() >= MAX_OVERFLOW_ACCESSES {
+                                self.overflow_dropped += 1;
+                                continue;
+                            }
+                            self.overflow.push(OverflowAccess {
+                                session_id: self.session_id.clone(),
+                                timestamp: timestamp.clone(),
+                                call_id: call_id.clone(),
+                                access: *access,
+                                first_read: Some(fit + k) == first_read_pos,
+                                name_hint: events::skill_name_from_path(path),
+                            });
+                        }
                     }
                 }
                 Some("custom_tool_call_output") => {
@@ -1059,6 +1114,56 @@ impl CodexScan {
                     c.confidence,
                 ));
             }
+        }
+        // Overflow accesses lost their path detail but not their load:
+        // emit the same event shape minus skill_path so counters, the
+        // funnel, and the retained-events budget treat them identically.
+        for ov in &self.overflow {
+            // Only the call's first Read may claim the captured output's
+            // frontmatter — same rule as the pending path.
+            let output = if ov.first_read {
+                self.outputs
+                    .get(&ov.call_id)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let (name, detection, confidence) = match ov.access {
+                events::Access::Read if ov.first_read => match events::frontmatter_name(output) {
+                    Some(n) => (Some(n), Detection::FileRead, Confidence::High),
+                    None => (
+                        ov.name_hint.clone(),
+                        Detection::PathReference,
+                        Confidence::Medium,
+                    ),
+                },
+                events::Access::Read => (
+                    ov.name_hint.clone(),
+                    Detection::PathReference,
+                    Confidence::Medium,
+                ),
+                events::Access::Reference => {
+                    (ov.name_hint.clone(), Detection::Mention, Confidence::Low)
+                }
+            };
+            events.push(SkillUsageEvent::skill_load(
+                Runtime::Codex,
+                ObservedVia::Transcript,
+                &ov.session_id,
+                &ov.timestamp,
+                Some("exec".to_string()),
+                name,
+                None,
+                detection,
+                confidence,
+            ));
+        }
+        if self.overflow_dropped > 0 && obs.errors.len() < MAX_OBSERVE_ERRORS {
+            obs.errors.push(format!(
+                "codex rollout accesses truncated: {} beyond retention caps",
+                self.overflow_dropped
+            ));
         }
         events.sort_by_cached_key(|e| rfc3339_ms(&e.timestamp).unwrap_or(i64::MAX));
         for event in events {

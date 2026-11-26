@@ -104,6 +104,22 @@ const MAX_SKILL_BYTES: u64 = 512 * 1024 * 1024;
 /// corpus would otherwise grow `errors` without limit.
 const MAX_DISCOVER_ERRORS: usize = 1024;
 
+/// Every diagnostic shares one bound — root errors, walk errors,
+/// parse errors, and truncation notices alike — so no input shape can
+/// grow `errors` past MAX_DISCOVER_ERRORS. The last slot is reserved
+/// for the latched truncation notice.
+fn push_discovery_error(errors: &mut Vec<String>, msg: String, noted: &mut bool) {
+    if errors.len() + 1 < MAX_DISCOVER_ERRORS {
+        errors.push(msg);
+    } else if !*noted {
+        *noted = true;
+        errors.push(format!(
+            "further discovery errors truncated at {}",
+            MAX_DISCOVER_ERRORS - 1
+        ));
+    }
+}
+
 pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
@@ -112,23 +128,28 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut total_bytes = 0u64;
     let mut capacity_truncated = false;
     let mut errored = 0usize;
-    let mut error_cap_noted = false;
+    let mut errors_noted = false;
 
     for requested in roots {
         if capacity_truncated {
             break;
         }
         let Ok(root) = std::fs::canonicalize(requested) else {
-            errors.push(format!(
-                "root not found or unreadable: {}",
-                requested.display()
-            ));
+            push_discovery_error(
+                &mut errors,
+                format!("root not found or unreadable: {}", requested.display()),
+                &mut errors_noted,
+            );
             continue;
         };
         if !root.is_dir() {
             // An existing non-directory root (e.g. a file path) is an
             // operator/agent error worth surfacing, not a silent skip.
-            errors.push(format!("root is not a directory: {}", requested.display()));
+            push_discovery_error(
+                &mut errors,
+                format!("root is not a directory: {}", requested.display()),
+                &mut errors_noted,
+            );
             continue;
         }
         if !seen_roots.insert(root.clone()) {
@@ -155,13 +176,17 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 Ok(e) => e,
                 Err(err) => {
                     if walk_errors < 100 {
-                        errors.push(format!(
-                            "{}: walk error at {}: {err}",
-                            root.display(),
-                            err.path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default()
-                        ));
+                        push_discovery_error(
+                            &mut errors,
+                            format!(
+                                "{}: walk error at {}: {err}",
+                                root.display(),
+                                err.path()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default()
+                            ),
+                            &mut errors_noted,
+                        );
                     }
                     walk_errors += 1;
                     continue;
@@ -213,15 +238,7 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                     // must not grow `errors`/`seen_files` without limit
                     // in a long-lived MCP server.
                     errored += 1;
-                    if errors.len() < MAX_DISCOVER_ERRORS {
-                        errors.push(err);
-                    } else if !error_cap_noted {
-                        error_cap_noted = true;
-                        errors.push(format!(
-                            "{}: further parse errors truncated at {MAX_DISCOVER_ERRORS}",
-                            root.display()
-                        ));
-                    }
+                    push_discovery_error(&mut errors, err, &mut errors_noted);
                     if errored >= MAX_SKILLS {
                         capacity_truncated = true;
                         break;
@@ -232,20 +249,28 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         // `consumed` counts every iterator item including walk errors;
         // truncation is about consumed budget, not successfully read entries.
         if consumed >= MAX_DISCOVER_ENTRIES && entries.next().is_some() {
-            errors.push(format!(
-                "{}: entry scan truncated at {} entries",
-                root.display(),
-                MAX_DISCOVER_ENTRIES
-            ));
+            push_discovery_error(
+                &mut errors,
+                format!(
+                    "{}: entry scan truncated at {} entries",
+                    root.display(),
+                    MAX_DISCOVER_ENTRIES
+                ),
+                &mut errors_noted,
+            );
         }
     }
 
     if capacity_truncated {
-        errors.push(format!(
-            "discovery truncated: skill limit {} or total size limit {} MiB reached",
-            MAX_SKILLS,
-            MAX_SKILL_BYTES / (1024 * 1024)
-        ));
+        push_discovery_error(
+            &mut errors,
+            format!(
+                "discovery truncated: skill limit {} or total size limit {} MiB reached",
+                MAX_SKILLS,
+                MAX_SKILL_BYTES / (1024 * 1024)
+            ),
+            &mut errors_noted,
+        );
     }
 
     Discovery { skills, errors }

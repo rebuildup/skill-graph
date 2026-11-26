@@ -901,6 +901,9 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // プルリク on the overlap. Work is bounded by total key-match
         // length, not run length.
         let mut cover_key = vec![-1i32; chars.len()];
+        // effective_key[ki] = index of the key whose source gloss
+        // expansions of keys[ki] should carry. Computed below.
+        let mut effective_key: Vec<usize> = Vec::new();
         if !keys.is_empty() {
             // Byte offset -> char index; match_indices only yields
             // char-boundary starts, so interior bytes are never read.
@@ -921,6 +924,31 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
                         }
                     }
                 }
+            }
+            // A key whose EVERY occurrence is subsumed by longer keys
+            // has no independent literal evidence: its gloss expansions
+            // must inherit the covering key's source, or the literal
+            // bigrams and the expansions of ONE dictionary word mint two
+            // "independent" sources (`根本原因` containing `原因` would
+            // self-admit a skill describing just `原因`). A key with at
+            // least one self-covered occurrence keeps its own source.
+            effective_key = vec![0usize; keys.len()];
+            for (ki, key) in keys.iter().enumerate() {
+                let klen = key.chars().count();
+                let mut self_covered = false;
+                let mut covering = ki;
+                for (b, _) in run.match_indices(key) {
+                    let start = byte_to_char[b];
+                    let end = (start + klen).min(chars.len());
+                    if cover_key[start..end].iter().all(|&c| c == ki as i32) {
+                        self_covered = true;
+                        break;
+                    }
+                    if covering == ki && cover_key[start] >= 0 {
+                        covering = cover_key[start] as usize;
+                    }
+                }
+                effective_key[ki] = if self_covered { ki } else { covering };
             }
         }
         // Gap segments: maximal runs of uncovered chars. A gap is
@@ -987,9 +1015,19 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
             // key/gap boundary, or sits in a pure-hiragana gap —
             // dropped so it cannot mint an independent source.
         }
+        // Gloss expansions carry the EFFECTIVE source of their key: a
+        // key fully subsumed by a longer dictionary word inherits that
+        // word's provenance so literal+expansion of one word cannot
+        // count as two independent sources.
+        let key_index: HashMap<&str, usize> =
+            keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         for (gloss, key) in gloss {
             if !STOPWORDS.contains(&gloss.as_str()) {
-                out.push((gloss, key));
+                let source = key_index
+                    .get(key.as_str())
+                    .map(|&ki| keys[effective_key[ki]])
+                    .unwrap_or(key.as_str());
+                out.push((gloss, source.to_string()));
             }
         }
         cjk.clear();
@@ -1476,6 +1514,29 @@ mod tests {
         assert_eq!(gap_sources.get("不具").map(String::as_str), Some("不具合"));
         assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
+    }
+
+    /// #144 round-12 (CodeRabbit): a dictionary key fully contained in a
+    /// longer key must not keep an independent source for its gloss
+    /// expansions — `原因` inside `根本原因` is ONE evidence unit, so a
+    /// skill whose description is just `原因` (literal + `root cause`
+    /// expansion) cannot self-admit on query `根本原因`.
+    #[test]
+    fn contained_key_gloss_inherits_covering_source() {
+        let tagged = terms_tagged("根本原因");
+        let sources = term_sources(&tagged);
+        // The bigram 原因 is covered by 根本原因; the gloss terms that
+        // 原因 would emit (root, cause) must carry the SAME source.
+        assert_eq!(sources.get("原因").map(String::as_str), Some("根本原因"));
+        assert_eq!(sources.get("root").map(String::as_str), Some("根本原因"));
+        assert_eq!(sources.get("cause").map(String::as_str), Some("根本原因"));
+        // A standalone 原因 elsewhere in the run is a genuinely
+        // independent dictionary word and keeps its own source.
+        let tagged = terms_tagged("根本原因と原因");
+        let sources = term_sources(&tagged);
+        assert_eq!(sources.get("原因").map(String::as_str), Some("原因"));
+        assert_eq!(sources.get("root").map(String::as_str), Some("原因"));
+        assert_eq!(sources.get("根本").map(String::as_str), Some("根本原因"));
     }
 
     #[test]

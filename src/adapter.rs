@@ -488,8 +488,22 @@ fn is_env_assignment(word: &ShellWord) -> bool {
     if word.dirty_before_eq || eq == 0 {
         return false;
     }
-    word.text[..eq]
-        .chars()
+    valid_env_name(&word.text[..eq])
+}
+
+/// `env` receives its arguments AFTER shell quote/escape removal, so
+/// `env 'FOO=bar' cmd` really does set FOO — the quoting metadata that
+/// disqualifies a shell-prefix assignment must not apply here. Check
+/// the unquoted text instead.
+fn is_env_arg(word: &ShellWord) -> bool {
+    let Some(eq) = word.text.find('=') else {
+        return false;
+    };
+    eq > 0 && valid_env_name(&word.text[..eq])
+}
+
+fn valid_env_name(name: &str) -> bool {
+    name.chars()
         .enumerate()
         .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
@@ -498,11 +512,21 @@ fn is_env_assignment(word: &ShellWord) -> bool {
 /// assignments and `env` prefixes — legacy hooks embed
 /// `SKILL_GRAPH_BIN=…` before the binary, so the marker must be the
 /// command word, not merely an argument (`echo /x/skill-graph-recommend-hook`
-/// is a foreign mention and must not be claimed).
+/// is a foreign mention and must not be claimed). After `env`, its
+/// `name=value` arguments are recognized on the unquoted text because
+/// env itself does no quote processing.
 fn command_word_index(words: &[ShellWord]) -> Option<usize> {
     let mut i = 0;
+    let mut after_env = false;
     while i < words.len() {
         if is_env_assignment(&words[i]) || words[i].text == "env" {
+            after_env = after_env || words[i].text == "env";
+            i += 1;
+        } else if after_env && (is_env_arg(&words[i]) || words[i].text.starts_with('-')) {
+            // env options (-i, -u NAME, --unset=NAME, ...) and their
+            // name=value operands precede the command; option arguments
+            // that are not assignments may be mis-skipped, which only
+            // ever under-claims — the safe direction.
             i += 1;
         } else {
             break;
@@ -662,8 +686,11 @@ fn read_config(path: &Path) -> Result<Value, String> {
             MAX_CONFIG_BYTES
         ));
     }
-    let text = String::from_utf8_lossy(&buf);
-    serde_json::from_str(&text).map_err(|e| format!("{}: invalid json: {e}", path.display()))
+    // Strict UTF-8: from_utf8_lossy would silently rewrite invalid
+    // bytes to U+FFFD and persist the corruption on the next write.
+    let text =
+        std::str::from_utf8(&buf).map_err(|e| format!("{}: invalid utf-8: {e}", path.display()))?;
+    serde_json::from_str(text).map_err(|e| format!("{}: invalid json: {e}", path.display()))
 }
 
 /// Atomic write that preserves the target's permissions and writes
@@ -797,6 +824,17 @@ fn write_config(path: &Path, value: &Value) -> Result<(), String> {
         return Ok(());
     }
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n";
+    // The read side caps configs at MAX_CONFIG_BYTES; a near-limit
+    // config plus added hooks could otherwise be written back oversized
+    // and become unreadable to status/disable. Refuse before touching
+    // the file.
+    if text.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "{}: config too large after update (>{} bytes)",
+            path.display(),
+            MAX_CONFIG_BYTES
+        ));
+    }
     write_text_atomic(path, &text)
 }
 
@@ -1182,16 +1220,27 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         // references it — user and project scopes share one payload dir.
         // Project configs in other directories cannot be enumerated, so
         // absence of references here is best-effort.
-        if !opencode_plugin_referenced() {
-            // An unresolvable dir means no payload could exist — skip
-            // rather than fabricate a cwd-relative path.
-            if let Some(dir) = opencode_plugin_dir() {
-                let _ = std::fs::remove_dir_all(dir);
+        match opencode_plugin_referenced() {
+            Some(false) => {
+                // An unresolvable dir means no payload could exist —
+                // skip rather than fabricate a cwd-relative path.
+                if let Some(dir) = opencode_plugin_dir() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                outln!(
+                    "note: checked user and current-project opencode configs only; \
+                     project configs in other directories may still reference the plugin"
+                );
             }
-            outln!(
-                "note: checked user and current-project opencode configs only; \
-                 project configs in other directories may still reference the plugin"
-            );
+            Some(true) => {}
+            None => {
+                // A config we could not read might still reference the
+                // shared payload — deleting it would break that scope.
+                outln!(
+                    "warning: could not verify all opencode configs; \
+                     keeping the materialized plugin payload"
+                );
+            }
         }
     }
 
@@ -1201,17 +1250,34 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// True when any opencode config (user or project scope) still contains a
-/// skill-graph plugin specifier.
-fn opencode_plugin_referenced() -> bool {
-    [Scope::User, Scope::Project].iter().any(|scope| {
-        let Ok(path) = config_path(Runtime::Opencode, *scope) else {
-            return false;
+/// Tri-state reference check for the shared opencode plugin payload: `Some(true)` a readable config references
+/// the plugin, `Some(false)` every checkable config is clean, `None`
+/// when at least one config could not be read or resolved. An
+/// unreadable/oversized config must NOT collapse to "unreferenced" —
+/// the caller would delete the shared payload out from under it.
+fn opencode_plugin_referenced() -> Option<bool> {
+    let mut referenced = false;
+    let mut unknown = false;
+    for scope in [Scope::User, Scope::Project] {
+        let Ok(path) = config_path(Runtime::Opencode, scope) else {
+            unknown = true;
+            continue;
         };
-        read_config(&path)
-            .map(|c| count_plugin_entries(&c) + count_legacy_plugin_entries(&c) > 0)
-            .unwrap_or(false)
-    })
+        match read_config(&path) {
+            Ok(c) if count_plugin_entries(&c) + count_legacy_plugin_entries(&c) > 0 => {
+                referenced = true;
+            }
+            Ok(_) => {}
+            Err(_) => unknown = true,
+        }
+    }
+    if referenced {
+        Some(true)
+    } else if unknown {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
