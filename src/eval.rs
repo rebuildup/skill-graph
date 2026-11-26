@@ -59,6 +59,13 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| dataset_abs.parent().unwrap_or(Path::new(".")).to_path_buf());
 
+    // Canonical repo root for the containment check below: a committed
+    // symlink inside the repo could otherwise point skill_root outside
+    // it while passing the lexical checks.
+    let repo_canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+
     let mut graphs: HashMap<PathBuf, crate::resolver::Graph> = HashMap::new();
     let mut discovery_errors: Vec<String> = Vec::new();
     let mut results = Vec::new();
@@ -96,6 +103,19 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
             ));
         }
         let root = repo_root.join(&case.skill_root);
+        // Lexical checks pass for a symlinked path; resolve it so a
+        // repo-committed link cannot smuggle an outside-repo scan.
+        // A root that does not exist falls through — discovery reports
+        // it as an error either way.
+        if let Ok(canon) = root.canonicalize()
+            && !canon.starts_with(&repo_canon)
+        {
+            return Err(format!(
+                "case {}: skill_root resolves outside the repository: {}",
+                case.id,
+                case.skill_root.display()
+            ));
+        }
         if !graphs.contains_key(&root) {
             let discovery = discover(std::slice::from_ref(&root));
             discovery_errors.extend(discovery.errors.iter().cloned());

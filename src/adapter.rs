@@ -72,35 +72,48 @@ pub struct AdapterArgs {
     pub bin: Option<String>,
 }
 
-fn home() -> PathBuf {
+/// HOME is only usable when set to an absolute path: an empty or
+/// relative value would silently turn "user"-scope writes into
+/// cwd-relative paths inside whatever project happens to be checked out.
+fn home() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
+        .filter(|p| p.is_absolute())
+}
+
+/// Absolute directory override from the environment, or None when the
+/// var is unset, empty, or relative — XDG-style vars treat non-absolute
+/// values as invalid and fall back to the default.
+fn env_absolute_dir(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
 }
 
 fn cwd() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-fn config_path(runtime: Runtime, scope: Scope) -> PathBuf {
-    match (runtime, scope) {
-        (Runtime::ClaudeCode, Scope::User) => home().join(".claude/settings.json"),
+fn config_path(runtime: Runtime, scope: Scope) -> Result<PathBuf, String> {
+    let user_home = || -> Result<PathBuf, String> {
+        home().ok_or_else(|| {
+            "HOME is not set to an absolute path; cannot resolve user-scope config".to_string()
+        })
+    };
+    Ok(match (runtime, scope) {
+        (Runtime::ClaudeCode, Scope::User) => user_home()?.join(".claude/settings.json"),
         (Runtime::ClaudeCode, Scope::Project) => cwd().join(".claude/settings.json"),
-        (Runtime::Codex, Scope::User) => {
-            let base = std::env::var_os("CODEX_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home().join(".codex"));
-            base.join("hooks.json")
-        }
+        (Runtime::Codex, Scope::User) => match env_absolute_dir("CODEX_HOME") {
+            Some(base) => base.join("hooks.json"),
+            None => user_home()?.join(".codex/hooks.json"),
+        },
         (Runtime::Codex, Scope::Project) => cwd().join(".codex/hooks.json"),
-        (Runtime::Opencode, Scope::User) => {
-            let base = std::env::var_os("XDG_CONFIG_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home().join(".config"));
-            base.join("opencode/opencode.json")
-        }
+        (Runtime::Opencode, Scope::User) => match env_absolute_dir("XDG_CONFIG_HOME") {
+            Some(base) => base.join("opencode/opencode.json"),
+            None => user_home()?.join(".config/opencode/opencode.json"),
+        },
         (Runtime::Opencode, Scope::Project) => cwd().join("opencode.json"),
-    }
+    })
 }
 
 /// Opt-in compose overlay: an extra settings file the operator asks us
@@ -366,15 +379,47 @@ fn v040_hook_parts(command: &str) -> Option<(String, bool)> {
     }
 }
 
+/// A shell word plus the metadata needed to tell a real `NAME=value`
+/// environment assignment from a quoted/escaped lookalike: `'FOO=bar'`
+/// and `FOO\=bar` are COMMAND words in a real shell (the hook path is
+/// merely an argument), so treating them as assignments would let a
+/// foreign hook be claimed as ours — or vice versa.
+struct ShellWord {
+    text: String,
+    /// Byte index of the first unquoted, unescaped `=`, if any.
+    eq_pos: Option<usize>,
+    /// A quote or escape was consumed before that `=` — the name part
+    /// is not a plain shell identifier, so this is not an assignment.
+    dirty_before_eq: bool,
+}
+
 /// Split a shell command into words honoring single/double quotes and
 /// backslash escapes, returning unquoted words. `split_whitespace`
 /// shatters quoted paths containing spaces (`'/tmp/sg home/bin/…'`),
 /// which would hide a legacy hook binary from ownership/status checks.
-fn shell_words(command: &str) -> Vec<String> {
+fn shell_words(command: &str) -> Vec<ShellWord> {
     let mut words = Vec::new();
-    let mut cur = String::new();
+    let mut cur = ShellWord {
+        text: String::new(),
+        eq_pos: None,
+        dirty_before_eq: false,
+    };
     let mut in_word = false;
     let mut chars = command.chars();
+    // `dirty` records quote/escape consumption only while no real `=`
+    // has been seen: quoting inside the VALUE (`FOO='b ar'`) is normal
+    // and must not disqualify the assignment.
+    macro_rules! push_char {
+        ($c:expr, $quoted:expr) => {{
+            if $quoted && cur.eq_pos.is_none() {
+                cur.dirty_before_eq = true;
+            }
+            if !$quoted && cur.eq_pos.is_none() && $c == '=' {
+                cur.eq_pos = Some(cur.text.len());
+            }
+            cur.text.push($c);
+        }};
+    }
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
@@ -383,7 +428,7 @@ fn shell_words(command: &str) -> Vec<String> {
                     if c2 == '\'' {
                         break;
                     }
-                    cur.push(c2);
+                    push_char!(c2, true);
                 }
             }
             '"' => {
@@ -394,28 +439,36 @@ fn shell_words(command: &str) -> Vec<String> {
                     }
                     if c2 == '\\' {
                         if let Some(e) = chars.next() {
-                            cur.push(e);
+                            push_char!(e, true);
                         }
                     } else {
-                        cur.push(c2);
+                        push_char!(c2, true);
                     }
                 }
             }
             '\\' => {
                 in_word = true;
                 if let Some(e) = chars.next() {
-                    cur.push(e);
+                    // An escaped `=` is data, not an assignment separator.
+                    push_char!(e, true);
                 }
             }
             c if c.is_whitespace() => {
                 if in_word {
-                    words.push(std::mem::take(&mut cur));
+                    words.push(std::mem::replace(
+                        &mut cur,
+                        ShellWord {
+                            text: String::new(),
+                            eq_pos: None,
+                            dirty_before_eq: false,
+                        },
+                    ));
                     in_word = false;
                 }
             }
             _ => {
                 in_word = true;
-                cur.push(c);
+                push_char!(c, false);
             }
         }
     }
@@ -426,17 +479,19 @@ fn shell_words(command: &str) -> Vec<String> {
 }
 
 /// A word is a `NAME=value` environment assignment when the name is a
-/// valid shell identifier and `=` is not the first character.
-fn is_env_assignment(word: &str) -> bool {
-    let Some(eq) = word.find('=') else {
+/// valid shell identifier, `=` is not the first character, and neither
+/// the name nor the `=` was quoted or escaped.
+fn is_env_assignment(word: &ShellWord) -> bool {
+    let Some(eq) = word.eq_pos else {
         return false;
     };
-    let name = &word[..eq];
-    !name.is_empty()
-        && name
-            .chars()
-            .enumerate()
-            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+    if word.dirty_before_eq || eq == 0 {
+        return false;
+    }
+    word.text[..eq]
+        .chars()
+        .enumerate()
+        .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
 }
 
 /// Index of the shell command word: skips leading `NAME=value`
@@ -444,10 +499,10 @@ fn is_env_assignment(word: &str) -> bool {
 /// `SKILL_GRAPH_BIN=…` before the binary, so the marker must be the
 /// command word, not merely an argument (`echo /x/skill-graph-recommend-hook`
 /// is a foreign mention and must not be claimed).
-fn command_word_index(words: &[String]) -> Option<usize> {
+fn command_word_index(words: &[ShellWord]) -> Option<usize> {
     let mut i = 0;
     while i < words.len() {
-        if is_env_assignment(&words[i]) || words[i] == "env" {
+        if is_env_assignment(&words[i]) || words[i].text == "env" {
             i += 1;
         } else {
             break;
@@ -470,7 +525,7 @@ fn is_legacy_bin_word(tok: &str) -> bool {
 /// `skill-graph-recommend-hook` binary.
 fn has_legacy_hook_bin(command: &str) -> bool {
     let words = shell_words(command);
-    command_word_index(&words).is_some_and(|i| is_legacy_bin_word(&words[i]))
+    command_word_index(&words).is_some_and(|i| is_legacy_bin_word(&words[i].text))
 }
 
 /// A hook command is ours when it carries a legacy marker, our ownership
@@ -502,7 +557,11 @@ fn marker_at_boundary(s: &str, marker: &str) -> bool {
     s.match_indices(marker).any(|(i, m)| {
         let before_ok = i == 0 || s.as_bytes()[i - 1] == b'/';
         let rest = &s[i + m.len()..];
-        let after_ok = rest.is_empty() || rest.starts_with(['/', '?', '#', '%']);
+        // Only end-of-string or a path separator may follow: our own
+        // file_url_encode percent-encodes `%`, `?`, `#`, so a raw
+        // delimiter after the marker means a foreign specifier whose
+        // path continues past it (e.g. `opencode-plugin%2F..`).
+        let after_ok = rest.is_empty() || rest.starts_with('/');
         before_ok && after_ok
     })
 }
@@ -561,13 +620,50 @@ fn desired_hooks(
     }
 }
 
+/// Config files live in untrusted project trees: a FIFO would block a
+/// plain read forever, a device/special file could exhaust memory, and
+/// a multi-GB file has no business being a settings.json. Require a
+/// regular file and cap the read.
+const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
 fn read_config(path: &Path) -> Result<Value, String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text)
-            .map_err(|e| format!("{}: invalid json: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(json!({})),
-        Err(e) => Err(format!("{}: {e}", path.display())),
+    use std::io::Read;
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(format!("{}: not a regular file", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(json!({})),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
     }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A file swapped for a FIFO between metadata() and open()
+        // cannot block the read; the fstat below still rejects it.
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts
+        .open(path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    // metadata() -> open() is a TOCTOU window: re-verify the opened fd
+    // is a regular file before reading.
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err(format!("{}: not a regular file", path.display()));
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if buf.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "{}: config too large (>{} bytes)",
+            path.display(),
+            MAX_CONFIG_BYTES
+        ));
+    }
+    let text = String::from_utf8_lossy(&buf);
+    serde_json::from_str(&text).map_err(|e| format!("{}: invalid json: {e}", path.display()))
 }
 
 /// Atomic write that preserves the target's permissions and writes
@@ -836,12 +932,12 @@ fn count_legacy_plugin_entries(config: &Value) -> usize {
         .unwrap_or(0)
 }
 
-fn opencode_plugin_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".local/share"));
-    base.join("skill-graph/opencode-plugin")
+/// None when neither XDG_DATA_HOME nor HOME yields an absolute base —
+/// callers must not fabricate a cwd-relative payload dir.
+fn opencode_plugin_dir() -> Option<PathBuf> {
+    let base =
+        env_absolute_dir("XDG_DATA_HOME").or_else(|| home().map(|h| h.join(".local/share")))?;
+    Some(base.join("skill-graph/opencode-plugin"))
 }
 
 /// Percent-encode a filesystem path for use in a `file://` URI.
@@ -861,15 +957,19 @@ fn file_url_encode(path: &Path) -> String {
     out
 }
 
-fn opencode_plugin_spec() -> String {
-    format!("file://{}", file_url_encode(&opencode_plugin_dir()))
+fn opencode_plugin_spec(dir: &Path) -> String {
+    format!("file://{}", file_url_encode(dir))
 }
 
 /// Embedded OpenCode plugin source, materialized on `adapter enable opencode`.
 const OPENCODE_PLUGIN_TS: &str = include_str!("assets/opencode-plugin.ts");
 
 fn materialize_opencode_plugin() -> Result<PathBuf, String> {
-    let dir = opencode_plugin_dir();
+    let dir = opencode_plugin_dir().ok_or_else(|| {
+        "cannot resolve the opencode plugin directory: XDG_DATA_HOME and HOME \
+         are unset or not absolute"
+            .to_string()
+    })?;
     // The payload is skill-graph-managed, not user dotfiles: a symlink
     // at the payload dir or file would redirect the write into an
     // unrelated file. Replace-mode rename swaps the link itself, and
@@ -899,7 +999,7 @@ pub fn run_adapter(args: &AdapterArgs) -> Result<(), String> {
                 .to_string(),
         );
     }
-    let path = config_path(args.runtime, args.scope);
+    let path = config_path(args.runtime, args.scope)?;
     match args.action {
         Action::Status => status(args, &path),
         Action::Disable => disable(args, &path),
@@ -987,8 +1087,8 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("{}: \"plugins\" must be an array", path.display()))?;
         // Materialize only after the config shape is validated — same
         // resolve/validate-before-touch ordering as the hook path.
-        materialize_opencode_plugin()?;
-        arr.push(json!(opencode_plugin_spec()));
+        let plugin_dir = materialize_opencode_plugin()?;
+        arr.push(json!(opencode_plugin_spec(&plugin_dir)));
     } else {
         strip_our_hooks(&mut config);
         let obj = config
@@ -1083,7 +1183,11 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         // Project configs in other directories cannot be enumerated, so
         // absence of references here is best-effort.
         if !opencode_plugin_referenced() {
-            let _ = std::fs::remove_dir_all(opencode_plugin_dir());
+            // An unresolvable dir means no payload could exist — skip
+            // rather than fabricate a cwd-relative path.
+            if let Some(dir) = opencode_plugin_dir() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
             outln!(
                 "note: checked user and current-project opencode configs only; \
                  project configs in other directories may still reference the plugin"
@@ -1101,7 +1205,9 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
 /// skill-graph plugin specifier.
 fn opencode_plugin_referenced() -> bool {
     [Scope::User, Scope::Project].iter().any(|scope| {
-        let path = config_path(Runtime::Opencode, *scope);
+        let Ok(path) = config_path(Runtime::Opencode, *scope) else {
+            return false;
+        };
         read_config(&path)
             .map(|c| count_plugin_entries(&c) + count_legacy_plugin_entries(&c) > 0)
             .unwrap_or(false)
@@ -1151,14 +1257,18 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                     })
                 })
                 .unwrap_or(false);
-            let plugin_file_missing =
-                v040_plugin && !opencode_plugin_dir().join("index.ts").is_file();
+            // An unresolvable payload dir means the materialized plugin
+            // cannot be verified — do not claim it missing.
+            let plugin_file_missing = v040_plugin
+                && opencode_plugin_dir()
+                    .map(|d| !d.join("index.ts").is_file())
+                    .unwrap_or(false);
             let bin_missing = v040_plugin && !opencode_bin_resolvable();
             broken = plugin_file_missing || bin_missing;
-            if plugin_file_missing {
+            if plugin_file_missing && let Some(dir) = opencode_plugin_dir() {
                 outln!(
                     "  warning: materialized plugin missing: {}",
-                    opencode_plugin_dir().join("index.ts").display()
+                    dir.join("index.ts").display()
                 );
             }
             if bin_missing {
@@ -1256,7 +1366,7 @@ fn legacy_hook_bins(config: &Value) -> Vec<String> {
         .iter()
         .filter_map(|c| {
             let words = shell_words(c);
-            command_word_index(&words).map(|i| words[i].clone())
+            command_word_index(&words).map(|i| words[i].text.clone())
         })
         .filter(|tok| is_legacy_bin_word(tok))
         .filter(|b| seen.insert(b.clone()))

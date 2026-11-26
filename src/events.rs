@@ -148,10 +148,16 @@ pub(crate) const MAX_RECOMMENDED: usize = 32;
 /// unbounded strings into every event line. Charset matches the hook's
 /// sanitizer so hook- and detect-emitted events agree.
 pub(crate) fn sanitize_session_id(session_id: &str) -> String {
-    let filtered: String = session_id
+    // Materialize at most 129 filtered chars: the overflow branch only
+    // needs a 119-char head plus a hash of the ORIGINAL input, so a
+    // hostile multi-MB session id cannot force a full-size allocation.
+    let mut filtered = String::new();
+    let mut chars = session_id
         .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        .collect();
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-');
+    for c in chars.by_ref().take(129) {
+        filtered.push(c);
+    }
     if filtered.chars().count() > 128 {
         // Truncation must not merge distinct ids that share a 128-char
         // prefix: keep a bounded head plus a hash suffix of the original,
@@ -466,8 +472,13 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
             pos = end;
             continue;
         }
+        // Bound the backward scan: any run longer than
+        // MAX_CANDIDATE_BYTES is rejected below anyway, so scanning
+        // further back is pure waste — and an unbounded walk makes a
+        // >4 KiB path-byte run followed by many SKILL.md hits quadratic.
         let mut start = pos;
-        while start > 0 && is_path_byte(bytes[start - 1]) {
+        let scan_floor = pos.saturating_sub(MAX_CANDIDATE_BYTES + NEEDLE.len());
+        while start > scan_floor && is_path_byte(bytes[start - 1]) {
             start -= 1;
         }
         // Trim a leading run that cannot begin a path (e.g. `foo=bar/SKILL.md`
@@ -1177,6 +1188,22 @@ mod tests {
         assert_eq!(
             skill_md_paths("cat x/SKILL.md, then cat y/SKILL.md"),
             vec!["x/SKILL.md".to_string(), "y/SKILL.md".to_string()]
+        );
+    }
+
+    /// #144 round-12: the backward path-byte scan is bounded — a run
+    /// longer than MAX_CANDIDATE_BYTES is rejected anyway, so scanning
+    /// to position 0 would be quadratic on hostile input.
+    #[test]
+    fn skill_md_paths_bounds_backward_scan() {
+        // A >4 KiB path-byte run before SKILL.md is rejected; a valid
+        // candidate later in the same input still extracts.
+        let hostile = format!("{}a/SKILL.md", "a".repeat(5000));
+        assert!(skill_md_paths(&hostile).is_empty());
+        let mixed = format!("{} /SKILL.md b/SKILL.md", "a".repeat(5000));
+        assert_eq!(
+            skill_md_paths(&mixed),
+            vec!["/SKILL.md".to_string(), "b/SKILL.md".to_string()]
         );
     }
 

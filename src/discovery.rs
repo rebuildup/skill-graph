@@ -99,6 +99,10 @@ const MAX_DISCOVER_ENTRIES: usize = 100_000;
 /// without caps a hostile or pathological tree could exhaust memory.
 const MAX_SKILLS: usize = 10_000;
 const MAX_SKILL_BYTES: u64 = 512 * 1024 * 1024;
+/// Parse/read failures are bounded independently of MAX_SKILLS: they
+/// consume neither the skill nor the byte budget, so an unreadable
+/// corpus would otherwise grow `errors` without limit.
+const MAX_DISCOVER_ERRORS: usize = 1024;
 
 pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
@@ -107,6 +111,8 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut seen_files = HashSet::new();
     let mut total_bytes = 0u64;
     let mut capacity_truncated = false;
+    let mut errored = 0usize;
+    let mut error_cap_noted = false;
 
     for requested in roots {
         if capacity_truncated {
@@ -183,10 +189,44 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             }
             match parse_skill(path, &root) {
                 Ok(skill) => {
-                    total_bytes += file_bytes;
+                    // Charge retained bytes, not pre-read metadata:
+                    // from_utf8_lossy can expand invalid UTF-8 ~3x and
+                    // a file that grows between metadata() and the
+                    // capped read is undercounted by file_bytes.
+                    let retained = (skill.body_text.len()
+                        + skill.name.len()
+                        + skill.description.len()
+                        + skill.keywords.iter().map(|k| k.len()).sum::<usize>()
+                        + skill
+                            .links
+                            .iter()
+                            .map(|l| l.target.len() + 64)
+                            .sum::<usize>()
+                        + skill.path.as_os_str().len()
+                        + 256) as u64;
+                    total_bytes = total_bytes.saturating_add(retained.max(file_bytes));
                     skills.push(skill);
                 }
-                Err(err) => errors.push(err),
+                Err(err) => {
+                    // Parse failures do not consume the skill/byte caps,
+                    // so bound them separately: an unreadable corpus
+                    // must not grow `errors`/`seen_files` without limit
+                    // in a long-lived MCP server.
+                    errored += 1;
+                    if errors.len() < MAX_DISCOVER_ERRORS {
+                        errors.push(err);
+                    } else if !error_cap_noted {
+                        error_cap_noted = true;
+                        errors.push(format!(
+                            "{}: further parse errors truncated at {MAX_DISCOVER_ERRORS}",
+                            root.display()
+                        ));
+                    }
+                    if errored >= MAX_SKILLS {
+                        capacity_truncated = true;
+                        break;
+                    }
+                }
             }
         }
         // `consumed` counts every iterator item including walk errors;
