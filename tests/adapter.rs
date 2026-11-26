@@ -47,6 +47,7 @@ impl Fixture {
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .env("SKILL_GRAPH_BIN", self.fake_bin.to_str().unwrap())
             .env_remove("CODEX_HOME")
             .env_remove("SKILL_GRAPH_EXTRA_OVERLAY")
             .stdin(Stdio::null())
@@ -62,6 +63,31 @@ impl Fixture {
         )
     }
 
+    /// `run_full` plus extra environment variables for this invocation.
+    fn run_full_env(&self, args: &[&str], envs: &[(&str, &str)]) -> (String, String, i32) {
+        let mut cmd = Command::new(bin());
+        cmd.args(args)
+            .current_dir(self.proj.path())
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .env("SKILL_GRAPH_BIN", self.fake_bin.to_str().unwrap())
+            .env_remove("CODEX_HOME")
+            .env_remove("SKILL_GRAPH_EXTRA_OVERLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn");
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+            out.status.code().unwrap_or(-1),
+        )
+    }
+
     fn run_full(&self, args: &[&str]) -> (String, String, i32) {
         let out = Command::new(bin())
             .args(args)
@@ -69,6 +95,7 @@ impl Fixture {
             .env("HOME", self.home.path())
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .env("SKILL_GRAPH_BIN", self.fake_bin.to_str().unwrap())
             .env_remove("CODEX_HOME")
             .env_remove("SKILL_GRAPH_EXTRA_OVERLAY")
             .stdin(Stdio::null())
@@ -697,4 +724,78 @@ fn spawn_failure_is_not_hook_capable() {
     assert_ne!(rc, 0, "{err}");
     assert!(err.contains("does not support"), "{err}");
     assert!(!f.home.path().join(".claude/settings.json").exists());
+}
+
+#[test]
+fn trailing_backslash_command_does_not_panic() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // First shell word ending in an unquoted backslash must not panic
+    // first_shell_word (byte-index-out-of-bounds on i += 2).
+    for cmd in [r#""C:\\""#, r#""foo\\""#] {
+        let body = format!(
+            r#"{{"hooks":{{"UserPromptSubmit":[{{"hooks":[{{"type":"command","command":{cmd}}}]}}]}}}}"#
+        );
+        std::fs::write(&path, &body).unwrap();
+        let (out, rc) = f.run(&["adapter", "status", "claude-code", "--user"]);
+        assert_eq!(rc, 0, "{out}");
+    }
+}
+
+#[test]
+fn foreign_mention_of_legacy_marker_survives() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A bare `skill-graph-recommend-hook` word (no path separator) is a
+    // foreign mention — enable/disable must not strip it.
+    let body = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo skill-graph-recommend-hook"}]}]}}"#;
+    std::fs::write(&path, body).unwrap();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("echo skill-graph-recommend-hook"), "{text}");
+}
+
+#[test]
+fn bin_flag_rejected_for_status_and_disable() {
+    let f = Fixture::new();
+    let bin = f.bin_arg();
+    for action in ["status", "disable"] {
+        let (_, err, rc) = f.run_full(&["adapter", action, "claude-code", "--bin", &bin, "--user"]);
+        assert_ne!(rc, 0, "{action}: {err}");
+        assert!(err.contains("only valid for"), "{err}");
+    }
+}
+
+#[test]
+fn opencode_status_broken_when_bin_unresolvable() {
+    let f = Fixture::new();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    // Point SKILL_GRAPH_BIN at a nonexistent path: the plugin spec is
+    // present and the payload exists, but no binary resolves -> broken.
+    let missing = f.home.path().join("gone/skill-graph");
+    let (out, rc) = f.run_env(
+        &["adapter", "status", "opencode", "--user"],
+        &[("SKILL_GRAPH_BIN", missing.to_str().unwrap())],
+    );
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("broken"), "{out}");
+    assert!(out.contains("SKILL_GRAPH_BIN"), "{out}");
+}
+
+#[test]
+fn opencode_enable_warns_when_bin_unresolvable() {
+    let f = Fixture::new();
+    let missing = f.home.path().join("gone/skill-graph");
+    let (out, err, rc) = f.run_full_env(
+        &["adapter", "enable", "opencode", "--user"],
+        &[("SKILL_GRAPH_BIN", missing.to_str().unwrap())],
+    );
+    assert_eq!(rc, 0, "{out} {err}");
+    assert!(err.contains("SKILL_GRAPH_BIN"), "{err}");
 }

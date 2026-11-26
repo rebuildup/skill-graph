@@ -243,7 +243,9 @@ fn first_shell_word(s: &str) -> Option<&str> {
                 in_quote = !in_quote;
                 i += 1;
             }
-            b'\\' if !in_quote => i += 2,
+            // A trailing unquoted backslash would skip past the end;
+            // clamp so `&s[..i]` never slices out of bounds.
+            b'\\' if !in_quote => i = usize::min(i + 2, b.len()),
             c if c.is_ascii_whitespace() && !in_quote => break,
             _ => i += 1,
         }
@@ -276,6 +278,21 @@ fn unquote_shell(word: &str) -> String {
         }
     }
     out
+}
+
+/// The materialized plugin resolves `skill-graph` via `SKILL_GRAPH_BIN`
+/// or PATH at spawn time. Mirror that lookup — existence + exec bit
+/// only, nothing is executed — so enable/status can diagnose a missing
+/// runtime binary. Hook runtimes embed a resolved path instead.
+fn opencode_bin_resolvable() -> bool {
+    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN") {
+        return is_executable(Path::new(&p));
+    }
+    std::env::var_os("PATH")
+        .map(|path_var| {
+            std::env::split_paths(&path_var).any(|dir| is_executable(&dir.join("skill-graph")))
+        })
+        .unwrap_or(false)
 }
 
 fn is_hook_runtime_mode(rt: &str, mode: &str) -> bool {
@@ -311,6 +328,13 @@ fn has_legacy_hook_bin(command: &str) -> bool {
         // A URL merely ending in the marker filename (e.g. a curl|sh
         // one-liner) must not be claimed for deletion.
         if tok.contains("://") {
+            return false;
+        }
+        // Legacy hooks always embedded an absolute/relative PATH to the
+        // binary — a bare `skill-graph-recommend-hook` word (e.g. in
+        // `echo skill-graph-recommend-hook`) is a foreign mention, not
+        // an invocation, and must not be claimed.
+        if !tok.contains('/') {
             return false;
         }
         Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
@@ -662,6 +686,9 @@ fn materialize_opencode_plugin() -> Result<PathBuf, String> {
 }
 
 pub fn run_adapter(args: &AdapterArgs) -> Result<(), String> {
+    if args.bin.is_some() && !matches!(args.action, Action::Enable) {
+        return Err("--bin is only valid for `adapter enable`".to_string());
+    }
     if args.runtime == Runtime::Opencode && args.bin.is_some() {
         return Err(
             "--bin is not supported for opencode (the plugin resolves skill-graph via PATH)"
@@ -732,6 +759,15 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
 
     if args.runtime == Runtime::Opencode {
+        if !opencode_bin_resolvable() {
+            // Warn rather than fail: the runtime's PATH may differ from
+            // this process's, and the plugin fails open until a binary
+            // appears. `status` reports the same condition as broken.
+            eprintln!(
+                "warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH; \
+                 the plugin will fail open until one is installed"
+            );
+        }
         // Drop any prior skill-graph specifier (any generation), then append ours.
         strip_our_plugins(&mut config);
         let obj = config
@@ -890,17 +926,23 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 .map(|p| {
                     p.iter().any(|s| {
                         s.as_str()
-                            .map(|x| x.contains(PLUGIN_MARKER))
+                            .map(|x| marker_at_boundary(x, PLUGIN_MARKER))
                             .unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);
-            broken = v040_plugin && !opencode_plugin_dir().join("index.ts").is_file();
-            if broken {
+            let plugin_file_missing =
+                v040_plugin && !opencode_plugin_dir().join("index.ts").is_file();
+            let bin_missing = v040_plugin && !opencode_bin_resolvable();
+            broken = plugin_file_missing || bin_missing;
+            if plugin_file_missing {
                 println!(
                     "  warning: materialized plugin missing: {}",
                     opencode_plugin_dir().join("index.ts").display()
                 );
+            }
+            if bin_missing {
+                println!("  warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH");
             }
         } else {
             // Check the embedded binary of EVERY owned v0.4.x hook
