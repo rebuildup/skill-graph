@@ -89,13 +89,17 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
                 let h = hex_digest(path.to_string_lossy().as_bytes());
                 format!("invalid-oversized-{}", &h[..8])
             });
+        // Non-empty placeholder: skill-summary.schema.json requires
+        // digest minLength 1 even for parse-error skills.
+        let placeholder: String =
+            format!("unread-{}", dir_name.chars().take(8).collect::<String>());
         return Ok(Skill {
             name: dir_name,
             description: String::new(),
             keywords: Vec::new(),
             path: path.to_path_buf(),
             root: root.to_path_buf(),
-            digest: String::new(),
+            digest: placeholder,
             metadata: HashMap::new(),
             links: Vec::new(),
             body_text: String::new(),

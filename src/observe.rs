@@ -214,13 +214,28 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
         return true;
     }
     // Enforce the schema's kind-conditional required fields; the Rust
-    // struct cannot distinguish "missing" from "empty" for Vec fields.
+    // struct cannot distinguish "missing" from "empty" for Vec fields,
+    // and an explicit JSON null must count as absent (serde maps it to
+    // None, which would re-serialize without the key).
     let required: &[&str] = match event.kind {
         EventKind::PromptSubmit => &["prompt_hash"],
         EventKind::Recommendation => &["recommended", "emitted", "reason", "trigger"],
         EventKind::SkillLoad => &["skill_name", "detection", "confidence"],
     };
-    if required.iter().any(|k| value.get(*k).is_none()) {
+    if required
+        .iter()
+        .any(|k| !value.get(*k).is_some_and(|v| !v.is_null()))
+    {
+        obs.lines_skipped += 1;
+        return true;
+    }
+    // recommended[] items must carry a non-empty name (schema minLength).
+    if event.kind == EventKind::Recommendation
+        && event
+            .recommended
+            .iter()
+            .any(|r| r.name.is_empty() || !crate::parser::valid_skill_name(&r.name))
+    {
         obs.lines_skipped += 1;
         return true;
     }
@@ -480,17 +495,24 @@ impl CodexScan {
                     }
                     // Dedup by path keeping the stronger access so one
                     // call touching the same SKILL.md twice counts once.
+                    // HashMap index keeps this O(1) per access — a hostile
+                    // transcript could otherwise force quadratic scans.
                     let mut deduped: Vec<(String, events::Access)> = Vec::new();
+                    let mut dedup_index: std::collections::HashMap<String, usize> =
+                        std::collections::HashMap::new();
                     for (path, access) in accesses {
-                        match deduped.iter_mut().find(|(p, _)| *p == path) {
-                            Some((_, a))
+                        match dedup_index.get(&path) {
+                            Some(&i)
                                 if access == events::Access::Read
-                                    && *a == events::Access::Reference =>
+                                    && deduped[i].1 == events::Access::Reference =>
                             {
-                                *a = events::Access::Read;
+                                deduped[i].1 = events::Access::Read;
                             }
                             Some(_) => {}
-                            None => deduped.push((path, access)),
+                            None => {
+                                dedup_index.insert(path.clone(), deduped.len());
+                                deduped.push((path, access));
+                            }
                         }
                     }
                     if !deduped.is_empty() {

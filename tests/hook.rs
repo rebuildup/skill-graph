@@ -388,3 +388,46 @@ fn non_object_stdin_writes_no_events() {
     }
     assert!(!dir.path().join("events.jsonl").exists());
 }
+
+/// Every event line the hook actually writes must validate against
+/// contracts/v1/skill-usage-event.schema.json — including non-emitted
+/// recommendation events whose `recommended` list is empty (issue #144:
+/// skip_serializing_if used to drop the key and observe then skipped
+/// the lines, inflating the funnel delivery rate).
+#[test]
+fn emitted_events_validate_against_event_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let payload = json!({"session_id":"s1","prompt":"use alpha-skill please"});
+    let args = &["hook", "claude-code", "prompt"];
+    let (_, rc) = run_hook(args, &payload, &env_pairs(&envs));
+    assert_eq!(rc, 0);
+    // Second identical submit produces a dedup_skip recommendation with
+    // recommended: [] — the exact shape that used to be schema-invalid.
+    let (_, rc) = run_hook(args, &payload, &env_pairs(&envs));
+    assert_eq!(rc, 0);
+
+    let schema: Value = serde_json::from_str(include_str!(
+        "../contracts/v1/skill-usage-event.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::options().build(&schema).unwrap();
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    assert!(
+        events.len() >= 3,
+        "expected prompt_submit+2 recommendations: {events:?}"
+    );
+    let mut saw_empty_recommended = false;
+    for (i, event) in events.iter().enumerate() {
+        if event["kind"] == "recommendation" && event["recommended"] == json!([]) {
+            saw_empty_recommended = true;
+        }
+        assert!(
+            validator.is_valid(event),
+            "event[{i}] failed schema: {}\nerrors: {:?}",
+            serde_json::to_string_pretty(event).unwrap(),
+            validator.iter_errors(event).collect::<Vec<_>>()
+        );
+    }
+    assert!(saw_empty_recommended, "dedup_skip event missing from log");
+}

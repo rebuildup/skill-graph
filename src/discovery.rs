@@ -84,7 +84,26 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         }
         let mut entries = WalkDir::new(&root).follow_links(false).into_iter();
         let mut scanned = 0usize;
-        for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES).flatten() {
+        let mut walk_errors = 0usize;
+        for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {
+            // Surface IO errors (permission-denied dirs etc.) instead of
+            // silently reporting a partial scan as clean.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(err) => {
+                    if walk_errors < 100 {
+                        errors.push(format!(
+                            "{}: walk error at {}: {err}",
+                            root.display(),
+                            err.path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default()
+                        ));
+                    }
+                    walk_errors += 1;
+                    continue;
+                }
+            };
             scanned += 1;
             if entry.file_type().is_symlink() || entry.file_name() != "SKILL.md" {
                 continue;

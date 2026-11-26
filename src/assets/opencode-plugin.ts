@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, closeSync, mkdirSync, openSync, renameSync, statSync, writeSync } from "node:fs"
+import { appendFileSync, closeSync, fchmodSync, mkdirSync, openSync, renameSync, statSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
@@ -37,11 +37,18 @@ const EVENT_LOG_MAX = envUint("SKILL_GRAPH_EVENT_LOG_MAX", 64 * 1024 * 1024)
 const MAX_EMITTED = 10_000
 const MAX_PENDING_SESSIONS = 200
 const MAX_SESSION_CTX = 200
+const MAX_SESSION_NAMES = 32
 const emitted = new Set<string>()
 const sessionCtx = new Map<string, string[]>()
 
 function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex")
+}
+
+// Mirror parser::valid_skill_name — runtime-supplied names are untrusted
+// and must never reach the event contract verbatim.
+function validSkillName(name: string): boolean {
+  return /^[a-z0-9-]{1,64}$/.test(name) && !name.startsWith("-") && !name.endsWith("-")
 }
 
 function emit(event: Record<string, unknown>) {
@@ -57,6 +64,8 @@ function emit(event: Record<string, unknown>) {
     // the Rust hook's permissions.
     const fd = openSync(EVENT_LOG, "a", 0o600)
     try {
+      // mode only applies at creation; tighten pre-existing logs too.
+      fchmodSync(fd, 0o600)
       writeSync(fd, JSON.stringify(event) + "\n")
     } finally {
       closeSync(fd)
@@ -181,6 +190,9 @@ export default Plugin.define({
     dbg("setup called")
     // sessionID -> queued injections for the next context hook
     const pending = new Map<string, { kind: "prompt" | "deps"; names: string[] }[]>()
+    // sessionID -> skills already dependency-recommended (parity with the
+    // Rust hook's `skill:<name>` dedup markers).
+    const loadDedup = new Map<string, Set<string>>()
 
     const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
       if (!names.length) return
@@ -199,11 +211,19 @@ export default Plugin.define({
     // dependency lookups. Bounded like `pending`.
     const rememberSession = (sessionID: string, names: string[]) => {
       if (!names.length) return
+      // Accumulate like the Rust hook's .recommended file: dedup, keep
+      // the most recent MAX_SESSION_NAMES names per session.
+      const merged = [...(sessionCtx.get(sessionID) ?? [])]
+      for (const n of names) {
+        if (validSkillName(n) && !merged.includes(n)) merged.push(n)
+      }
+      const capped = merged.slice(-MAX_SESSION_NAMES)
+      if (!capped.length) return
       if (!sessionCtx.has(sessionID) && sessionCtx.size >= MAX_SESSION_CTX) {
         const oldest = sessionCtx.keys().next().value
         if (oldest !== undefined) sessionCtx.delete(oldest)
       }
-      sessionCtx.set(sessionID, names)
+      sessionCtx.set(sessionID, capped)
     }
 
     await ctx.session.hook("prompt", async (event) => {
@@ -221,7 +241,7 @@ export default Plugin.define({
       if (Array.isArray(skills) && skills.length > 0) {
         for (const s of skills) {
           const name = typeof s === "string" ? s : s?.name ?? s?.id
-          if (typeof name === "string" && name) {
+          if (typeof name === "string" && name && validSkillName(name)) {
             emit({
               ...base("skill_load"),
               session_id: sessionID,
@@ -233,6 +253,9 @@ export default Plugin.define({
           }
         }
       }
+      // Empty prompts carry no signal — the Rust hook exits before
+      // emitting any recommendation event for them.
+      if (!text) return
       const key = sha256(`${sessionID}\n${text}`)
       if (emitted.has(key)) return
       if (emitted.size >= MAX_EMITTED) {
@@ -273,6 +296,18 @@ export default Plugin.define({
         // the shell adapters' skill-load mode, including session-context
         // continuity). recommended[] records exactly the injected set
         // for funnel integrity.
+        // Skip skills this session already got a dependency pass for.
+        let done = loadDedup.get(sessionID)
+        if (!done) {
+          if (loadDedup.size >= MAX_PENDING_SESSIONS) {
+            const oldest = loadDedup.keys().next().value
+            if (oldest !== undefined) loadDedup.delete(oldest)
+          }
+          done = new Set()
+          loadDedup.set(sessionID, done)
+        }
+        if (done.has(skillName)) continue
+        done.add(skillName)
         const sessionNames = sessionCtx.get(sessionID) ?? []
         const deps = await recommendNames(
           skillName,

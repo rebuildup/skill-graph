@@ -81,7 +81,7 @@ skill-graph resolve <target> [--root ...]                # 名前/リンク解�
 skill-graph observe <path> [--summary]                     # transcript/DB/イベントログの観測集計（--summary で funnel 指標）
 skill-graph detect --runtime <rt> --via <via>            # hook/plugin 用イベント正規化（stdin）
                                                          # --via 既定値は "hook"。有効値: hook|plugin|transcript|db
-skill-graph hook <claude-code|codex> <prompt|skill-load> # ランタイム hook 入口（stdin、fail-open）
+skill-graph hook <claude-code|codex|opencode> <prompt|skill-load> # ランタイム hook 入口（stdin、fail-open）
 skill-graph mcp                                          # stdio MCP server（read-only tools）
 skill-graph adapter <enable|disable|status> <rt>         # adapter ライフサイクル管理
 skill-graph bench <dataset> / perf                       # 評価・性能ハーネス
@@ -164,7 +164,7 @@ PATH で解決するため `--bin` は使えない）。PATH 上の候補は `ho
 - イベントは `${TMPDIR}/skill-graph-events.jsonl`（JSONL）へ。
   prompt は SHA-256 hash のみで本文・コマンド・tool response は
   **一切保存しない**。
-- `skill-graph hook`（claude-code / codex）が参照する環境変数:
+- `skill-graph hook`（claude-code / codex / opencode）が参照する環境変数:
   `SKILL_GRAPH_EVENT_LOG` で保存先変更、`SKILL_GRAPH_HOOK_NOSTATE=1`
   で全書き込み無効化（state marker も生成しない no-save mode）、
   `SKILL_GRAPH_EVENT_LOG_MAX`（既定 64MiB）でローテーション。

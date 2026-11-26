@@ -67,7 +67,7 @@ pub enum Trigger {
 /// How strongly the observation supports "the skill was loaded".
 /// Ordered weakest→strongest is NOT the declaration order; rank via
 /// `load_rank` where needed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Detection {
     /// Runtime-native skill mechanism fired (e.g. Claude `Skill` tool).
@@ -87,7 +87,7 @@ pub enum Detection {
     Applied,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     High,
@@ -116,7 +116,7 @@ pub struct SkillUsageEvent {
     pub prompt_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<Trigger>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub recommended: Vec<RecommendedSkill>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitted: Option<bool>,
@@ -215,6 +215,8 @@ impl SkillUsageEvent {
         detection: Detection,
         confidence: Confidence,
     ) -> Self {
+        // tool/skill_path are payload-controlled; cap them so a hostile
+        // payload cannot write unbounded strings into every event line.
         Self {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::SkillLoad,
@@ -229,11 +231,11 @@ impl SkillUsageEvent {
             reason: None,
             recommend_ms: None,
             skill_name,
-            skill_path,
+            skill_path: skill_path.map(|p| p.chars().take(1024).collect()),
             skill_digest: None,
             detection: Some(detection),
             confidence: Some(confidence),
-            tool,
+            tool: tool.map(|t| t.chars().take(256).collect()),
         }
     }
 
@@ -381,6 +383,7 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     }
     let bytes = text.as_bytes();
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut pos = 0usize;
     while pos + NEEDLE.len() <= bytes.len() {
         if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
@@ -397,7 +400,7 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
         // accept the whole run; `is_skill_md_path` filters non-SKILL.md names).
         if let Ok(candidate) = std::str::from_utf8(&bytes[start..end])
             && !candidate.is_empty()
-            && !out.iter().any(|p| p == candidate)
+            && seen.insert(candidate)
         {
             out.push(candidate.to_string());
         }
@@ -407,7 +410,7 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
 }
 
 /// How a shell command segment treats a SKILL.md reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Access {
     /// A read-like verb accesses the file (content likely enters context).
     Read,
@@ -432,6 +435,9 @@ const TRANSPARENT_PREFIXES: &[&str] = &[
 /// and a Reference for `b`. Empty when no SKILL.md path is referenced.
 pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     let mut out: Vec<(String, Access)> = Vec::new();
+    // path -> index into `out`; keeps dedup O(1) per candidate so a
+    // command stuffed with distinct SKILL.md paths cannot go quadratic.
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for segment in command.split(['&', ';', '|', '\n']) {
         let access = if segment_has_read_verb(segment) {
             Access::Read
@@ -444,12 +450,16 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
             }
             // Same path seen earlier: keep the stronger access so
             // `ls x/SKILL.md && cat x/SKILL.md` still counts as a Read.
-            match out.iter_mut().find(|(p, _)| *p == path) {
-                Some((_, a)) if access == Access::Read && *a == Access::Reference => {
-                    *a = Access::Read;
+            match index.get(&path) {
+                Some(&i) => {
+                    if access == Access::Read && out[i].1 == Access::Reference {
+                        out[i].1 = Access::Read;
+                    }
                 }
-                Some(_) => {}
-                None => out.push((path, access)),
+                None => {
+                    index.insert(path.clone(), out.len());
+                    out.push((path, access));
+                }
             }
         }
     }
@@ -527,7 +537,13 @@ pub fn classify_tool_access_all(
         }];
     }
     if is_read_tool(&lower) {
-        for key in ["path", "file_path", "notebook_path"] {
+        for key in [
+            "path",
+            "file_path",
+            "filePath",
+            "notebook_path",
+            "notebookPath",
+        ] {
             if let Some(path) = input.get(key).and_then(Value::as_str)
                 && is_skill_md_path(path)
             {
@@ -538,6 +554,8 @@ pub fn classify_tool_access_all(
     }
     if is_command_tool(&lower) {
         let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<(Option<String>, Detection)> =
+            std::collections::HashSet::new();
         for key in ["command", "cmd", "input"] {
             if let Some(command) = input.get(key).and_then(Value::as_str) {
                 for (path, access) in classify_command(command) {
@@ -550,9 +568,7 @@ pub fn classify_tool_access_all(
                             confidence: Confidence::Low,
                         },
                     };
-                    if !out.iter().any(|o: &LoadClassification| {
-                        o.skill_path == c.skill_path && o.detection == c.detection
-                    }) {
+                    if seen.insert((c.skill_path.clone(), c.detection)) {
                         out.push(c);
                     }
                 }
@@ -611,6 +627,7 @@ pub fn normalize_skill_name(raw: &str) -> Option<String> {
 /// fragments conservatively (returns empty when nothing parses).
 pub fn extract_exec_commands(js: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let bytes = js.as_bytes();
     let mut pos = 0usize;
     while let Some(found) = find_subslice(&bytes[pos..], b"exec_command") {
@@ -623,7 +640,7 @@ pub fn extract_exec_commands(js: &str) -> Vec<String> {
         };
         if let Some(cmd) = extract_cmd_param(window)
             && !cmd.trim().is_empty()
-            && !out.contains(&cmd)
+            && seen.insert(cmd.clone())
         {
             out.push(cmd);
         }
@@ -642,7 +659,11 @@ fn extract_cmd_param(window: &str) -> Option<String> {
     let bytes = window.as_bytes();
     let mut pos = 0usize;
     while pos + 3 < bytes.len() {
-        if &bytes[pos..pos + 3] == b"cmd" {
+        // `cmd` must start at an identifier boundary so `{mycmd: ...}` or
+        // `subcmd=` is not mistaken for the command parameter.
+        let boundary = pos == 0
+            || !(bytes[pos - 1].is_ascii_alphanumeric() || matches!(bytes[pos - 1], b'_' | b'$'));
+        if boundary && &bytes[pos..pos + 3] == b"cmd" {
             let mut i = pos + 3;
             while i < bytes.len() && (bytes[i] as char).is_whitespace() {
                 i += 1;

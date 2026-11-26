@@ -205,8 +205,11 @@ pub fn run() -> Result<(), String> {
             match parsed {
                 Some(runtime) if valid_mode => crate::hook::run_hook(runtime, &mode),
                 _ => {
+                    // Same 16 MiB cap as the real hook path — an
+                    // invalid-args invocation must not drain unboundedly.
                     let mut sink = Vec::new();
-                    let _ = std::io::stdin().read_to_end(&mut sink);
+                    let _ = std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024)
+                        .read_to_end(&mut sink);
                     if parsed.is_none() {
                         eprintln!("skill-graph: unknown runtime: {runtime}");
                     } else {
