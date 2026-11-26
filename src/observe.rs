@@ -99,6 +99,15 @@ fn line_session_id(value: &Value) -> Option<String> {
 }
 
 fn collect_observables(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut visited = std::collections::HashSet::new();
+    collect_observables_inner(path, out, &mut visited)
+}
+
+fn collect_observables_inner(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) -> Result<(), String> {
     if path.is_file() {
         if matches!(
             path.extension().and_then(|e| e.to_str()),
@@ -111,11 +120,22 @@ fn collect_observables(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String
     if !path.is_dir() {
         return Err(format!("not a file or directory: {}", path.display()));
     }
+    // `is_dir` follows symlinks; a symlink cycle would recurse forever.
+    // Canonicalize each directory and visit it at most once — this also
+    // dedups bind mounts and overlapping roots.
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(canonical) {
+        return Ok(());
+    }
     for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let p = entry.path();
+        // Never recurse through symlinked directories.
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            continue;
+        }
         if p.is_dir() {
-            collect_observables(&p, out)?;
+            collect_observables_inner(&p, out, visited)?;
         } else if matches!(
             p.extension().and_then(|e| e.to_str()),
             Some("jsonl") | Some("db")
