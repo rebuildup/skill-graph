@@ -49,6 +49,10 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
     // carries the backlink. Sources are deduplicated per target: a skill
     // referencing the same copy through several link kinds (e.g. a
     // Markdown link plus Requires) counts once.
+    // Worst case is bounded by the discovery caps (10K skills ×
+    // 512 links + 64 requires + 64 mentions ≈ 6.4M pairs, ~100-200 MB
+    // transient per Graph). Rebuilt per call; revisit only if the
+    // discovery caps grow (#144 r13).
     let mut backlinks: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (source, skill) in skills.iter().enumerate() {
         for link in &skill.links {

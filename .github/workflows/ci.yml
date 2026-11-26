@@ -38,6 +38,15 @@ jobs:
               for p in paths
               if json.loads(p.read_text()).get("version") != version
           ]
+          # optionalDependencies pins must track the release version too:
+          # a stale pin silently resolves npm installs to the old binary.
+          for p in paths:
+              if p.name != "package.json":
+                  continue
+              deps = json.loads(p.read_text()).get("optionalDependencies") or {}
+              stale = {k: v for k, v in deps.items() if v != version}
+              if stale:
+                  bad.append(f"{p}: optionalDependencies not at {version}: {stale}")
           if bad:
               sys.exit("version mismatch: " + "; ".join(bad))
           PY

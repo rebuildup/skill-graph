@@ -765,3 +765,41 @@ fn fifo_is_not_an_observable() {
     assert_eq!(obs.files_scanned, 0);
     assert!(obs.loads.is_empty());
 }
+
+/// Round-13: a single JSONL line above the per-record byte cap must be
+/// skipped before serde_json::Value materialization (~16-30x
+/// amplification would otherwise turn one line into gigabytes).
+#[test]
+fn oversized_jsonl_line_is_skipped() {
+    let dir = TempDir::new().unwrap();
+    let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(5 * 1024 * 1024));
+    let path = dir.path().join("big.jsonl");
+    fs::write(&path, format!("{big}\n{{\"type\":\"user\"}}\n")).unwrap();
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 1);
+    assert_eq!(obs.lines_skipped, 1);
+    assert!(obs.events.is_empty());
+}
+
+/// Round-13: an untimestamped recommendation sorts last but uses
+/// encounter-order eligibility; a load that timestamp-kills discarded
+/// for an earlier rec must still be convertible by it.
+#[test]
+fn funnel_mixed_timestamps_convert_via_encounter_order() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // Untimestamped rec FIRST in encounter order.
+            rec_event("s1", "", &["alpha"], true),
+            // Timestamped rec recommending the same skill.
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha"], true),
+            // Old-timestamped load LAST in encounter order: dead for the
+            // 2026 rec by timestamp, positionally after the untimestamped one.
+            load_event("s1", "2020-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+}

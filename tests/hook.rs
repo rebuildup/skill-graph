@@ -463,3 +463,33 @@ fn degenerate_session_ids_stay_distinct() {
     sorted.dedup();
     assert_eq!(sorted.len(), 3, "degenerate ids must not collide: {ids:?}");
 }
+
+/// Round-13: env-supplied hook paths must be absolute — a relative
+/// SKILL_GRAPH_EVENT_LOG/SKILL_GRAPH_HOOK_STATE/TMPDIR would resolve
+/// against the hook's cwd (the project tree) and drop state there.
+#[test]
+fn relative_hook_env_paths_fall_back_to_tmpdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let envs: Vec<(String, String)> = vec![
+        ("SKILL_GRAPH_ROOTS".to_string(), fixture_roots()),
+        ("TMPDIR".to_string(), tmp.path().to_string_lossy().into()),
+        (
+            "SKILL_GRAPH_EVENT_LOG".to_string(),
+            "relative-events.jsonl".to_string(),
+        ),
+        (
+            "SKILL_GRAPH_HOOK_STATE".to_string(),
+            "relative-state".to_string(),
+        ),
+    ];
+    let payload = json!({"session_id":"s1","prompt":"alpha task"});
+    let (_out, rc) = run_hook(
+        &["hook", "claude-code", "prompt"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    // Relative values are ignored: the log lands under TMPDIR instead.
+    assert!(tmp.path().join("skill-graph-events.jsonl").exists());
+    assert!(!std::path::Path::new("relative-events.jsonl").exists());
+}

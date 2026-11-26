@@ -53,9 +53,21 @@ struct HookEnv {
     timestamp: String,
 }
 
+/// Absolute-path env var, or None when unset/relative/empty.
+fn env_absolute_path(var: &str) -> Option<PathBuf> {
+    std::env::var(var).ok().and_then(|v| {
+        let p = PathBuf::from(v);
+        p.is_absolute().then_some(p)
+    })
+}
+
 impl HookEnv {
     fn from_payload(runtime: Runtime, payload: &Value) -> Self {
-        let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+        // Env-supplied paths must be absolute — same policy as the
+        // adapter's HOME/XDG handling: a relative value would resolve
+        // against the hook's cwd (the project tree) and drop state/log
+        // files there (#144 r13).
+        let tmp = env_absolute_path("TMPDIR").unwrap_or_else(|| PathBuf::from("/tmp"));
         let session_id = payload
             .get("session_id")
             .or_else(|| payload.get("sessionID"))
@@ -67,12 +79,10 @@ impl HookEnv {
             runtime,
             nostate: std::env::var("SKILL_GRAPH_HOOK_NOSTATE").as_deref() == Ok("1"),
             state_disabled: false,
-            event_log: std::env::var("SKILL_GRAPH_EVENT_LOG")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(&tmp).join("skill-graph-events.jsonl")),
-            state_dir: std::env::var("SKILL_GRAPH_HOOK_STATE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(&tmp).join("skill-graph-hook-state")),
+            event_log: env_absolute_path("SKILL_GRAPH_EVENT_LOG")
+                .unwrap_or_else(|| tmp.join("skill-graph-events.jsonl")),
+            state_dir: env_absolute_path("SKILL_GRAPH_HOOK_STATE")
+                .unwrap_or_else(|| tmp.join("skill-graph-hook-state")),
             event_log_max: std::env::var("SKILL_GRAPH_EVENT_LOG_MAX")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -769,6 +779,11 @@ pub fn run_hook(runtime: Runtime, mode: &str) -> Result<(), String> {
 /// not a legitimate hook call and is dropped fail-open.
 const MAX_STDIN_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Parsed-payload bound: Value-tree amplification makes multi-MiB JSON
+/// cost hundreds of MB transiently. Legitimate hook messages are
+/// KB-scale.
+const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+
 fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
     let mut input = String::new();
     std::io::stdin()
@@ -776,11 +791,25 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         .read_to_string(&mut input)
         .map_err(|e| format!("stdin: {e}"))?;
     if input.len() as u64 > MAX_STDIN_BYTES {
+        // `take` stopped at the cap with payload still in the pipe:
+        // drain a bounded remainder so the caller does not hit EPIPE
+        // writing to a process that already exited (same contract as
+        // the invalid-args path in cli.rs).
+        let mut sink = Vec::new();
+        let _ = std::io::stdin()
+            .take(MAX_STDIN_BYTES)
+            .read_to_end(&mut sink);
         return Ok(());
     }
     // Empty, non-object, or unparseable stdin is not a hook payload:
     // exit before touching state dirs or the event log (matches the
     // v0.3.x shell hook, which exited early when jq could not parse).
+    // serde_json::Value retains ~16-30x its input size, so refuse to
+    // materialize a tree for payloads far beyond any legitimate hook
+    // message (stdin is already drained to EOF or the cap above).
+    if input.len() > MAX_PARSE_BYTES {
+        return Ok(());
+    }
     let payload: Value = match serde_json::from_str::<Value>(input.trim()) {
         Ok(v) if v.is_object() => v,
         _ => return Ok(()),

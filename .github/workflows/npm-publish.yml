@@ -70,6 +70,17 @@ jobs:
             echo "plugins/skill-graph/plugin.json is $pver but tag is $want" >&2
             exit 1
           }
+          # The metapackage's optionalDependencies must pin the release
+          # version — a stale pin silently ships the previous binary.
+          stale="$(node -e "
+            const d = require('./npm/skill-graph/package.json').optionalDependencies || {};
+            const bad = Object.entries(d).filter(([,v]) => v !== process.argv[1]);
+            if (bad.length) console.log(bad.map(([k,v]) => k + '@' + v).join(','));
+          " "$want")"
+          [ -z "$stale" ] || {
+            echo "optionalDependencies not at $want: $stale" >&2
+            exit 1
+          }
       - name: Download release binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

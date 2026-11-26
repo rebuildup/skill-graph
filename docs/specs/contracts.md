@@ -89,26 +89,47 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   持たない unattributable load は率から除外される（`load_grade_loads` との差が
   帰属不能分）。`loads_per_session` は全 load-grade load を session 数で
   割る top-level 指標であり、帰属不能 load を含む。
+  `context_consumption.emitted_per_session_*` の分母は emitted
+  recommendation を 1 件以上持つ session のみ（全 session ではない）。
+  `Observation.sessions` は生の session id の distinct 数であり、
+  funnel の `(runtime, session_id)` 集計とは sanitize 差異で一致しない
+  ことがある（best-effort count）。
 - `observe` の保持量には集約上限がある: 入力ファイル数 4096、
   ディレクトリ再帰深さ 64、走査エラー 1024 件、ファイル毎 256 MiB
-  （`.db` は `-wal` 込み）、retained events/loads 各 1,000,000、
-  retained detail 合計 64 MiB（イベント/ロードの推定バイト数 —
+  （`.db` は `-wal` 込み）、JSONL 行・`.db` 行の `data` ペイロード毎
+  4 MiB（`serde_json::Value` は入力の ~16-30 倍を占めるため、
+  ファイル上限だけでは 1 行で数 GB を確保しうる）、retained
+  events/loads 各 1,000,000、retained detail 合計 64 MiB
+  （イベント/ロードの推定バイト数 —
   count 上限だけでは contract 適合の巨大イベントでメモリを
   尽くしうるため。`skill_load.file` は走査後に backfill されるため、
   走査中のファイルパス長を事前に課金して過小計上を防ぐ）。
+  `sessions` 集計は生の session id を保持せず hash のみを保持し、
+  cardinality 1,000,000 で打ち切る。`skill_loads` の name-keyed
+  カウンタは 65,536 件で打ち切り、以降の新規 name は計上しない
+  （既存 name の加算は継続）。
   observables として受理するのは regular file のみで、FIFO・
   device・socket は拡張子に関わらず走査対象外（FIFO の
-  `read_to_string` による永久ブロックを防ぐ）。Codex rollout の
-  pending access 集約はファイル毎 65,536 件まで。
-  超過時は `errors` に打ち切り通知が入り、
-  `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される。
+  `read_to_string` による永久ブロックを防ぐ）。JSONL の読み取りは
+  `O_NOFOLLOW | O_NONBLOCK` + fd 再検証 + `take()` 上限で行い、
+  収集時検査との間の FIFO 差し替え・サイズ超過を防ぐ。Codex
+  rollout の pending access 集約はファイル毎 65,536 件までで、
+  超過分は path を持たない compact record（`MAX_OVERFLOW_ACCESSES`
+  65,536 件）として counters/funnel の正確さを保ったまま保持する。
+  いずれの打ち切りも `errors` に latched 通知が入り、
+  `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される
+  （`skill_loads` の name cardinality 打ち切りを除く）。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を
   最大 8,000,000 回で打ち切る。この予算は `summary()` の全
   funnel pass（全体・runtime 別・session 別）で共有され、pass 毎に
   リセットされない（超過後の rec は convert しない。
-  rec 順序は固定なので結果は決定的）。
+  rec 順序は固定なので結果は決定的）。timestamp を持たない rec が
+  1 件でも混在する session では、timestamp による cursor kill を
+  無効化する（encounter-order fallback が timestamp-dead 判定済みの
+  load を位置的に eligible としうるため。消費済み load の kill は
+  有効のまま）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
   `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
@@ -175,7 +196,7 @@ Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts
 
 CLI・hook・MCP・plugin の全入口で同一規則を使う（`src/discovery.rs::resolve_roots`）:
 
-1. `SKILL_GRAPH_ROOTS`（プラットフォームの path-list 区切り）— **非空値が設定されていれば常に最優先**で、設定値が探索範囲の全体を定義する。存在しない・ファイル・権限不足の entry は `discover` の `errors` で診断され、有効 entry のみが走査される。**有効 entry が 0 件でも explicit 引数や既定 root へは拡大しない**（空の走査 + 診断に縮退する）。空文字列は未設定と同等。非 UTF-8 値も `var_os` で「設定済み」と判定される。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。
+1. `SKILL_GRAPH_ROOTS`（プラットフォームの path-list 区切り）— **非空値が設定されていれば常に最優先**で、設定値が探索範囲の全体を定義する。存在しない・ファイル・権限不足の entry は `discover` の `errors` で診断され、有効 entry のみが走査される。**有効 entry が 0 件でも explicit 引数や既定 root へは拡大しない**（空の走査 + 診断に縮退する）。空文字列は未設定と同等。非 UTF-8 値も `var_os` で「設定済み」と判定される。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。OpenCode plugin のみ `:` 区切りで split する（Windows は非対応のため実害なし）。
 2. 明示引数（CLI `--root`、MCP tool `roots`。MCP は 32 件上限）— env 未設定時のみ
 3. 呼び出し側の既定 root（CLI/plugin 既定、hook は runtime 別 fallback）— env 未設定かつ明示引数なしのときのみ
 
@@ -214,12 +235,21 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   （`MAX_CONFIG_BYTES`）。FIFO・`/dev/zero` 等の symlink 先・
   巨大ファイルは `status`/`disable` 経路でも hang/OOM しない。
 - adapter の env 由来パス（`HOME`、`CODEX_HOME`、`XDG_CONFIG_HOME`、
-  `XDG_DATA_HOME`）は絶対パスのみ有効。相対値・非 UTF-8 は未設定
-  として既定解決に縮退し、`file://` spec には絶対パスのみを使う。
+  `XDG_DATA_HOME`、`SKILL_GRAPH_EXTRA_OVERLAY`）は絶対パスのみ有効。
+  相対値・非 UTF-8 は未設定として既定解決に縮退し、`file://` spec
+  には絶対パスのみを使う。hook 側も同規則で `TMPDIR`・
+  `SKILL_GRAPH_EVENT_LOG`・`SKILL_GRAPH_HOOK_STATE` の相対値を
+  未設定として扱う（hook の cwd は project tree でありうるため）。
 - legacy hook 検出の shell 解析は quote/escape を考慮する:
   `'FOO=bar'` や `FOO\=bar` のように quote・escape された `NAME=`
   は env assignment ではなく command word であり、foreign hook と
-  誤認して削除しない。
+  誤認して削除しない。`env` コマンドの `name=value` operand は
+  quote 除去後の text で判定する。`;`/`&&`/`||`/`|` 等の command
+  separator は word 解析の対象外であり、compound command 内の
+  hook 呼出しは所有権検出・除去の対象にならない（under-claim で
+  あり foreign command を巻き込まない方向に倒す既知の制限）。
+  v0.4.x hook command の parse は binary path の single/double
+  quote と引数の quote を受理する。
 - plugin specifier の境界判定で、marker 直後の `%` は follower と
   みなさない（`file_url_encode` は marker 直後に raw `%` を出力
   せず、`%2F` 等の percent-encoding で path が継続しうるため）。
@@ -229,6 +259,11 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   ディレクトリ内 config の置換に限定される設計（dirfd pin や
   `openat2(RESOLVE_BENEATH)` は採用しない）。この残余 race は
   既知の制限として記録する。
+- materialize される OpenCode plugin payload は XDG data dir 配下に
+  置かれ、最終 component の symlink は拒否するが、中間 component
+  （例: `$XDG_DATA_HOME/skill-graph` 自体の symlink）は user 所有
+  領域の自己影響に留まるため祖先 walk の対象外（project config の
+  ような他者が書き換えうる経路ではない）。
 - plugin の `detect` spawn 予算（session 毎 512 回）は
   SKILL.md prefilter を通過した呼出しにのみ課金する —
   無関係な tool 実行が budget を消費して検出を無効化することはない。
@@ -247,3 +282,6 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   skill/byte cap を消費しないが、error エントリ自体は bounded。
   MCP `discover` は全 error を collect してから truncate せず、
   残り枠分のみを保持する。
+- frontmatter `metadata` map は信頼できない入力として bounded:
+  128 entry・value 1024 文字・合計 8,192 文字まで。retained byte
+  会計には metadata の key+value も含まれる。
