@@ -16,6 +16,7 @@ skill-graph は release-driven development で進める。GitHub Issue、Spec、
 - 設計判断は ADR に記録する。
 - 公開 API、保存形式、権限境界、外部依存の変更は明示的にレビューする。
 - `main` への直接 push、force push、rebase merge は行わない。
+- Agent Skills の正本は `.agents/skills/` のみ。`skills/`・`.claude/skills/`・`.devin/skills/` は symlink であり、`bunx skills` の copy install で実ファイルに戻った場合は symlink に戻してから commit する（詳細: `docs/development.md`「Agent Skills の配置」）。
 
 ## Verification
 
