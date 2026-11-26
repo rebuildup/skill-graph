@@ -1,123 +1,175 @@
 #!/usr/bin/env bash
-# skill-graph Codex hook.
-#   prompt     (UserPromptSubmit): recommend skills for the submitted prompt.
-#   skill-load (PostToolUse/Skill): surface declared dependencies of a just-loaded skill.
-# Emits additionalContext only on hits; silent (exit 0, no output) on no
-# recommendations, repeats within a session, or any internal error — a hook
-# failure must never block the session.
+# skill-graph runtime hook — emits Skill Usage Events (contracts/v1).
+#
+#   prompt      (UserPromptSubmit): emit prompt_submit + recommendation events,
+#                inject additionalContext on hits.
+#   skill-load  (PostToolUse): detect a skill load via `skill-graph detect`,
+#                emit a skill_load event, and surface declared dependencies.
+#
+# Detection and recommendation are separate: non-skill-load tool calls are
+# excluded by a cheap jq pre-filter before the binary is invoked, and no
+# command lines, tool responses, or prompt bodies are ever persisted —
+# prompts are stored as SHA-256 hashes only.
+#
+# Fails open: any internal error exits 0 silently and never blocks the session.
 #
 # Env:
-#   SKILL_GRAPH_BIN       path/name of the skill-graph binary (default: skill-graph)
-#   SKILL_GRAPH_ROOTS     colon-separated skill roots (default: conventional dirs)
-#   SKILL_GRAPH_HOOK_LOG  JSONL log path (default: ${TMPDIR}/skill-graph-hook.jsonl)
+#   SKILL_GRAPH_BIN        path/name of the skill-graph binary (default: skill-graph)
+#   SKILL_GRAPH_ROOTS      colon-separated skill roots (default: conventional dirs)
+#   SKILL_GRAPH_EVENT_LOG  JSONL event log (default: ${TMPDIR}/skill-graph-events.jsonl)
 #   SKILL_GRAPH_HOOK_STATE dedup state dir (default: ${TMPDIR}/skill-graph-hook-state)
-#   SKILL_GRAPH_HOOK_NOSTATE=1  no-save mode: no markers, no log writes
+#   SKILL_GRAPH_HOOK_NOSTATE=1  no-save mode: no markers, no event writes
 set -uo pipefail
 
 mode="${1:-prompt}"
 input="$(cat)"
 nostate="${SKILL_GRAPH_HOOK_NOSTATE:-0}"
-log="${SKILL_GRAPH_HOOK_LOG:-${TMPDIR:-/tmp}/skill-graph-hook.jsonl}"
+event_log="${SKILL_GRAPH_EVENT_LOG:-${TMPDIR:-/tmp}/skill-graph-events.jsonl}"
 state_dir="${SKILL_GRAPH_HOOK_STATE:-${TMPDIR:-/tmp}/skill-graph-hook-state}"
 bin="${SKILL_GRAPH_BIN:-skill-graph}"
+runtime="claude-code"
+case "$0" in */codex/*) runtime="codex" ;; esac
+
 if [ "$nostate" != "1" ]; then
-  mkdir -p "$(dirname "$log")" "$state_dir"
+  mkdir -p "$(dirname "$event_log")" "$state_dir" 2>/dev/null || true
 fi
 
-start_ns="$(date +%s%N)"
+now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+session_id="$(printf '%s' "$input" | jq -r '.session_id // .sessionID // "unknown"' 2>/dev/null)"
+[ -n "$session_id" ] || session_id="unknown"
 
-session_id="$(printf '%s' "$input" | jq -r '.session_id // "unknown"')"
-
-if [ "$mode" = "skill-load" ]; then
-  query="$(printf '%s' "$input" | jq -r '.tool_input.skill // .tool_input.name // .tool_input.skill_name // ""')"
-  query="${query##*/}"
-  query="${query##*:}"
-  dedup_key="skill:$query"
-else
-  query="$(printf '%s' "$input" | jq -r '.prompt // ""')"
-  dedup_key="prompt:$(printf '%s' "$query" | cksum | cut -d' ' -f1)"
-fi
-
-log_event() {
-  [ "$nostate" = "1" ] && return 0
-  printf '%s' "$input" | jq -c --arg mode "$mode" --argjson emitted "$1" \
-    --argjson recommend_ms "$2" --argjson elapsed_ms "$3" --arg names "$4" \
-    --arg reason "$5" \
-    '{hook:"skill-graph-recommend", mode: $mode, hook_event_name: .hook_event_name,
-      session_id, prompt_preview: (.prompt // "" | .[0:120]),
-      tool_name, emitted: $emitted, recommend_ms: $recommend_ms,
-      elapsed_ms: $elapsed_ms,
-      recommended: ($names | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))),
-      reason: $reason}' >> "$log"
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | cut -d' ' -f1
+  else
+    printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1
+  fi
 }
 
-finish() {
-  local emitted="$1" recommend_ms="$2" names="$3" reason="$4"
-  local elapsed_ms=$(( ($(date +%s%N) - start_ns) / 1000000 ))
-  log_event "$emitted" "$recommend_ms" "$elapsed_ms" "$names" "$reason"
+log_event() { # $1 = complete event JSON
+  [ "$nostate" = "1" ] && return 0
+  printf '%s\n' "$1" >> "$event_log" 2>/dev/null || true
+}
+
+emit_prompt_submit() { # $1 = prompt text
+  local phash; phash="$(sha256 "$1")"
+  log_event "$(jq -nc --arg rt "$runtime" --arg sid "$session_id" --arg ts "$now" \
+    --arg ph "$phash" \
+    '{schema_version:1,kind:"prompt_submit",runtime:$rt,session_id:$sid,timestamp:$ts,observed_via:"hook",prompt_hash:$ph}')"
+}
+
+emit_recommendation() { # $1=trigger $2=prompt_hash(or "") $3=recs-json $4=emitted $5=reason $6=recommend_ms
+  log_event "$(jq -nc --arg rt "$runtime" --arg sid "$session_id" --arg ts "$now" \
+    --arg trig "$1" --arg ph "$2" --argjson recs "$3" --argjson emitted "$4" \
+    --arg reason "$5" --argjson ms "$6" \
+    '{schema_version:1,kind:"recommendation",runtime:$rt,session_id:$sid,timestamp:$ts,
+      observed_via:"hook",trigger:$trig,
+      recommended:($recs | map({name:.skill.name,digest:.skill.digest})),
+      emitted:$emitted,reason:$reason,recommend_ms:$ms}
+      + (if $ph == "" then {} else {prompt_hash:$ph} end)')"
 }
 
 # Build skill roots: explicit override, else conventional locations.
 if [ -n "${SKILL_GRAPH_ROOTS:-}" ]; then
   IFS=':' read -r -a roots <<< "$SKILL_GRAPH_ROOTS"
 else
-  roots=(
-    "$HOME/.codex/skills"
-    "$HOME/.agents/skills"
-    "$PWD/skills"
-    "$PWD/.codex/skills"
-    "$PWD/.agents/skills"
-  )
+  case "$runtime" in
+    codex) roots=("$HOME/.codex/skills" "$HOME/.agents/skills" "$PWD/skills" "$PWD/.codex/skills" "$PWD/.agents/skills") ;;
+    *)     roots=("$HOME/.claude/skills" "$HOME/.agents/skills" "$PWD/skills" "$PWD/.claude/skills" "$PWD/.agents/skills") ;;
+  esac
 fi
 root_args=()
 for root in "${roots[@]}"; do
-  if [ -d "$root" ]; then
-    root_args+=(--root "$root")
-  fi
+  [ -d "$root" ] && root_args+=(--root "$root")
 done
 
-if [ -z "$query" ] || [ "${#root_args[@]}" -eq 0 ]; then
-  finish false 0 "" "no_input_or_roots"
+recommend_names() { # $1=query $2=max -> prints recs json or fails
+  "$bin" recommend "$1" "${root_args[@]}" --max "$2" --format json 2>/dev/null
+}
+
+if [ "$mode" = "skill-load" ]; then
+  # ---- cheap pre-filter: only Skill tool or SKILL.md-referencing calls ----
+  hit="$(printf '%s' "$input" | jq -r '
+    (.tool_name // .tool // "") as $t
+    | (.tool_input // .input // null) as $i
+    | if $t == "Skill" then "native"
+      elif ($i != null and (($i | tostring) | test("SKILL\\.md"))) then "path"
+      else "" end' 2>/dev/null)"
+  [ -n "$hit" ] || exit 0
+
+  detected="$(printf '%s' "$input" | "$bin" detect --runtime "$runtime" --via hook 2>/dev/null)"
+  [ -n "$detected" ] || exit 0
+  log_event "$detected"
+
+  detection="$(printf '%s' "$detected" | jq -r '.detection // ""' 2>/dev/null)"
+  skill_name="$(printf '%s' "$detected" | jq -r '.skill_name // ""' 2>/dev/null)"
+  # mention/low-confidence references are not loads: no dependency lookup.
+  case "$detection" in file_read|path_reference|native_invocation|inferred|applied) ;; *) exit 0 ;; esac
+  [ -n "$skill_name" ] || exit 0
+
+  # Dedup dependency recommendations per session+skill.
+  dedup_key="skill:$skill_name"
+  marker="$state_dir/$session_id.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
+  if [ "$nostate" != "1" ] && [ -e "$marker" ]; then
+    emit_recommendation "skill_load" "" "[]" false "dedup_skip" 0
+    exit 0
+  fi
+  [ "$nostate" != "1" ] && touch "$marker"
+
+  if [ "${#root_args[@]}" -eq 0 ]; then
+    emit_recommendation "skill_load" "" "[]" false "no_roots" 0
+    exit 0
+  fi
+
+  recommend_start_ns="$(date +%s%N)"
+  if ! recs="$(recommend_names "$skill_name" 5)"; then
+    emit_recommendation "skill_load" "" "[]" false "recommender_error" 0
+    exit 0
+  fi
+  recommend_ms=$(( ($(date +%s%N) - recommend_start_ns) / 1000000 ))
+
+  names="$(printf '%s' "$recs" | jq -r --arg self "$skill_name" \
+    '[.[].skill.name | select(. != $self)] | .[0:3] | join(", ")')"
+  if [ -z "$names" ]; then
+    emit_recommendation "skill_load" "" "$recs" false "no_recommendations" "$recommend_ms"
+    exit 0
+  fi
+  emit_recommendation "skill_load" "" "$recs" true "recommended" "$recommend_ms"
+  context="skill-graph: '$skill_name' declares dependencies — $names. Read the matching SKILL.md files if the task needs them."
+  jq -nc --arg ctx "$context" '{hookSpecificOutput:{hookEventName:"PostToolUse",additionalContext:$ctx}}'
   exit 0
 fi
 
-# Dedup: one emission per session+key.
-marker="$state_dir/$session_id.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
-if [ "$nostate" != "1" ]; then
-  if [ -e "$marker" ]; then
-    finish false 0 "" "dedup_skip"
-    exit 0
-  fi
-  touch "$marker"
+# ---- prompt mode ----
+query="$(printf '%s' "$input" | jq -r '.prompt // ""' 2>/dev/null)"
+[ -n "$query" ] && emit_prompt_submit "$query"
+
+if [ -z "$query" ] || [ "${#root_args[@]}" -eq 0 ]; then
+  emit_recommendation "prompt_submit" "$(sha256 "$query")" "[]" false "no_input_or_roots" 0
+  exit 0
 fi
 
+# Dedup: one emission per session+prompt-hash.
+dedup_key="prompt:$(printf '%s' "$query" | cksum | cut -d' ' -f1)"
+marker="$state_dir/$session_id.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
+if [ "$nostate" != "1" ] && [ -e "$marker" ]; then
+  emit_recommendation "prompt_submit" "$(sha256 "$query")" "[]" false "dedup_skip" 0
+  exit 0
+fi
+[ "$nostate" != "1" ] && touch "$marker"
+
 recommend_start_ns="$(date +%s%N)"
-if ! recs="$("$bin" recommend "$query" "${root_args[@]}" --max 5 --format json 2>/dev/null)"; then
-  finish false 0 "" "recommender_error"
+if ! recs="$(recommend_names "$query" 5)"; then
+  emit_recommendation "prompt_submit" "$(sha256 "$query")" "[]" false "recommender_error" 0
   exit 0
 fi
 recommend_ms=$(( ($(date +%s%N) - recommend_start_ns) / 1000000 ))
-
-# skill-load: drop the just-loaded skill itself; keep declared deps only.
-if [ "$mode" = "skill-load" ]; then
-  names="$(printf '%s' "$recs" | jq -r --arg self "$query" \
-    '[.[].skill.name | select(. != $self)] | .[0:3] | join(", ")')"
-else
-  names="$(printf '%s' "$recs" | jq -r '[.[].skill.name] | .[0:3] | join(", ")')"
-fi
-
+phash="$(sha256 "$query")"
+names="$(printf '%s' "$recs" | jq -r '[.[].skill.name] | .[0:3] | join(", ")')"
 if [ -z "$names" ]; then
-  finish false "$recommend_ms" "" "no_recommendations"
+  emit_recommendation "prompt_submit" "$phash" "$recs" false "no_recommendations" "$recommend_ms"
   exit 0
 fi
-
-if [ "$mode" = "skill-load" ]; then
-  context="skill-graph: '$query' declares dependencies — $names. Read the matching SKILL.md files if the task needs them."
-  event="PostToolUse"
-else
-  context="skill-graph: skills relevant to this task — $names. Read the matching SKILL.md before relying on it."
-  event="UserPromptSubmit"
-fi
-jq -nc --arg ctx "$context" --arg ev "$event" \
-  '{hookSpecificOutput:{hookEventName:$ev,additionalContext:$ctx}}'
-finish true "$recommend_ms" "$names" "recommended"
+emit_recommendation "prompt_submit" "$phash" "$recs" true "recommended" "$recommend_ms"
+context="skill-graph: skills relevant to this task — $names. Read the matching SKILL.md before relying on it."
+jq -nc --arg ctx "$context" '{hookSpecificOutput:{hookEventName:"UserPromptSubmit",additionalContext:$ctx}}'

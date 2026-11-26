@@ -69,6 +69,16 @@ enum Command {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Normalize a single runtime hook/plugin payload (stdin JSON) into a
+    /// Skill Usage Event. Prints the event JSON, or nothing when the
+    /// payload carries no skill-load signal. Detection only — never runs
+    /// recommendation or corpus analysis.
+    Detect {
+        #[arg(long)]
+        runtime: String,
+        #[arg(long, default_value = "hook")]
+        via: String,
+    },
 }
 
 pub fn run() -> Result<(), String> {
@@ -120,6 +130,30 @@ pub fn run() -> Result<(), String> {
         Command::Observe { path, format } => {
             let obs = observe::observe_path(&path)?;
             print_result(json!(obs), &format)
+        }
+        Command::Detect { runtime, via } => {
+            use crate::events::{self, ObservedVia, Runtime};
+            let runtime =
+                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            let via = match via.as_str() {
+                "hook" => ObservedVia::Hook,
+                "plugin" => ObservedVia::Plugin,
+                "transcript" => ObservedVia::Transcript,
+                "db" => ObservedVia::Db,
+                other => return Err(format!("unknown observed_via: {other}")),
+            };
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+                .map_err(|e| format!("stdin: {e}"))?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&input).map_err(|e| format!("payload json: {e}"))?;
+            if let Some(event) = events::detect_from_payload(runtime, via, &payload) {
+                println!(
+                    "{}",
+                    serde_json::to_string(&event).map_err(|e| e.to_string())?
+                );
+            }
+            Ok(())
         }
         Command::Perf { sizes, iterations } => {
             let result = perf::run(&sizes, iterations)?;

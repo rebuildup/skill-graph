@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod discovery;
 pub mod eval;
+pub mod events;
 pub mod model;
 pub mod observe;
 pub mod parser;

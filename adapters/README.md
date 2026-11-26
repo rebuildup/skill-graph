@@ -7,8 +7,25 @@ mode (`SKILL_GRAPH_HOOK_NOSTATE=1`).
 | Runtime | Mechanism | Status |
 |---|---|---|
 | `claude-code/` | Agent Plugins dir (`--plugin-dir`) or settings.json hooks via `install.sh` | Verified live (v0.1.0 S02) |
-| `codex/` | `hooks.json` (user `$CODEX_HOME` or trusted `.codex/`) | Feasibility verified; live pending |
-| `opencode/` | TS plugin (`@opencode/plugin`) | Skeleton; live pending |
+| `codex/` | `hooks.json` (user `$CODEX_HOME` or trusted `.codex/`) | Live-verified (v0.2.0 #70); skill-load detection via `PostToolUse` matcher `Bash` |
+| `opencode/` | TS plugin (`@opencode/plugin`) | Live-verified core path (v0.2.0 #70) |
+
+## Skill Usage Events
+
+All adapters emit the shared contract
+(`contracts/v1/skill-usage-event.schema.json`) as JSONL to
+`${TMPDIR}/skill-graph-events.jsonl` (`SKILL_GRAPH_EVENT_LOG` overrides).
+`skill-graph observe <path>` aggregates hook/plugin events together with
+read-only transcript/DB normalization into the same event shape.
+
+- `prompt` mode emits `prompt_submit` + `recommendation` per prompt.
+- `skill-load` mode emits `skill_load` (via `skill-graph detect`) and, only
+  for load-grade detections (`file_read`/`path_reference`/`native_invocation`/
+  `inferred`/`applied`), a dependency `recommendation`. Non-skill tool calls
+  are excluded by a jq pre-filter before the binary runs — no corpus analysis
+  or context injection happens for them.
+- No command lines, tool responses, or prompt bodies are persisted; prompts
+  are SHA-256 hashed. `SKILL_GRAPH_HOOK_NOSTATE=1` disables all writes.
 
 ## PATH-free install / uninstall
 
