@@ -137,14 +137,19 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
 /// emitting anything, while older releases fail on the unknown
 /// subcommand or missing arguments.
 fn supports_hook_subcommand(path: &Path) -> bool {
-    std::process::Command::new(path)
+    match std::process::Command::new(path)
         .args(["hook", "claude-code", "prompt"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    {
+        Ok(s) => s.success(),
+        // A spawn failure (transient resource exhaustion, exec-format
+        // edge) is inconclusive: is_executable already screened the file,
+        // and failing enable on it would be flakier than the hook itself.
+        Err(_) => true,
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
