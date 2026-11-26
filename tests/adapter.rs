@@ -799,3 +799,65 @@ fn opencode_enable_warns_when_bin_unresolvable() {
     assert_eq!(rc, 0, "{out} {err}");
     assert!(err.contains("SKILL_GRAPH_BIN"), "{err}");
 }
+
+/// Round-9: SKILL_GRAPH_BIN may name a bare command resolved on PATH
+/// (parity with the opencode plugin's runtime resolution); `adapter`
+/// must embed the resolved executable, not the bare name.
+#[test]
+#[cfg(unix)]
+fn skill_graph_bin_bare_name_resolves_on_path() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let bindir = f.home.path().join("sgbin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let shim = bindir.join("my-sg");
+    std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, rc) = f.run_env(
+        &["adapter", "enable", "claude-code", "--user"],
+        &[
+            ("SKILL_GRAPH_BIN", "my-sg"),
+            ("PATH", bindir.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(rc, 0);
+    let cfg = f.config("claude-code", "--user").unwrap();
+    let text = serde_json::to_string(&cfg).unwrap();
+    assert!(
+        text.contains(&shim.to_string_lossy().into_owned()),
+        "embedded bin should be the PATH-resolved shim: {text}"
+    );
+}
+
+/// Round-9: a SKILL_GRAPH_BIN that does not support `hook` must fail
+/// enable rather than embedding a dead command.
+#[test]
+#[cfg(unix)]
+fn skill_graph_bin_without_hook_support_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let bad = f.home.path().join("bin/not-sg");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, stderr, rc) = f.run_full_env(
+        &["adapter", "enable", "claude-code", "--user"],
+        &[("SKILL_GRAPH_BIN", bad.to_str().unwrap())],
+    );
+    assert_ne!(rc, 0);
+    assert!(stderr.contains("SKILL_GRAPH_BIN"), "{stderr}");
+}
+
+/// Round-9: `disable` on a config with no skill-graph entries must not
+/// rewrite the file — foreign formatting is preserved byte-for-byte.
+#[test]
+fn disable_without_our_hooks_leaves_file_bytes_untouched() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let raw = "{\n  \"hooks\": {\"UserPromptSubmit\": [{\"hooks\": [{\"type\":\"command\",\"command\":\"echo foreign\"}]}]},\n  \"model\": \"x\"\n}\n";
+    std::fs::write(&path, raw).unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+}

@@ -39,6 +39,7 @@
 - 推薦処理の障害で通常開発を停止させない。
 - skill の読み込みを成果物品質の保証として扱わない。
 - 推薦 admission は direct relevance または explicit `requires` dependency に限定する。direct relevance は、query term が skill name に specific に一致する場合、query term が description に 2 語以上一致し少なくとも 1 語が corpus 内で低頻度の場合、または context term が description に 2 語以上一致する場合とする。document frequency は name + description を対象に計算するが、description 側には frontmatter の `keywords` と組み込み glossary による CJK→英語展開（`expand_gloss`）を含む（`src/search.rs` の `document_frequency`）。Markdown link・名前言及・backlink・body text・link target の一致は relatedness / weak evidence であり、単独では推薦しない。
+- term 抽出の対象 script は ASCII 英数字と CJK（ひらがな・カタカナ・漢字・ハングル）のみ。それ以外の文字体系（キリル・アラビア・ギリシャ・アクセント付きラテン等）は現行実装では term を生成しない既知の境界であり、対応が必要になった場合は Unicode 対応の tokenization を別途設計する。
 
 ## Storage modes
 

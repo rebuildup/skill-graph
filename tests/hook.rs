@@ -431,3 +431,35 @@ fn emitted_events_validate_against_event_schema() {
     }
     assert!(saw_empty_recommended, "dedup_skip event missing from log");
 }
+
+/// Round-9: payload session ids that sanitize to empty must not
+/// collapse distinct sessions into one `""` key — they get distinct
+/// `unknown-<hash>` ids instead.
+#[test]
+fn degenerate_session_ids_stay_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    for (i, raw) in ["!!!", "???", "日本語のみ"].iter().enumerate() {
+        let payload = json!({"session_id": raw, "prompt": format!("alpha task {i}")});
+        let (out, rc) = run_hook(
+            &["hook", "claude-code", "prompt"],
+            &payload,
+            &env_pairs(&envs),
+        );
+        assert_eq!(rc, 0, "rc for {raw:?}: out={out}");
+    }
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    let ids: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "recommendation")
+        .map(|e| e["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    for id in &ids {
+        assert!(id.starts_with("unknown-"), "session_id {id}");
+    }
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "degenerate ids must not collide: {ids:?}");
+}

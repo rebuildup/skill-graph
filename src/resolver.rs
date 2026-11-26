@@ -126,7 +126,16 @@ fn resolve_requires(link: &mut SkillLink, by_name: &HashMap<String, Vec<usize>>)
     }
 }
 
+/// Mentions are derived evidence, not authored links: the parser's
+/// MAX_LINKS budget does not cover them, so cap per skill — a body that
+/// names many skills must not create unbounded link/backlink blowup.
+/// Deterministic: tokens are visited in sorted order.
+const MAX_MENTIONS_PER_SKILL: usize = 64;
+
 fn add_mentions(skills: &mut [Skill], index: usize, by_name: &HashMap<String, Vec<usize>>) {
+    if skills[index].parse_error.is_some() {
+        return;
+    }
     let body = skills[index].body_text.clone();
     let self_name = skills[index].name.clone();
     let mut tokens = HashSet::new();
@@ -142,8 +151,10 @@ fn add_mentions(skills: &mut [Skill], index: usize, by_name: &HashMap<String, Ve
         }
     }
 
+    let mut tokens: Vec<String> = tokens.into_iter().collect();
+    tokens.sort_unstable();
     let mut mentions = Vec::new();
-    for token in tokens {
+    for token in tokens.into_iter().take(MAX_MENTIONS_PER_SKILL) {
         if token == self_name {
             continue;
         }

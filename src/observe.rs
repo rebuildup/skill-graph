@@ -395,6 +395,18 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
     event.skill_path = event.skill_path.map(|p| p.chars().take(1024).collect());
     event.tool = event.tool.map(|t| t.chars().take(256).collect());
     event.skill_name = event.skill_name.map(|n| n.chars().take(256).collect());
+    // Remaining string fields get the same treatment: a single hostile
+    // log line must not inject file-cap-sized strings into retained
+    // events. Bounds match or exceed what the constructors produce.
+    event.reason = event.reason.map(|r| r.chars().take(1024).collect());
+    event.prompt_hash = event.prompt_hash.map(|h| h.chars().take(128).collect());
+    event.skill_digest = event.skill_digest.map(|d| d.chars().take(128).collect());
+    event.timestamp = event.timestamp.chars().take(64).collect();
+    for item in &mut event.recommended {
+        if let Some(d) = &mut item.digest {
+            *d = d.chars().take(128).collect();
+        }
+    }
     // `recommended` item constraints apply whenever the field is present,
     // not only on recommendation events (schema property-level rule).
     // Names must be non-empty valid skill names; items may carry only
@@ -1384,6 +1396,24 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
         }
     }
 
+    // Index loads by skill name and parse timestamps once: the
+    // conversion scan below must not be O(recommendations × loads) —
+    // a large contract-shaped event log would otherwise hang
+    // `observe --summary` (the by_session cap does not bound the
+    // top-level funnel, which runs over all events).
+    let mut loads_by_name: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for &li in &loads {
+        loads_by_name
+            .entry(events[li].skill_name.as_deref().unwrap_or(""))
+            .or_default()
+            .push(li);
+    }
+    let timestamps: std::collections::HashMap<usize, Option<i64>> = idxs
+        .iter()
+        .map(|&i| (i, rfc3339_ms(&events[i].timestamp)))
+        .collect();
+
     // Greedy conversion: each emitted recommendation converts the first
     // later load-grade load naming one of its recommendations; each load
     // converts at most one recommendation.
@@ -1398,16 +1428,22 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
         if names.is_empty() {
             continue;
         }
-        let rec_ts = rfc3339_ms(&rec.timestamp);
-        for &li in &loads {
+        let rec_ts = timestamps[&ri];
+        // Union of candidate loads across recommended names, visited in
+        // session order — equivalent to scanning `loads` while skipping
+        // non-matching names, but only touches relevant loads.
+        let mut candidates: Vec<usize> = names
+            .iter()
+            .filter_map(|name| loads_by_name.get(*name))
+            .flatten()
+            .copied()
+            .collect();
+        candidates.sort_by_key(|&li| pos[&li]);
+        for li in candidates {
             if consumed.contains(&li) {
                 continue;
             }
-            let load = events[li];
-            if !names.contains(load.skill_name.as_deref().unwrap_or("")) {
-                continue;
-            }
-            let load_ts = rfc3339_ms(&load.timestamp);
+            let load_ts = timestamps[&li];
             let after = match (rec_ts, load_ts) {
                 (Some(a), Some(b)) => b >= a,
                 _ => pos.get(&li).zip(pos.get(&ri)).is_some_and(|(l, r)| l > r),
@@ -1485,5 +1521,24 @@ impl Funnel {
                 "emitted_per_session_max": max,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::under_cap;
+
+    #[test]
+    fn under_cap_latches_single_notice() {
+        let mut errors = Vec::new();
+        let mut noted = false;
+        assert!(under_cap(0, 2, "events", &mut noted, &mut errors));
+        assert!(under_cap(1, 2, "events", &mut noted, &mut errors));
+        // At and beyond the cap: rejected, but the notice is emitted
+        // exactly once — post-cap input must not grow `errors`.
+        assert!(!under_cap(2, 2, "events", &mut noted, &mut errors));
+        assert!(!under_cap(2, 2, "events", &mut noted, &mut errors));
+        assert!(!under_cap(999, 2, "events", &mut noted, &mut errors));
+        assert_eq!(errors, vec!["events truncated at 2".to_string()]);
     }
 }

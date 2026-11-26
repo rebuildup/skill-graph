@@ -193,14 +193,23 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
         }
     }
 
+    // Requires declarations get their own small budget independent of
+    // MAX_LINKS: ordinary links must not crowd out dependency
+    // declarations, and duplicates are collapsed so `requires-skills:
+    // a a a` cannot triple the necessity boost downstream.
+    const MAX_REQUIRES: usize = 64;
+    let mut requires_seen = std::collections::HashSet::new();
     for key in ["requires-skills", "requires_skills"] {
         if let Some(value) = metadata.get(key) {
             for item in value.split(|c: char| c == ',' || c.is_whitespace()) {
-                if links.len() >= MAX_LINKS {
+                if requires_seen.len() >= MAX_REQUIRES {
                     break;
                 }
                 let item = item.trim();
-                if !item.is_empty() && item.chars().count() <= MAX_LINK_TARGET_CHARS {
+                if !item.is_empty()
+                    && item.chars().count() <= MAX_LINK_TARGET_CHARS
+                    && requires_seen.insert(item.to_string())
+                {
                     links.push(SkillLink {
                         target: item.to_string(),
                         kind: LinkKind::Requires,

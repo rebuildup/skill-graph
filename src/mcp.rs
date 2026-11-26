@@ -46,19 +46,20 @@ impl SkillGraphMcp {
 
 /// Roots resolution shared by every entry point: SKILL_GRAPH_ROOTS wins,
 /// then explicit tool `roots` (capped at MAX_TOOL_ROOTS), then defaults.
+///
+/// A present `roots` array defines the scope even when every entry is
+/// invalid: entries pass through verbatim (no `is_dir` pre-filter) so
+/// `discover` reports "root is not a directory" diagnostics and returns
+/// an empty scan — silently dropping them would widen the query to the
+/// default corpus, the same violation #177 fixed for SKILL_GRAPH_ROOTS.
 fn tool_roots(arg_roots: Option<&Value>) -> Vec<PathBuf> {
     let explicit: Vec<PathBuf> = arg_roots
         .and_then(Value::as_array)
         .map(|arr| {
-            // Scan a generous window before filtering: non-directory
-            // entries must not consume the cap, and valid roots beyond
-            // position MAX_TOOL_ROOTS+1 are still honored up to the cap.
             arr.iter()
-                .take(8 * MAX_TOOL_ROOTS)
                 .filter_map(Value::as_str)
-                .map(PathBuf::from)
-                .filter(|p| p.is_dir())
                 .take(MAX_TOOL_ROOTS)
+                .map(PathBuf::from)
                 .collect()
         })
         .unwrap_or_default();
@@ -201,6 +202,12 @@ struct BuiltGraph {
 fn build_graph(roots: &[PathBuf]) -> BuiltGraph {
     let discovery = discover(roots);
     let errors = discovery.errors.clone();
+    // recommend/resolve return bare result JSON, so discovery
+    // diagnostics would vanish; stderr is the MCP logging channel
+    // (stdout carries the protocol). Bounded like the CLI surface.
+    for err in errors.iter().take(10) {
+        crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
+    }
     BuiltGraph {
         graph: build(discovery),
         errors,

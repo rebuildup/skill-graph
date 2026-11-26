@@ -12,7 +12,7 @@ fn fixture_root() -> PathBuf {
 #[test]
 fn discovers_fixture_skills() {
     let discovery = discover(&[fixture_root()]);
-    assert_eq!(discovery.skills.len(), 8);
+    assert_eq!(discovery.skills.len(), 9);
     assert!(discovery.errors.is_empty());
 }
 
@@ -325,4 +325,70 @@ fn cjk_terms_and_keywords_admit_crosslingual_match() {
         "expected kappa-skill via keywords, got: {:?}",
         recs.iter().map(|r| &r.skill.name).collect::<Vec<_>>()
     );
+}
+
+/// #144 round-9: one CJK substring is ONE piece of evidence. A query
+/// that is a single CJK word emits a bigram cluster plus glossary
+/// expansions, but they all share the run as provenance — they must not
+/// satisfy the two-independent-sources description admission rule by
+/// themselves. Two distinct CJK words DO provide independent sources.
+#[test]
+fn cjk_single_word_cannot_self_admit_via_description() {
+    let graph = build(discover(&[fixture_root()]));
+
+    // Single CJK word: bigram cluster + gloss "review" all trace to the
+    // same run -> description-only admission must fail.
+    let recs = recommend(&graph, "レビュー", "", 5);
+    assert!(
+        !recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "single CJK substring self-admitted: {recs:?}"
+    );
+
+    // Two distinct CJK words are independent sources -> admits.
+    let recs = recommend(&graph, "レビュー テスト", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "two CJK words should admit: {recs:?}"
+    );
+}
+
+/// #144 round-9: resolver-derived mentions are capped per skill —
+/// parser MAX_LINKS does not cover them, so a body naming many skills
+/// must not create unbounded link/backlink blowup.
+#[test]
+fn resolver_mentions_are_capped_per_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..70 {
+        let d = dir.path().join(format!("skill-{i:02}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: skill-{i:02}\ndescription: fixture {i}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    let mentioner = dir.path().join("mentioner");
+    std::fs::create_dir_all(&mentioner).unwrap();
+    let names = (0..70)
+        .map(|i| format!("skill-{i:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        mentioner.join("SKILL.md"),
+        format!("---\nname: mentioner\ndescription: mentions many\n---\n{names}\n"),
+    )
+    .unwrap();
+
+    let graph = build(discover(&[dir.path().to_path_buf()]));
+    let skill = graph
+        .skills
+        .iter()
+        .find(|s| s.name == "mentioner")
+        .expect("mentioner discovered");
+    let mentions = skill
+        .links
+        .iter()
+        .filter(|l| l.kind == skill_graph::model::LinkKind::Mention)
+        .count();
+    assert_eq!(mentions, 64, "mention cap should engage deterministically");
 }

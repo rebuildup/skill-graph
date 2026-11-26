@@ -128,7 +128,14 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         if !seen_roots.insert(root.clone()) {
             continue;
         }
-        let mut entries = WalkDir::new(&root).follow_links(false).into_iter();
+        // Sort entries so discovery order — and therefore Graph.skills
+        // index order, the deterministic body-scan budget order in
+        // recommend(), and equal-score output ordering — does not depend
+        // on filesystem directory order.
+        let mut entries = WalkDir::new(&root)
+            .follow_links(false)
+            .sort_by_file_name()
+            .into_iter();
         let mut consumed = 0usize;
         let mut walk_errors = 0usize;
         for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {

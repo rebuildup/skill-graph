@@ -620,3 +620,28 @@ fn summary_timeliness_uses_millisecond_precision() {
     assert_eq!(v["timeliness_ms"]["p50"], 500);
     assert_eq!(v["timeliness_ms"]["max"], 500);
 }
+
+/// Round-9: the conversion scan indexes loads by name — verify greedy
+/// pairing still agrees with the naive O(recs × loads) scan on a
+/// larger same-name session (each load converts at most one rec).
+#[test]
+fn summary_conversion_pairs_greedily_at_scale() {
+    use skill_graph::observe::{Observation, summary};
+
+    let mut events = Vec::new();
+    for i in 0..500 {
+        let sec = i;
+        let ts = format!("2026-01-01T00:{:02}:{:02}Z", sec / 60, sec % 60);
+        events.push(rec_event("big", &ts, &["a"], true));
+        let load_ts = format!("2026-01-01T00:{:02}:{:02}.500Z", sec / 60, sec % 60);
+        events.push(load_event("big", &load_ts, "a"));
+    }
+    let obs = Observation {
+        events,
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 500);
+    assert_eq!(v["unnecessary_loads"], 0);
+    assert_eq!(v["load_grade_loads"], 500);
+}

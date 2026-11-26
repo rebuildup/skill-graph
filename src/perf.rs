@@ -21,8 +21,18 @@ pub fn run(sizes: &[usize], iterations: usize) -> Result<Value, String> {
     if sizes.len() > 16 || sizes.iter().any(|&s| s > 10_000) {
         return Err("perf sizes are capped at 16 entries of <= 10000".to_string());
     }
-    if iterations > 10_000 {
-        return Err("perf iterations are capped at 10000".to_string());
+    if iterations > 1_000 {
+        return Err("perf iterations are capped at 1000".to_string());
+    }
+    // Bound total work: corpus generation is O(sum of sizes) skill
+    // parses and benchmarking is O(sizes × iterations) recommend()
+    // calls over up-to-10k-skill graphs. Without a product cap the
+    // flags alone permit ~160k recommendations.
+    if sizes.iter().sum::<usize>() > 50_000 {
+        return Err("perf total corpus capped at 50000 skills".to_string());
+    }
+    if sizes.len().saturating_mul(iterations) > 2_000 {
+        return Err("perf total recommend calls capped at 2000 (sizes × iterations)".to_string());
     }
     let mut results = Vec::new();
     for &size in sizes {

@@ -9,8 +9,9 @@ repository = "https://github.com/rebuildup/skill-graph"
 readme = "README.md"
 keywords = ["agent-skills", "cli", "recommendation"]
 categories = ["command-line-utilities"]
+# `include` alone defines the crate contents; a separate `exclude` is
+# ignored by cargo when `include` is present (and was stale anyway).
 include = ["/src/**/*", "/contracts/**/*", "/Cargo.toml", "/LICENSE", "/README.md"]
-exclude = ["/npm/**", "/examples/**", "/tests/**", "/evals/**", "/docs/**", "/adapters/**", "/experiments/**", "/.github/**", "/.agents/**", "/.claude/**", "/.devin/**"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
