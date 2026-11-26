@@ -103,6 +103,13 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     }
     let mut candidates: Vec<usize> = rep_of_name.values().copied().collect();
     candidates.sort_unstable();
+    // "Rare term" bound for admission: a term stays specific evidence while
+    // it appears in at most ~10% of distinct skill names, with a floor of 2.
+    // The floor keeps a single same-domain addition from flipping admission
+    // (the df==1 -> 2 failure reported in #170); the relative cap keeps the
+    // bound meaningful as the corpus grows. Ranking is unaffected — scores
+    // never consulted df, so rarer terms are not promoted, only gated.
+    let df_bound = (candidates.len() / 10).max(2);
 
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
@@ -171,17 +178,17 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
         let name_hits = query_terms
             .iter()
-            .filter(|term| name_lower.contains(term.as_str()))
+            .filter(|term| term_matches(name_lower, term))
             .cloned()
             .collect::<Vec<_>>();
         let description_hits = query_terms
             .iter()
-            .filter(|term| description_lower.contains(term.as_str()))
+            .filter(|term| term_matches(description_lower, term))
             .cloned()
             .collect::<Vec<_>>();
         let context_hits = context_terms
             .iter()
-            .filter(|term| skill_descriptions_base[index].contains(term.as_str()))
+            .filter(|term| term_matches(&skill_descriptions_base[index], term))
             .cloned()
             .collect::<Vec<_>>();
 
@@ -231,10 +238,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
     for (index, info) in infos.iter().enumerate() {
-        if info
-            .as_ref()
-            .is_some_and(|info| directly_admitted(info, &query_sources, &document_frequency))
-        {
+        if info.as_ref().is_some_and(|info| {
+            directly_admitted(info, &query_sources, &document_frequency, df_bound)
+        }) {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
@@ -256,7 +262,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                     continue;
                 }
                 let is_seed = infos[target].as_ref().is_some_and(|info| {
-                    directly_admitted(info, &query_sources, &document_frequency)
+                    directly_admitted(info, &query_sources, &document_frequency, df_bound)
                 });
                 let entry = admitted.entry(target).or_default();
                 entry.push(format!("required by {}", graph.skills[*seed].name));
@@ -347,14 +353,19 @@ fn directly_admitted(
     info: &Evidence,
     query_sources: &HashMap<String, String>,
     document_frequency: &HashMap<String, usize>,
+    df_bound: usize,
 ) -> bool {
     let df = |term: &str| document_frequency.get(term).copied().unwrap_or(usize::MAX);
+    // Corpus-relative rarity: a term counts as specific evidence while its
+    // document frequency stays within df_bound (see recommend()). df==1 made
+    // admission flip the moment a second same-domain skill appeared (#170).
+    let rare = |term: &str| df(term) <= df_bound;
     // The skill name is the skill's identity: two or more query terms inside
     // one name is specific regardless of corpus-wide document frequency.
     // A single name hit stays conservative (low df, meaningful length).
     let multiple_name_hits = info.name_hits.len() >= 2;
     let unique_name_hit =
-        info.name_hits.len() == 1 && df(&info.name_hits[0]) == 1 && info.name_hits[0].len() >= 4;
+        info.name_hits.len() == 1 && rare(&info.name_hits[0]) && info.name_hits[0].len() >= 4;
     // A name hit plus independent description evidence admits: the name anchors
     // identity while the description confirms topical fit. This keeps high-df
     // description terms from admitting alone but lets e.g. "PR review" reach
@@ -376,7 +387,7 @@ fn directly_admitted(
         .collect();
     let description_admitted = info.description_hits.len() >= 2
         && description_sources.len() >= 2
-        && info.description_hits.iter().any(|term| df(term) == 1);
+        && info.description_hits.iter().any(|term| rare(term));
     let context_admitted = info.context_hits.len() >= 2;
     multiple_name_hits
         || unique_name_hit
@@ -409,8 +420,8 @@ fn document_frequency<'a>(
                 };
                 copies.iter().any(|&copy| {
                     graph.skills[copy].parse_error.is_none()
-                        && (skill_names[copy].contains(term)
-                            || skill_descriptions[copy].contains(term))
+                        && (term_matches(&skill_names[copy], term)
+                            || term_matches(&skill_descriptions[copy], term))
                 })
             })
             .count();
@@ -435,12 +446,12 @@ fn field_score(
     }
     let mut score = 0.0;
     for term in query_terms {
-        if field.contains(term.as_str()) {
+        if term_matches(field, term) {
             score += weight;
             reasons.push(format!("{label}: {term}"));
         }
     }
-    if !query.contains(char::is_whitespace) && field.contains(query) {
+    if !query.contains(char::is_whitespace) && term_matches(field, query) {
         score += weight * 2.0;
         reasons.push(format!("{label}: {query}"));
     }
@@ -448,7 +459,59 @@ fn field_score(
 }
 
 fn matches_query(query: &str, target: &str) -> bool {
-    !query.is_empty() && target.to_lowercase().contains(query)
+    !query.is_empty() && term_matches(&target.to_lowercase(), query)
+}
+
+/// Single matching rule for query terms against skill text (#170, audit
+/// I-02):
+/// - ASCII terms match on word boundaries — the match must not be flanked by
+///   ASCII alphanumerics, with a single trailing plural `s`/`es` tolerated so
+///   "changelog" still reaches "changelogs". This stops "pr" from hitting
+///   "improve"/"project"/"production" and "test" from hitting "latest".
+///   Hyphens, underscores, dots, and whitespace all count as boundaries, so
+///   "code-naming" still answers "code naming".
+/// - Non-ASCII terms (CJK bigrams) keep substring semantics: CJK has no word
+///   boundaries and bigrams are the matching unit by design (#61).
+///
+/// Neighbors are checked with `is_ascii_alphanumeric`, so a CJK character
+/// next to ASCII (e.g. "PRをレビュー") counts as a boundary and abbreviations
+/// inside Japanese text remain reachable.
+fn term_matches(field: &str, term: &str) -> bool {
+    if term.is_ascii() {
+        ascii_word_match(field, term)
+    } else {
+        field.contains(term)
+    }
+}
+
+fn ascii_word_match(field: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    field.match_indices(needle).any(|(start, found)| {
+        let end = start + found.len();
+        let left_ok = field[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        if !left_ok {
+            return false;
+        }
+        let rest = &field[end..];
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => true,
+            Some(c) if !c.is_ascii_alphanumeric() => true,
+            // Plural tolerance: "changelog" matches "changelogs" and
+            // "class" matches "classes".
+            Some('s') => chars.next().is_none_or(|c| !c.is_ascii_alphanumeric()),
+            Some('e') if rest.starts_with("es") => rest[2..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric()),
+            _ => false,
+        }
+    })
 }
 
 // English function words and generic prompt filler carry no skill-selection
@@ -668,8 +731,8 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
     }
     // Common abbreviation expansion: "pull request" is routinely shortened
     // to "PR"/"pr" in skill text, so emit the abbreviation as an extra term.
-    // Substring matching means "pr" is noisy, but it only adds evidence on
-    // queries that actually contain the phrase.
+    // Boundary-aware matching keeps "pr" from hitting "improve"/"project",
+    // but it still matches a standalone "pr" token such as "PR review".
     let lower = text.to_lowercase();
     if lower.contains("pull request")
         || lower.contains("pull-request")
