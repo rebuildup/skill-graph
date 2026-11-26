@@ -1,11 +1,8 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from "node:fs"
+import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
-
-const DBG = process.env.SKILL_GRAPH_DEBUG === "1" ? "/tmp/sg-oc-plugin.log" : ""
-const dbg = (m: string) => { if (DBG) try { appendFileSync(DBG, m + "\n") } catch {} }
 
 // skill-graph adapter for OpenCode.
 //
@@ -25,6 +22,12 @@ const EVENT_LOG =
 // Parity with the Rust hook: SKILL_GRAPH_HOOK_NOSTATE=1 suppresses all
 // event writes; SKILL_GRAPH_EVENT_LOG_MAX bounds the log (rotate to .1).
 const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
+// Debug diagnostics go to stderr only — never to a file. The old
+// fixed-path debug log under /tmp bypassed every emit() hardening
+// (O_NOFOLLOW, 0600, uid check, TMPDIR, NOSTATE); issue #169 removed it.
+// NOSTATE suppresses debug output too: no diagnostics are persisted.
+const DBG = process.env.SKILL_GRAPH_DEBUG === "1" && !NOSTATE
+const dbg = (m: string) => { if (DBG) try { console.error(`[skill-graph] ${m}`) } catch {} }
 // Mirror the Rust hook's env parsing: positive integers only, anything
 // else falls back to the default.
 function envUint(name: string, fallback: number): number {
