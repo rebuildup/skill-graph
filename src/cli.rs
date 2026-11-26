@@ -78,6 +78,9 @@ enum Command {
         /// prompt | skill-load
         mode: String,
     },
+    /// stdio MCP server exposing read-only skill tools (recommend,
+    /// discover, resolve). See ADR-0005.
+    Mcp,
     /// Manage runtime adapter hooks/plugins in native configs.
     /// enable|disable|status <claude-code|codex|opencode> [--user|--project]
     Adapter {
@@ -167,6 +170,7 @@ pub fn run() -> Result<(), String> {
             }
             crate::hook::run_hook(runtime, &mode)
         }
+        Command::Mcp => crate::mcp::run(),
         Command::Adapter {
             action,
             runtime,
