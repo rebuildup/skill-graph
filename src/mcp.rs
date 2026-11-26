@@ -22,8 +22,10 @@ use std::sync::Arc;
 /// Process-internal memoization (v1.0.0 spec §6): the built graph is
 /// cached per roots signature for the lifetime of this server process.
 /// No persistent cache — a client restart or new roots signature rebuilds.
+type GraphCache = Arc<std::sync::Mutex<Option<(String, Arc<crate::resolver::Graph>)>>>;
+
 struct SkillGraphMcp {
-    graph_cache: Arc<std::sync::Mutex<Option<(String, Arc<crate::resolver::Graph>)>>>,
+    graph_cache: GraphCache,
 }
 
 impl SkillGraphMcp {
