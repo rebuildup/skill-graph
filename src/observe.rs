@@ -67,10 +67,18 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     for file in files {
         obs.files_scanned += 1;
         // Size cap applies to every observable format — .db inputs are
-        // scanned row-by-row and would otherwise have no bound.
-        if let Ok(meta) = fs::metadata(&file)
-            && meta.len() > MAX_OBSERVE_FILE_BYTES
-        {
+        // scanned row-by-row and would otherwise have no bound. For a
+        // SQLite database the un-checkpointed WAL is read too, so its
+        // size counts against the same cap.
+        let mut size = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        if file.extension().and_then(|e| e.to_str()) == Some("db") {
+            let mut wal = file.as_os_str().to_os_string();
+            wal.push("-wal");
+            if let Ok(meta) = fs::metadata(Path::new(&wal)) {
+                size = size.saturating_add(meta.len());
+            }
+        }
+        if size > MAX_OBSERVE_FILE_BYTES {
             obs.errors
                 .push(format!("{}: file too large", file.display()));
             continue;

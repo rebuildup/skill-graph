@@ -60,8 +60,8 @@ function safeSessionID(id: unknown): string {
   return safe || "unknown"
 }
 
-function emit(event: Record<string, unknown>) {
-  if (NOSTATE) return
+function emit(event: Record<string, unknown>): boolean {
+  if (NOSTATE) return false
   try {
     mkdirSync(dirname(EVENT_LOG), { recursive: true })
     try {
@@ -87,17 +87,19 @@ function emit(event: Record<string, unknown>) {
       // fchmod would fail, but the append would still land in a file we
       // do not own. Skip the write unless the file is ours.
       const st = fstatSync(fd)
-      if (typeof process.getuid === "function" && st.uid !== process.getuid()) return
+      if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false
       // mode only applies at creation; tighten pre-existing logs too.
       // Isolated: on filesystems where fchmod fails post-open, the event
       // write must still succeed (0600 was already applied at O_CREAT).
       try { fchmodSync(fd, 0o600) } catch {}
       writeSync(fd, JSON.stringify(event) + "\n")
+      return true
     } finally {
       closeSync(fd)
     }
   } catch (e) {
     dbg("emit failed: " + e)
+    return false
   }
 }
 
@@ -335,15 +337,16 @@ export default Plugin.define({
           const name = typeof s === "string" ? s : s?.name ?? s?.id
           if (typeof name !== "string" || !name || !validSkillName(name)) continue
           if (seen.has(name)) continue
-          seen.add(name)
-          emit({
+          // Register the dedup key only when the event was actually
+          // written — a transient log failure must not suppress retries.
+          if (emit({
             ...base("skill_load"),
             session_id: sessionID,
             skill_name: name,
             detection: "inferred",
             confidence: "medium",
             tool: "prompt.skills",
-          })
+          })) seen.add(name)
         }
       }
       // Empty prompts carry no signal — the Rust hook exits before
