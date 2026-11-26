@@ -138,6 +138,34 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
         // shim/symlink paths (mise, npm bin) are preserved.
         return Ok(std::path::absolute(&path).unwrap_or(path));
     }
+    // SKILL_GRAPH_BIN is honored here for parity with the opencode
+    // plugin, which resolves the same env var at runtime: an operator
+    // pointing it at a wrapper gets consistent behavior across entry
+    // points instead of hooks silently embedding a different binary.
+    // The plugin accepts a bare command name (spawn resolves PATH), so
+    // a separator-less value is looked up on PATH rather than treated
+    // as a relative path.
+    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN") {
+        let raw = PathBuf::from(p);
+        let is_path_form = raw.components().count() > 1 || raw.is_absolute();
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if is_path_form {
+            candidates.push(raw.clone());
+        } else if let Some(path_var) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                candidates.push(dir.join(raw.file_name().unwrap_or_default()));
+            }
+        }
+        for candidate in candidates {
+            if is_executable(&candidate) && supports_hook_subcommand(&candidate) {
+                return Ok(std::path::absolute(&candidate).unwrap_or(candidate));
+            }
+        }
+        return Err(format!(
+            "SKILL_GRAPH_BIN does not resolve to an executable `skill-graph hook` binary: {}",
+            raw.display()
+        ));
+    }
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("skill-graph");
@@ -852,12 +880,18 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 path.display()
             ));
         }
+        let before = config.clone();
         if args.runtime == Runtime::Opencode {
             strip_our_plugins(&mut config);
         } else {
             strip_our_hooks(&mut config);
         }
-        write_config(path, &config)?;
+        // Skip the rewrite when nothing was stripped: re-serializing a
+        // foreign-only config would churn formatting for no reason
+        // (same no-op guard as clean_extra_overlay).
+        if config != before {
+            write_config(path, &config)?;
+        }
         outln!(
             "disabled skill-graph ({}, {}) from {}",
             args.runtime.as_str(),

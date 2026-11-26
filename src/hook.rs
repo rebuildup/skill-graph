@@ -44,7 +44,12 @@ struct HookEnv {
     event_log: PathBuf,
     state_dir: PathBuf,
     event_log_max: u64,
+    /// Filesystem-safe session key for state files — always non-empty.
     session_id: String,
+    /// Contract session id for emitted events: `events::sanitize_session_id`
+    /// semantics, so absent ids stay unattributed (`""`) and distinct
+    /// all-invalid ids hash apart instead of collapsing into `"unknown"`.
+    event_session_id: String,
     timestamp: String,
 }
 
@@ -55,12 +60,8 @@ impl HookEnv {
             .get("session_id")
             .or_else(|| payload.get("sessionID"))
             .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let safe: String = session_id
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-            .take(128)
-            .collect();
+            .unwrap_or("");
+        let event_session_id = events::sanitize_session_id(session_id);
         Self {
             runtime,
             nostate: std::env::var("SKILL_GRAPH_HOOK_NOSTATE").as_deref() == Ok("1"),
@@ -75,11 +76,16 @@ impl HookEnv {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(64 * 1024 * 1024),
-            session_id: if safe.is_empty() {
+            // State files key off the contract session id so distinct
+            // all-invalid payload ids (hashed apart by
+            // sanitize_session_id) do not share one dedup namespace;
+            // only a truly absent id falls back to "unknown".
+            session_id: if event_session_id.is_empty() {
                 "unknown".to_string()
             } else {
-                safe
+                event_session_id.clone()
             },
+            event_session_id,
             timestamp: events::rfc3339_now(),
         }
     }
@@ -440,7 +446,13 @@ fn recommend_names(
     max: usize,
     roots: &[PathBuf],
 ) -> Result<Vec<crate::model::Recommendation>, String> {
-    let graph = build(discover(roots));
+    let discovery = discover(roots);
+    // Fail-open stays, but broken roots must not vanish silently —
+    // bounded stderr note (hook stderr does not reach the agent).
+    for err in discovery.errors.iter().take(3) {
+        crate::cli::write_stderr_line(&format!("skill-graph hook: {err}"));
+    }
+    let graph = build(discovery);
     Ok(recommend(&graph, query, context, max))
 }
 
@@ -456,7 +468,7 @@ fn emit_recommendation(
     env.log_event(&SkillUsageEvent::recommendation(
         env.runtime,
         ObservedVia::Hook,
-        &env.session_id,
+        &env.event_session_id,
         &env.timestamp,
         prompt_hash,
         trigger,
@@ -520,8 +532,8 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     const MAX_LOAD_RECOMMENDS: usize = 8;
     let mut recommend_budget = MAX_LOAD_RECOMMENDS;
     for mut event in detected {
-        // Normalize to the sanitized session id so all events agree.
-        event.session_id = env.session_id.clone();
+        // Normalize to the contract session id so all events agree.
+        event.session_id = env.event_session_id.clone();
         env.log_event(&event);
         let Some(detection) = event.detection else {
             continue;
@@ -535,7 +547,11 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
         let graph = graph_cache.get_or_insert_with(|| {
             let roots =
                 crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime));
-            build(discover(&roots))
+            let discovery = discover(&roots);
+            for err in discovery.errors.iter().take(3) {
+                crate::cli::write_stderr_line(&format!("skill-graph hook: {err}"));
+            }
+            build(discovery)
         });
         if graph.skills.is_empty() {
             // No skills discovered: emit no_roots once, keep logging any
@@ -649,7 +665,7 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
         env.log_event(&SkillUsageEvent::prompt_submit(
             env.runtime,
             ObservedVia::Hook,
-            &env.session_id,
+            &env.event_session_id,
             &env.timestamp,
             &query,
         ));

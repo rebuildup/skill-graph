@@ -141,6 +141,13 @@ fn cjk_bigrams_still_match_descriptions() {
     );
     let graph = build(discover(&[root]));
 
+    // A lone CJK word is one provenance source — like a lone English
+    // term it cannot description-admit by itself (#144 round-9).
     let recs = recommend(&graph, "ロールバック", "", 5);
+    assert!(names(&recs).is_empty(), "got: {:?}", names(&recs));
+
+    // A second independent term restores admission; bigrams keep plain
+    // substring semantics against the Japanese description.
+    let recs = recommend(&graph, "ロールバック 手順", "", 5);
     assert_eq!(names(&recs), vec!["jp-ops"]);
 }

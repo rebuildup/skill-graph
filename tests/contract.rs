@@ -73,7 +73,7 @@ fn discovery_output_matches_contract_shape() {
     let discovery = discover(&[fixture_root()]);
     let value = serde_json::to_value(output(&discovery)).unwrap();
     let skills = value["skills"].as_array().expect("skills array");
-    assert_eq!(skills.len(), 8);
+    assert_eq!(skills.len(), 9);
     assert!(value["errors"].as_array().unwrap().is_empty());
     for skill in skills {
         assert_skill_summary(skill);

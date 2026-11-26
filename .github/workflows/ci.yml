@@ -15,5 +15,37 @@ jobs:
           toolchain: 1.100.0
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - uses: oven-sh/setup-bun@v2
+      - name: OpenCode plugin bundles
+        # Syntax/bundle check for the embedded plugin source; type
+        # resolution against @opencode/plugin is out of scope here.
+        run: |
+          bun build src/assets/opencode-plugin.ts \
+            --external '@opencode/plugin' \
+            --outfile /tmp/opencode-plugin.js
+      - name: Package versions agree
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          cargo = pathlib.Path("Cargo.toml").read_text()
+          version = re.search(r'^version = "([^"]+)"', cargo, re.M).group(1)
+          paths = [pathlib.Path("plugins/skill-graph/plugin.json")]
+          paths += sorted(pathlib.Path("npm").glob("*/package.json"))
+          bad = [
+              f"{p}: {json.loads(p.read_text()).get('version')} != {version}"
+              for p in paths
+              if json.loads(p.read_text()).get("version") != version
+          ]
+          if bad:
+              sys.exit("version mismatch: " + "; ".join(bad))
+          PY
+      - name: Crate contains only intended files
+        run: |
+          cargo package --list --allow-dirty | sort > /tmp/crate-files.txt
+          if grep -Eq '^(tests|evals|npm|docs|plugins|adapters|experiments|\.github|\.agents|\.claude|\.devin)/' /tmp/crate-files.txt; then
+            echo "unexpected files in crate package:" >&2
+            grep -E '^(tests|evals|npm|docs|plugins|adapters|experiments|\.github|\.agents|\.claude|\.devin)/' /tmp/crate-files.txt >&2
+            exit 1
+          fi

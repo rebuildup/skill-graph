@@ -241,3 +241,35 @@ fn filesystem_changes_are_visible_without_restart() {
     let res: Value = serde_json::from_str(text).unwrap();
     assert_eq!(res["kind"], "unresolved", "{res}");
 }
+
+/// A `roots` array that is present but entirely invalid must NOT widen
+/// to the default corpus — same no-widening rule as SKILL_GRAPH_ROOTS
+/// (#177). Entries pass through verbatim so `discover` reports the
+/// failure as diagnostics with an empty skill list.
+#[test]
+fn all_invalid_explicit_roots_do_not_widen_to_defaults() {
+    let mut mcp = Mcp::spawn();
+    let missing = "/definitely/not/a/real/root-184-audit";
+    let result = mcp.call("discover", json!({"roots": [missing]}));
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let disc: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(disc["skills"].as_array().unwrap().len(), 0, "{disc}");
+    assert!(
+        disc["errors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e.as_str().unwrap_or("").contains("root")),
+        "expected a root diagnostic, got {disc}"
+    );
+
+    // recommend over the same invalid scope returns no skills rather
+    // than recommendations from the default corpus.
+    let result = mcp.call(
+        "recommend",
+        json!({"query": "alpha task", "roots": [missing], "max": 3}),
+    );
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let recs: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(recs.as_array().unwrap().len(), 0, "{recs}");
+}

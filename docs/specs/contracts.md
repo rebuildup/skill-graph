@@ -161,3 +161,10 @@ command が埋め込む bin パスについて存在・実行ビットを非実�
 する（#167: config 由来パスは信頼できない入力であり実行しない）。
 `enabled` は「エントリ存在 + bin 存在/実行可能」のみを意味し、
 bin のバージョン能力は status では未検証である。
+
+bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時に
+`resolve_bin`（`--bin` → `SKILL_GRAPH_BIN` → PATH probe）で解決した
+絶対パスを config に埋め込むのに対し、opencode plugin は実行時に
+`SKILL_GRAPH_BIN` → PATH の順で解決する。enable 後に
+`SKILL_GRAPH_BIN` を変更しても hook command の埋め込みパスは
+変わらない（plugin のみ追従する）。

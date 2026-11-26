@@ -308,7 +308,20 @@ fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {
 }
 
 fn graph_for(roots: Vec<PathBuf>) -> Result<crate::resolver::Graph, String> {
-    Ok(build(discover(&roots)))
+    let discovery = discover(&roots);
+    // recommend/resolve output stays clean JSON, but invalid or
+    // truncated roots must not vanish silently — surface a bounded
+    // diagnostics sample on stderr (same info `discover` reports).
+    for err in discovery.errors.iter().take(10) {
+        write_stderr_line(&format!("skill-graph: {err}"));
+    }
+    if discovery.errors.len() > 10 {
+        write_stderr_line(&format!(
+            "skill-graph: ... and {} more discovery errors",
+            discovery.errors.len() - 10
+        ));
+    }
+    Ok(build(discovery))
 }
 
 pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveResult {

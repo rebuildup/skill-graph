@@ -152,11 +152,11 @@ pub(crate) fn sanitize_session_id(session_id: &str) -> String {
         // Distinct invalid ids must not collapse into one "unknown"
         // funnel session: derive a deterministic suffix from the
         // original bytes so different ids stay distinct while the same
-        // id remains joinable.
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        session_id.hash(&mut h);
-        format!("unknown-{:016x}", h.finish())
+        // id remains joinable. SHA-256 (truncated) is used rather than
+        // DefaultHasher because the OpenCode plugin must produce the
+        // identical id for the same payload — the hash is part of the
+        // cross-entrypoint event contract.
+        format!("unknown-{}", &sha256_hex(session_id.as_bytes())[..16])
     } else {
         safe
     }
@@ -327,6 +327,9 @@ pub fn frontmatter_name(text: &str) -> Option<String> {
     const MAX_SCAN: usize = 8 * 1024;
     let head: String = text.chars().take(MAX_SCAN).collect();
     let head = head.strip_prefix('\u{feff}').unwrap_or(head.as_str());
+    // Mirror split_frontmatter: it trims leading \n/\r chars (not just
+    // blank lines), so a lone-\r opening still counts as frontmatter.
+    let head = head.trim_start_matches(['\n', '\r']);
     let mut lines = head.lines();
     // Skip leading blank lines, then require the opening fence.
     let mut opened = false;
@@ -513,9 +516,18 @@ fn segment_has_read_verb(segment: &str) -> bool {
             }
         }
         let w = match words.next() {
-            Some(w) => w.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == '`'),
+            Some(w) => {
+                w.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == '`' || c == '$')
+            }
             None => return false,
         };
+        // Skip flags interleaved with transparent wrappers
+        // (`sudo -E cat`, `xargs -I{} cat`). Flag *values* are not
+        // skipped — `sudo -u root cat` still resolves `root` as the
+        // verb; that residual is accepted (documented heuristic).
+        if w.len() > 1 && w.starts_with('-') {
+            continue;
+        }
         // Skip transparent wrappers (sudo, env, xargs, ...); `xargs cat`
         // style still resolves to the inner verb.
         if TRANSPARENT_PREFIXES.contains(&w) {

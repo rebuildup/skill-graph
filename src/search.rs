@@ -286,7 +286,13 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // admit, so skills past the budget keep a slightly lower possible
     // rank — the admitted set itself is unaffected.
     const MAX_BODY_SCAN_BYTES: usize = 8 * 1024 * 1024;
+    // term_matches cost is O(query terms × field bytes): the byte cap
+    // alone would let a max-length query (1024 terms) multiply 8 MiB
+    // into tens of GiB of scanning. Bound total term×byte work too.
+    const MAX_BODY_TERM_WORK: usize = 256 * 1024 * 1024;
+    let term_count = query_terms.len() + context_terms.len();
     let mut body_scanned = 0usize;
+    let mut body_work = 0usize;
     let mut body_order: Vec<usize> = admitted.keys().copied().collect();
     body_order.sort_unstable();
     for index in body_order {
@@ -294,10 +300,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             break;
         }
         let body_len = graph.skills[index].body_text.len();
-        if body_scanned + body_len > MAX_BODY_SCAN_BYTES {
+        let work = term_count.saturating_mul(body_len);
+        if body_scanned + body_len > MAX_BODY_SCAN_BYTES || body_work + work > MAX_BODY_TERM_WORK {
             continue;
         }
         body_scanned += body_len;
+        body_work += work;
         let Some(info) = infos[index].as_mut() else {
             continue;
         };
@@ -478,7 +486,17 @@ fn field_score(
 }
 
 fn matches_query(query: &str, target: &str) -> bool {
-    !query.is_empty() && term_matches(&target.to_lowercase(), query)
+    if query.is_empty() {
+        return false;
+    }
+    // Link targets are scanned once per candidate skill per call; skip
+    // the lowercase allocation when the target is already lowercase
+    // ASCII (the common case: valid skill names are lowercase).
+    if target.is_ascii() && !target.bytes().any(|b| b.is_ascii_uppercase()) {
+        term_matches(target, query)
+    } else {
+        term_matches(&target.to_lowercase(), query)
+    }
 }
 
 /// Single matching rule for query terms against skill text (#170, audit
@@ -711,17 +729,23 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // CJK has no whitespace and no case: emit character bigrams so
         // substring matching works against Japanese descriptions (#61),
         // plus English glossary terms for known dev vocabulary so queries
-        // can reach English-only skill text (#78). Gloss terms carry their
-        // CJK key as provenance so one substring cannot self-admit.
-        let chars: Vec<char> = cjk.chars().collect();
+        // can reach English-only skill text (#78). Bigram terms share the
+        // whole run as provenance — one run's bigram cluster is a single
+        // piece of literal-text evidence and cannot satisfy the
+        // two-independent-sources admission rule by itself (#144). Gloss
+        // expansions keep per-key provenance: distinct dictionary words
+        // inside one run (e.g. 不具合…再現) are independent evidence, while
+        // a lone word still collapses to one source because its bigram
+        // source equals the key string.
+        let run: String = cjk.chars().collect();
+        let chars: Vec<char> = run.chars().collect();
         for window in chars.windows(2) {
             let bigram: String = window.iter().collect();
-            out.push((bigram.clone(), bigram));
+            out.push((bigram, run.clone()));
         }
-        let run: String = chars.iter().collect();
         for (gloss, key) in gloss_terms(&run) {
             if !STOPWORDS.contains(&gloss.as_str()) {
-                out.push((gloss, key.to_string()));
+                out.push((gloss, key));
             }
         }
         cjk.clear();
@@ -761,10 +785,23 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         out.push(("pr".to_string(), "pull-request".to_string()));
     }
     // Repeated terms would inflate hit counts and scores; keep first
-    // occurrence of each term (provenance is first-wins in term_sources).
-    let mut seen = HashSet::new();
-    out.retain(|(term, _)| seen.insert(term.clone()));
-    out
+    // occurrence of each term. Provenance prefers an explicitly typed
+    // (self-sourced) occurrence over a glossary-derived one: when a CJK
+    // run expands to "bug" and the user also typed "bug", the literal
+    // term is independent evidence and must keep its own source (#144).
+    let mut index_of: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<(String, String)> = Vec::with_capacity(out.len());
+    for (term, source) in out {
+        if let Some(&i) = index_of.get(&term) {
+            if source == term {
+                deduped[i].1 = term.clone();
+            }
+            continue;
+        }
+        index_of.insert(term.clone(), deduped.len());
+        deduped.push((term, source));
+    }
+    deduped
 }
 
 fn is_cjk(c: char) -> bool {
@@ -1085,10 +1122,14 @@ const GLOSS: &[(&str, &str)] = &[
 
 // Returns (English term, CJK key) pairs for every glossary key present in
 // `text`, deduplicated by term. Used in both directions: query terms emit
-// these into the term list (key becomes the provenance source), and skill
-// match text gets the terms appended.
+// these into the term list, and skill match text gets the terms appended.
 fn gloss_terms(text: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
+    // Every glossary key is CJK; ASCII-only text can never contain one,
+    // so skip the ~290-entry scan for English descriptions/bodies.
+    if text.is_ascii() {
+        return out;
+    }
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, gloss) in GLOSS {
         if gloss.is_empty() || !text.contains(key) {
@@ -1138,15 +1179,17 @@ mod tests {
     }
 
     #[test]
-    fn gloss_terms_carry_cjk_key_as_source() {
+    fn cjk_provenance_splits_bigrams_from_gloss_keys() {
         let tagged = terms_tagged("文章を自然にしたい");
         let sources = term_sources(&tagged);
-        // "prose"/"writing" come from the 文章 key; the bigram 文章 is its
-        // own source but shares the same string, so all three collapse to
-        // one provenance group for admission purposes.
+        // Round-9: the run's bigram cluster shares the whole run as one
+        // provenance, while each glossary expansion keeps its dictionary
+        // key — distinct words in one run are independent evidence.
+        let run = "文章を自然にしたい";
+        assert_eq!(sources.get("文章").map(String::as_str), Some(run));
+        assert_eq!(sources.get("章を").map(String::as_str), Some(run));
         assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
-        assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
     }
 
     #[test]

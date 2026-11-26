@@ -54,13 +54,16 @@ function validSkillName(name: string): boolean {
   return /^[a-z0-9-]{1,64}$/.test(name) && !name.startsWith("-") && !name.endsWith("-")
 }
 
-// Mirror hook.rs's session-id sanitizer: runtime-supplied ids are
-// untrusted — bound charset and length before they reach persistent
-// events or in-memory map keys.
+// Mirror events.rs's sanitize_session_id contract: absent/empty ids
+// stay unattributed (""), charset-valid ids pass through bounded, and
+// distinct all-invalid ids hash apart instead of collapsing into one
+// "unknown" funnel session.
 function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
   const safe = s.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128)
-  return safe || "unknown"
+  if (safe) return safe
+  if (!s) return ""
+  return `unknown-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16)}`
 }
 
 function emit(event: Record<string, unknown>): boolean {
@@ -445,12 +448,23 @@ export default Plugin.define({
       const list = pending.get(sessionID)
       if (!list?.length) return
       pending.delete(sessionID)
+      // The context-hook payload shape is runtime-defined; `system` may
+      // be absent or non-array. Fail open rather than throw inside the
+      // plugin host — this is the only unguarded path left.
+      if (!Array.isArray(event.system)) {
+        try {
+          ;(event as { system?: unknown }).system = []
+        } catch {
+          return
+        }
+      }
+      const system = event.system as { type: string; text: string }[]
       for (const entry of list) {
         const text =
           entry.kind === "deps"
             ? `skill-graph: a skill declares dependencies — ${entry.names.join(", ")}. Read the matching SKILL.md files if the task needs them.`
             : `skill-graph: skills relevant to this task — ${entry.names.join(", ")}. Read the matching SKILL.md before relying on it.`
-        event.system.push({ type: "text", text })
+        system.push({ type: "text", text })
       }
     })
   },
