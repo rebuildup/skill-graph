@@ -412,6 +412,30 @@ fn foreign_hook_group_without_hooks_array_survives_enable() {
 }
 
 #[test]
+fn foreign_tool_with_hook_tail_shape_survives() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A foreign tool whose command coincidentally ends in
+    // `hook <runtime> <mode>` must not be claimed or stripped.
+    std::fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/usr/bin/other-tool hook claude-code prompt"}]}]}}"#,
+    )
+    .unwrap();
+    let bin = f.bin_arg();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("other-tool hook claude-code prompt"),
+        "{text}"
+    );
+}
+
+#[test]
 fn status_reports_broken_when_bin_missing() {
     let f = Fixture::new();
     let bin = f.bin_arg();

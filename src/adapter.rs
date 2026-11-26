@@ -23,6 +23,11 @@ const PLUGIN_MARKER: &str = "skill-graph/opencode-plugin";
 /// v0.3.x bundled plugin dir marker (`.../adapters/opencode/skill-graph`).
 const LEGACY_PLUGIN_MARKER: &str = "adapters/opencode/skill-graph";
 
+/// Trailing shell comment marking a hook command as installed by
+/// `adapter enable`. Arbitrary `--bin` names are supported because
+/// ownership is proven by this marker, not by the binary's filename.
+const HOOK_OWNER_MARKER: &str = "# skill-graph-managed";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     User,
@@ -151,50 +156,108 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// v0.4.x hook command shape: `<bin> hook <claude-code|codex|opencode>
-/// <prompt|skill-load>`. Matching the stable invocation tail — not the
-/// binary name — keeps enable/disable correct for any `--bin` override.
-fn is_v040_hook_command(command: &str) -> bool {
-    let cmd = command.trim_start();
-    let rest = if let Some(r) = cmd.strip_prefix('\'') {
-        match r.split_once('\'') {
-            Some((_, tail)) => tail.trim_start(),
-            None => return false,
+/// End index of the first shell word in `s`, honoring single quotes.
+/// Sufficient for commands we emit via `sh_quote` plus plain paths.
+fn first_shell_word(s: &str) -> Option<&str> {
+    let b = s.as_bytes();
+    if b.is_empty() {
+        return None;
+    }
+    let mut i = 0;
+    let mut in_quote = false;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                in_quote = !in_quote;
+                i += 1;
+            }
+            b'\\' if !in_quote => i += 2,
+            c if c.is_ascii_whitespace() && !in_quote => break,
+            _ => i += 1,
         }
-    } else {
-        match cmd.split_once(char::is_whitespace) {
-            Some((_, tail)) => tail.trim_start(),
-            None => return false,
-        }
-    };
-    let t: Vec<&str> = rest.split_whitespace().collect();
-    t.len() == 3
-        && t[0] == "hook"
-        && matches!(t[1], "claude-code" | "codex" | "opencode")
-        && matches!(t[2], "prompt" | "skill-load")
+    }
+    if i == 0 { None } else { Some(&s[..i]) }
 }
 
+/// Inverse of `sh_quote` for a single shell word: strips single quotes
+/// and resolves the `'\''` escape sequence back to a literal `'`.
+fn unquote_shell(word: &str) -> String {
+    let b = word.as_bytes();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\'' => {
+                i += 1;
+                while i < b.len() && b[i] != b'\'' {
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+                i += 1; // closing quote
+            }
+            b'\\' => {
+                i += 1;
+                if i < b.len() {
+                    out.push(b[i] as char);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c as char);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn is_hook_runtime_mode(rt: &str, mode: &str) -> bool {
+    matches!(rt, "claude-code" | "codex" | "opencode") && matches!(mode, "prompt" | "skill-load")
+}
+
+/// Parse a v0.4.x hook command `<bin> hook <runtime> <mode> [marker]`.
+/// Returns (embedded bin path, carries_ownership_marker).
+fn v040_hook_parts(command: &str) -> Option<(String, bool)> {
+    let cmd = command.trim_start();
+    let word = first_shell_word(cmd)?;
+    let rest = cmd[word.len()..].trim_start();
+    let t: Vec<&str> = rest.split_whitespace().collect();
+    let marked = match t.as_slice() {
+        ["hook", rt, mode] if is_hook_runtime_mode(rt, mode) => false,
+        ["hook", rt, mode, "#", "skill-graph-managed"] if is_hook_runtime_mode(rt, mode) => true,
+        _ => return None,
+    };
+    let bin = unquote_shell(word);
+    if bin.is_empty() {
+        None
+    } else {
+        Some((bin, marked))
+    }
+}
+
+/// A hook command is ours when it carries a legacy marker, our ownership
+/// comment, or the v0.4.x invocation shape with a binary path that names
+/// skill-graph (covers hooks written before the marker existed, e.g. the
+/// v0.4.0 release). Foreign tools sharing the tail shape are preserved.
 fn is_our_hook_command(command: &str) -> bool {
-    command.contains(LEGACY_HOOK_MARKER) || is_v040_hook_command(command)
+    if command.contains(LEGACY_HOOK_MARKER) {
+        return true;
+    }
+    match v040_hook_parts(command) {
+        Some((bin, marked)) => marked || bin.contains("skill-graph"),
+        None => false,
+    }
 }
 
 fn is_our_plugin(spec: &Value) -> bool {
     spec.as_str()
-        .map(|s| {
-            s.contains(PLUGIN_MARKER)
-                || s.contains(LEGACY_PLUGIN_MARKER)
-                || s.ends_with("/skill-graph")
-        })
+        .map(|s| s.contains(PLUGIN_MARKER) || s.contains(LEGACY_PLUGIN_MARKER))
         .unwrap_or(false)
 }
 
 fn is_legacy_plugin(spec: &Value) -> bool {
     spec.as_str()
-        .map(|s| {
-            is_our_plugin(spec)
-                && !s.contains(PLUGIN_MARKER)
-                && (s.contains(LEGACY_PLUGIN_MARKER) || s.ends_with("/skill-graph"))
-        })
+        .map(|s| s.contains(LEGACY_PLUGIN_MARKER) && !s.contains(PLUGIN_MARKER))
         .unwrap_or(false)
 }
 
@@ -207,7 +270,7 @@ fn desired_hooks(
 ) -> Vec<(String, Option<String>, String, Option<String>)> {
     let bin = sh_quote(&bin.to_string_lossy());
     let rt = runtime.as_str();
-    let mk = |mode: &str| format!("{bin} hook {rt} {mode}");
+    let mk = |mode: &str| format!("{bin} hook {rt} {mode} {HOOK_OWNER_MARKER}");
     match runtime {
         Runtime::ClaudeCode => vec![
             ("UserPromptSubmit".into(), None, mk("prompt"), None),
@@ -245,34 +308,42 @@ fn read_config(path: &Path) -> Result<Value, String> {
     }
 }
 
+/// Atomic write that preserves the target's permissions and writes
+/// through symlinks (dotfiles-managed configs stay linked).
+fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
+    let target = if path.is_symlink() {
+        std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let tmp = target.with_extension("json.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    if let Some(p) = perms {
+        let _ = std::fs::set_permissions(&tmp, p);
+    }
+    std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))
+}
+
 /// Write JSON without the delete-on-empty behavior of `write_config` —
 /// used for files we do not own (e.g. the dotfiles overlay).
 fn write_json(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
     let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n";
-    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    write_text_atomic(path, &text)
 }
 
 fn write_config(path: &Path, value: &Value) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    let text = if value.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+    if value.as_object().map(|o| o.is_empty()).unwrap_or(false) {
         // A config reduced to {} carries no information; remove it so
         // uninstall fully restores the pre-install state.
         let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(&tmp);
         return Ok(());
-    } else {
-        serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n"
-    };
-    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+    }
+    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n";
+    write_text_atomic(path, &text)
 }
 
 fn hook_group(command: &str, status_message: Option<&str>) -> Value {
@@ -628,23 +699,11 @@ fn count_legacy_entries(config: &Value) -> usize {
 fn first_hook_command(config: &Value) -> Option<String> {
     hook_commands(config)
         .into_iter()
-        .find(|c| is_v040_hook_command(c))
+        .find(|c| is_our_hook_command(c) && v040_hook_parts(c).is_some())
 }
 
-/// First whitespace-separated token of a v0.4.x hook command, unquoted —
-/// the embedded binary path. Only called on commands already validated by
-/// `is_v040_hook_command`, so the first token is always the binary.
+/// Embedded binary path of a v0.4.x hook command, unquoted. Only called
+/// on commands already validated by `v040_hook_parts`.
 fn embedded_bin(command: &str) -> Option<String> {
-    let cmd = command.trim();
-    let token = if let Some(rest) = cmd.strip_prefix('\'') {
-        rest.split('\'').next().map(str::to_string)
-    } else {
-        cmd.split_whitespace().next().map(str::to_string)
-    }?;
-    let token = token.trim_matches('\'');
-    if token.is_empty() {
-        None
-    } else {
-        Some(token.to_string())
-    }
+    v040_hook_parts(command).map(|(bin, _)| bin)
 }
