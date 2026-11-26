@@ -37,6 +37,10 @@ const LOAD_GRADE: [Detection; 5] = [
 struct HookEnv {
     runtime: Runtime,
     nostate: bool,
+    /// True when the state dir resolved to a symlink (shared-TMPDIR
+    /// planting); all state reads/writes are skipped but the event log
+    /// still records observations.
+    state_disabled: bool,
     event_log: PathBuf,
     state_dir: PathBuf,
     event_log_max: u64,
@@ -60,6 +64,7 @@ impl HookEnv {
         Self {
             runtime,
             nostate: std::env::var("SKILL_GRAPH_HOOK_NOSTATE").as_deref() == Ok("1"),
+            state_disabled: false,
             event_log: std::env::var("SKILL_GRAPH_EVENT_LOG")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(&tmp).join("skill-graph-events.jsonl")),
@@ -115,6 +120,7 @@ impl HookEnv {
     fn marker_exists(&self, dedup_key: &str) -> bool {
         // symlink_metadata: a planted symlink must not satisfy dedup.
         !self.nostate
+            && !self.state_disabled
             && self
                 .marker_path(dedup_key)
                 .symlink_metadata()
@@ -123,7 +129,7 @@ impl HookEnv {
     }
 
     fn touch_marker(&self, dedup_key: &str) {
-        if self.nostate {
+        if self.nostate || self.state_disabled {
             return;
         }
         let path = self.marker_path(dedup_key);
@@ -158,7 +164,7 @@ impl HookEnv {
     }
 
     fn session_recommended(&self) -> Vec<String> {
-        if self.nostate {
+        if self.nostate || self.state_disabled {
             return Vec::new();
         }
         std::fs::read_to_string(self.recommended_path())
@@ -172,7 +178,7 @@ impl HookEnv {
     }
 
     fn record_recommended(&self, names: &[String]) {
-        if self.nostate || names.is_empty() {
+        if self.nostate || self.state_disabled || names.is_empty() {
             return;
         }
         const CAP: usize = 32;
@@ -380,6 +386,12 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     let mut contexts = Vec::new();
     let mut graph_cache: Option<crate::resolver::Graph> = None;
     let mut no_roots_emitted = false;
+    // Each load-grade skill triggers a full recommend() pass; cap the
+    // number of recommendation calls per payload so a command stuffed
+    // with SKILL.md paths cannot pin the hook. Events are still logged;
+    // skipped skills simply get no dependency injection this run.
+    const MAX_LOAD_RECOMMENDS: usize = 8;
+    let mut recommend_budget = MAX_LOAD_RECOMMENDS;
     for mut event in detected {
         // Normalize to the sanitized session id so all events agree.
         event.session_id = env.session_id.clone();
@@ -415,7 +427,7 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
             }
             continue;
         }
-        if let Some(ctx) = skill_load_context(env, &skill_name, graph) {
+        if let Some(ctx) = skill_load_context(env, &skill_name, graph, &mut recommend_budget) {
             contexts.push(ctx);
         }
     }
@@ -432,7 +444,14 @@ fn skill_load_context(
     env: &HookEnv,
     skill_name: &str,
     graph: &crate::resolver::Graph,
+    recommend_budget: &mut usize,
 ) -> Option<String> {
+    // Budget is checked before touching the dedup marker: a skill skipped
+    // for budget reasons was never recommended, so a later payload may
+    // still surface it.
+    if *recommend_budget == 0 {
+        return None;
+    }
     let dedup_key = format!("skill:{skill_name}");
     if env.marker_exists(&dedup_key) {
         emit_recommendation(
@@ -448,6 +467,7 @@ fn skill_load_context(
     }
     env.touch_marker(&dedup_key);
 
+    *recommend_budget -= 1;
     // Session continuity (issue #128): names this session's prompt mode
     // already surfaced become recommendation context.
     let session_ctx = env.session_recommended().join(" ");
@@ -621,13 +641,24 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         Ok(v) if v.is_object() => v,
         _ => return Ok(()),
     };
-    let env = HookEnv::from_payload(runtime, &payload);
+    let mut env = HookEnv::from_payload(runtime, &payload);
 
     if env.nostate {
         // No state dir needed, but the event log is also skipped by log_event.
     } else {
-        let _ = std::fs::create_dir_all(&env.state_dir);
-        restrict_dir_perms(&env.state_dir);
+        // State lives under a shared TMPDIR: a pre-planted symlink at the
+        // state-dir path would redirect marker/session writes (and the
+        // chmod below) into an arbitrary directory. Refuse state ops in
+        // that case; the event log still records observations.
+        let is_link = std::fs::symlink_metadata(&env.state_dir)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            env.state_disabled = true;
+        } else {
+            let _ = std::fs::create_dir_all(&env.state_dir);
+            restrict_dir_perms(&env.state_dir);
+        }
     }
 
     let response = match mode {

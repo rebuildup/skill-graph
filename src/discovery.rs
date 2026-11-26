@@ -65,13 +65,24 @@ pub fn resolve_roots(
 /// the whole filesystem before output truncation applies.
 const MAX_DISCOVER_ENTRIES: usize = 100_000;
 
+/// Upper bounds on accepted skills and their cumulative bytes. Each
+/// SKILL.md may be up to 1 MiB and `Skill` retains the full body text;
+/// without caps a hostile or pathological tree could exhaust memory.
+const MAX_SKILLS: usize = 10_000;
+const MAX_SKILL_BYTES: u64 = 512 * 1024 * 1024;
+
 pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
     let mut seen_roots = HashSet::new();
     let mut seen_files = HashSet::new();
+    let mut total_bytes = 0u64;
+    let mut capacity_truncated = false;
 
     for requested in roots {
+        if capacity_truncated {
+            break;
+        }
         let Ok(root) = std::fs::canonicalize(requested) else {
             errors.push(format!(
                 "root not found or unreadable: {}",
@@ -86,6 +97,9 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         let mut scanned = 0usize;
         let mut walk_errors = 0usize;
         for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {
+            if capacity_truncated {
+                break;
+            }
             // Surface IO errors (permission-denied dirs etc.) instead of
             // silently reporting a partial scan as clean.
             let entry = match entry {
@@ -120,8 +134,16 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             if !seen_files.insert(canonical) {
                 continue;
             }
+            let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if skills.len() >= MAX_SKILLS || total_bytes + file_bytes > MAX_SKILL_BYTES {
+                capacity_truncated = true;
+                break;
+            }
             match parse_skill(path, &root) {
-                Ok(skill) => skills.push(skill),
+                Ok(skill) => {
+                    total_bytes += file_bytes;
+                    skills.push(skill);
+                }
                 Err(err) => errors.push(err),
             }
         }
@@ -132,6 +154,14 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 MAX_DISCOVER_ENTRIES
             ));
         }
+    }
+
+    if capacity_truncated {
+        errors.push(format!(
+            "discovery truncated: skill limit {} or total size limit {} MiB reached",
+            MAX_SKILLS,
+            MAX_SKILL_BYTES / (1024 * 1024)
+        ));
     }
 
     Discovery { skills, errors }

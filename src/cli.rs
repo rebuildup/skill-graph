@@ -144,10 +144,16 @@ pub fn run() -> Result<(), String> {
             let query = match (query, query_stdin) {
                 (Some(q), false) => q,
                 (None, true) => {
+                    // Same 16 MiB bound as hook/detect stdin: query text is
+                    // agent-controlled and recommend() work scales with it.
                     let mut buf = String::new();
                     std::io::stdin()
+                        .take(16 * 1024 * 1024 + 1)
                         .read_to_string(&mut buf)
                         .map_err(|e| format!("failed to read --query-stdin: {e}"))?;
+                    if buf.len() > 16 * 1024 * 1024 {
+                        return Err("--query-stdin input exceeds 16 MiB".into());
+                    }
                     buf
                 }
                 (Some(_), true) => {

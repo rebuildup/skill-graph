@@ -12,9 +12,24 @@ struct Evidence {
     reasons: Vec<String>,
 }
 
+// Agent-controlled input (hook stdin, --query-stdin, MCP args) must not
+// turn term extraction into unbounded work: cap raw text and unique terms.
+const MAX_RECOMMEND_INPUT_CHARS: usize = 32 * 1024;
+const MAX_RECOMMEND_TERMS: usize = 1024;
+
 pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<Recommendation> {
-    let query = query.trim().to_lowercase();
-    let context = context.trim().to_lowercase();
+    let query = query
+        .trim()
+        .chars()
+        .take(MAX_RECOMMEND_INPUT_CHARS)
+        .collect::<String>()
+        .to_lowercase();
+    let context = context
+        .trim()
+        .chars()
+        .take(MAX_RECOMMEND_INPUT_CHARS)
+        .collect::<String>()
+        .to_lowercase();
     if query.is_empty() && context.is_empty() {
         return Vec::new();
     }
@@ -23,9 +38,14 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // substring they were derived from, so admission can tell independent
     // evidence from one substring's bigram+gloss cluster (#78).
     let query_tagged = terms_tagged(&query);
+    let query_tagged: Vec<(String, String)> =
+        query_tagged.into_iter().take(MAX_RECOMMEND_TERMS).collect();
     let query_terms: Vec<String> = query_tagged.iter().map(|(t, _)| t.clone()).collect();
     let query_sources = term_sources(&query_tagged);
-    let context_terms = terms(&context);
+    let context_terms: Vec<String> = terms(&context)
+        .into_iter()
+        .take(MAX_RECOMMEND_TERMS)
+        .collect();
     let skill_names: Vec<String> = graph
         .skills
         .iter()
@@ -643,6 +663,10 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
     {
         out.push(("pr".to_string(), "pull-request".to_string()));
     }
+    // Repeated terms would inflate hit counts and scores; keep first
+    // occurrence of each term (provenance is first-wins in term_sources).
+    let mut seen = HashSet::new();
+    out.retain(|(term, _)| seen.insert(term.clone()));
     out
 }
 

@@ -274,6 +274,11 @@ fn v040_hook_parts(command: &str) -> Option<(String, bool)> {
 fn has_legacy_hook_bin(command: &str) -> bool {
     command.split_whitespace().any(|tok| {
         let tok = tok.trim_matches(|c| c == '\'' || c == '"');
+        // A URL merely ending in the marker filename (e.g. a curl|sh
+        // one-liner) must not be claimed for deletion.
+        if tok.contains("://") {
+            return false;
+        }
         Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
     })
 }
@@ -390,37 +395,47 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
     }
     let perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
     static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = target.with_file_name(format!(
-        ".{}.tmp-{}-{seq}",
-        target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config"),
-        std::process::id()
-    ));
-    let result = (|| -> Result<(), String> {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+    let name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    // Retry on create_new collisions (PID reuse, stale tmp litter): each
+    // attempt gets a fresh sequence number.
+    for _ in 0..8 {
+        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = target.with_file_name(format!(".{name}.tmp-{}-{seq}", std::process::id()));
+        // Ok(false) = tmp name already taken; retry with a fresh seq.
+        let result = (|| -> Result<bool, String> {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = match opts.open(&tmp) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+                Err(e) => return Err(format!("{}: {e}", tmp.display())),
+            };
+            std::io::Write::write_all(&mut f, text.as_bytes())
+                .map_err(|e| format!("{}: {e}", tmp.display()))?;
+            if let Some(p) = &perms {
+                let _ = std::fs::set_permissions(&tmp, p.clone());
+            }
+            std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))?;
+            Ok(true)
+        })();
+        match result {
+            Ok(true) => return Ok(()),
+            Ok(false) => continue,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
         }
-        let mut f = opts
-            .open(&tmp)
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
-        std::io::Write::write_all(&mut f, text.as_bytes())
-            .map_err(|e| format!("{}: {e}", tmp.display()))?;
-        if let Some(p) = perms {
-            let _ = std::fs::set_permissions(&tmp, p);
-        }
-        std::fs::rename(&tmp, &target).map_err(|e| format!("{}: {e}", target.display()))
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&tmp);
     }
-    result
+    Err(format!("{}: could not create temp file", target.display()))
 }
 
 /// Write JSON without the delete-on-empty behavior of `write_config` —

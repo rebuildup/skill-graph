@@ -138,6 +138,23 @@ pub struct SkillUsageEvent {
     pub tool: Option<String>,
 }
 
+/// Session ids come from agent-controlled payloads and transcripts;
+/// bound them like `tool`/`skill_path` so a hostile payload cannot write
+/// unbounded strings into every event line. Charset matches the hook's
+/// sanitizer so hook- and detect-emitted events agree.
+fn sanitize_session_id(session_id: &str) -> String {
+    let safe: String = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        .take(128)
+        .collect();
+    if safe.is_empty() && !session_id.is_empty() {
+        "unknown".to_string()
+    } else {
+        safe
+    }
+}
+
 impl SkillUsageEvent {
     pub fn prompt_submit(
         runtime: Runtime,
@@ -150,7 +167,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::PromptSubmit,
             runtime,
-            session_id: session_id.to_string(),
+            session_id: sanitize_session_id(session_id),
             timestamp: timestamp.to_string(),
             observed_via,
             prompt_hash: Some(sha256_hex(prompt.as_bytes())),
@@ -185,7 +202,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::Recommendation,
             runtime,
-            session_id: session_id.to_string(),
+            session_id: sanitize_session_id(session_id),
             timestamp: timestamp.to_string(),
             observed_via,
             prompt_hash,
@@ -221,7 +238,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::SkillLoad,
             runtime,
-            session_id: session_id.to_string(),
+            session_id: sanitize_session_id(session_id),
             timestamp: timestamp.to_string(),
             observed_via,
             prompt_hash: None,
@@ -295,45 +312,32 @@ fn unix_secs_to_rfc3339(secs: u64) -> String {
 
 /// Extract the `name:` field from a YAML frontmatter block, wherever it
 /// appears in `text` (tool output may carry a prefix such as `Output:`).
+/// Only a bounded head is scanned and fences must be `---` alone on their
+/// line — mirroring `parser.rs` — so prose containing `--- foo` or a
+/// later frontmatter-looking block cannot spoof the skill name.
 pub fn frontmatter_name(text: &str) -> Option<String> {
-    let mut rest = text;
-    loop {
-        let start = rest.find("---")?;
-        // The opening fence must be at a line boundary.
-        let line_start =
-            start == 0 || rest[..start].ends_with('\n') || rest[..start].ends_with("\r\n");
-        if !line_start {
-            rest = &rest[start + 3..];
+    const MAX_SCAN: usize = 8 * 1024;
+    let head: String = text.chars().take(MAX_SCAN).collect();
+    let mut in_fence = false;
+    for line in head.lines() {
+        if line.trim_end() == "---" {
+            if in_fence {
+                return None;
+            }
+            in_fence = true;
             continue;
         }
-        let after = &rest[start + 3..];
-        let end_rel = find_line_fence(after)?;
-        let block = &after[..end_rel];
-        for line in block.lines() {
-            let line = line.trim_end();
-            if let Some(value) = line.strip_prefix("name:") {
-                let value = value.trim().trim_matches('"').trim_matches('\'');
-                // Only spec-conforming names may flow into events/state;
-                // anything else is treated as absent.
-                if !value.is_empty() && crate::parser::valid_skill_name(value) {
-                    return Some(value.to_string());
-                }
+        if !in_fence {
+            continue;
+        }
+        if let Some(value) = line.trim_end().strip_prefix("name:") {
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            // Only spec-conforming names may flow into events/state;
+            // anything else is treated as absent.
+            if !value.is_empty() && crate::parser::valid_skill_name(value) {
+                return Some(value.to_string());
             }
         }
-        return None;
-    }
-}
-
-/// Find the offset of the next line that is exactly `---` (the closing
-/// fence), relative to `text` which starts just after the opening fence.
-fn find_line_fence(text: &str) -> Option<usize> {
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed == "---" {
-            return Some(offset);
-        }
-        offset += line.len();
     }
     None
 }
@@ -764,6 +768,12 @@ pub fn response_text(value: &Value) -> String {
     }
 }
 
+/// Upper bound on events emitted from a single payload. A hostile or buggy
+/// tool call could reference thousands of distinct SKILL.md paths; without
+/// a cap the hook would run unbounded recommend() passes and churn the
+/// event log.
+const MAX_EVENTS_PER_PAYLOAD: usize = 64;
+
 /// Normalize a runtime hook/plugin payload into `skill_load` events —
 /// one per distinct skill access (a command may touch several SKILL.md
 /// files). Empty when the payload carries no skill-load signal.
@@ -846,14 +856,17 @@ pub fn detect_all_from_payload(
                 push(path, access, &mut events);
             }
         }
+        events.truncate(MAX_EVENTS_PER_PAYLOAD);
         return events;
     }
 
-    classify_tool_access_all(tool, &input, &output)
+    let mut events: Vec<SkillUsageEvent> = classify_tool_access_all(tool, &input, &output)
         .into_iter()
         .filter(|c| c.skill_name.is_some())
         .map(to_event)
-        .collect()
+        .collect();
+    events.truncate(MAX_EVENTS_PER_PAYLOAD);
+    events
 }
 
 /// Single-event view kept for callers that can only carry one result

@@ -209,11 +209,27 @@ fn split_frontmatter(text: &str) -> (&str, &str) {
     if !(rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n")) {
         return ("", text);
     }
-    let Some(end) = rest.find("\n---") else {
+    // The closing fence must be `---` alone on its line; `find("\n---")`
+    // would also accept `---x`/`--- extra` and fences inside YAML block
+    // scalars, truncating frontmatter early.
+    let mut offset = 0usize;
+    let mut fence = None;
+    for line in rest.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == "---" {
+            fence = Some((offset, offset + line.len()));
+            break;
+        }
+        offset += line.len();
+    }
+    let Some((fence_start, fence_end)) = fence else {
         return ("", text);
     };
-    let frontmatter = &rest[..end];
-    let after = &rest[end + 4..];
+    let fm = &rest[..fence_start];
+    let frontmatter = fm
+        .strip_suffix("\r\n")
+        .or_else(|| fm.strip_suffix('\n'))
+        .unwrap_or(fm);
+    let after = &rest[fence_end..];
     let body = after
         .strip_prefix('\n')
         .or_else(|| after.strip_prefix("\r\n"))
