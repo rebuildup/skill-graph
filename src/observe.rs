@@ -85,6 +85,21 @@ pub struct SkillLoad {
     pub detection: String,
 }
 
+/// Observable format is judged on the INPUT path's extension, carried
+/// alongside the canonical path: a symlink `x.db -> storage.sqlite`
+/// must still be scanned as a database even though the resolved path
+/// has no `.db` extension (#144 r14).
+fn is_db_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("db")
+}
+
+fn observable_ext(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("jsonl") | Some("db")
+    )
+}
+
 pub fn observe_path(path: &Path) -> Result<Observation, String> {
     let (files, collect_errors) = collect_observables(path);
     let mut files = files;
@@ -92,7 +107,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     let mut obs = Observation::default();
     obs.errors.extend(collect_errors);
     let mut sessions = SessionSet::default();
-    for file in files {
+    for (file, is_db) in files {
         obs.files_scanned += 1;
         obs.current_file_len = file.display().to_string().len();
         // Size cap applies to every observable format — .db inputs are
@@ -100,7 +115,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
         // SQLite database the un-checkpointed WAL is read too, so its
         // size counts against the same cap.
         let mut size = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        if file.extension().and_then(|e| e.to_str()) == Some("db") {
+        if is_db {
             let mut wal = file.as_os_str().to_os_string();
             wal.push("-wal");
             if let Ok(meta) = fs::metadata(Path::new(&wal)) {
@@ -112,7 +127,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
             continue;
         }
         let loads_before = obs.loads.len();
-        let result = if file.extension().and_then(|e| e.to_str()) == Some("db") {
+        let result = if is_db {
             observe_db(&file, &mut obs, &mut sessions)
         } else {
             observe_jsonl(&file, &mut obs, &mut sessions)
@@ -235,7 +250,7 @@ fn note_error(errors: &mut Vec<String>, noted: &mut bool, msg: String) {
     }
 }
 
-fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
+fn collect_observables(path: &Path) -> (Vec<(PathBuf, bool)>, Vec<String>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let mut visited_dirs = std::collections::HashSet::new();
@@ -275,7 +290,7 @@ fn note_observable_cap(out_len: usize, errors: &mut Vec<String>, noted: &mut boo
 #[allow(clippy::too_many_arguments)]
 fn collect_observables_inner(
     path: &Path,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, bool)>,
     errors: &mut Vec<String>,
     visited_dirs: &mut std::collections::HashSet<PathBuf>,
     seen_files: &mut std::collections::HashSet<ObsKey>,
@@ -302,10 +317,7 @@ fn collect_observables_inner(
         return;
     }
     if path.is_file() {
-        if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("jsonl") | Some("db")
-        ) {
+        if observable_ext(path) {
             push_observable(path, out, seen_files);
         }
         return;
@@ -374,12 +386,7 @@ fn collect_observables_inner(
             // Never recurse through symlinked directories (unbounded
             // scan risk), but a symlinked .jsonl/.db file is a single
             // bounded read and is followed — deduped by canonical target.
-            if p.is_file()
-                && matches!(
-                    p.extension().and_then(|e| e.to_str()),
-                    Some("jsonl") | Some("db")
-                )
-            {
+            if p.is_file() && observable_ext(&p) {
                 push_observable(&p, out, seen_files);
             }
             continue;
@@ -398,12 +405,7 @@ fn collect_observables_inner(
                 entries_seen,
                 depth + 1,
             );
-        } else if p.is_file()
-            && matches!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("jsonl") | Some("db")
-            )
-        {
+        } else if p.is_file() && observable_ext(&p) {
             // is_file() rejects FIFOs/devices: read_to_string on a FIFO
             // would block forever waiting for a writer.
             push_observable(&p, out, seen_files);
@@ -435,16 +437,23 @@ fn observable_key(path: &Path) -> ObsKey {
 
 fn push_observable(
     path: &Path,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, bool)>,
     seen: &mut std::collections::HashSet<ObsKey>,
 ) {
+    // Format is judged on the input path's extension BEFORE
+    // canonicalization: a symlink `x.db -> storage.sqlite` must still
+    // be scanned as a database (#144 r14).
+    let is_db = is_db_path(path);
     if seen.insert(observable_key(path)) {
         // Store the canonical path: every symlink component is resolved
         // at collection time, so the O_NOFOLLOW open in observe_jsonl
         // guards only the final component and a symlinked .jsonl is
         // still scanned (its target, deduped by (dev,ino)) — read_dir
         // order can no longer decide whether the file is seen (#144 r14).
-        out.push(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()));
+        out.push((
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+            is_db,
+        ));
     }
 }
 
@@ -1307,8 +1316,15 @@ impl CodexScan {
                             }
                             let name_hint = events::skill_name_from_path(path);
                             // name_hint is derived from the (already
-                            // capped) path; charge a flat record cost.
-                            if !self.charge(256 + name_hint.as_deref().map_or(0, str::len)) {
+                            // capped) path; charge the record's real
+                            // retained strings — distinct call_ids are
+                            // distinct allocations even though they are
+                            // Rc-shared within one call.
+                            if !self.charge(
+                                256 + call_id.len()
+                                    + timestamp.len()
+                                    + name_hint.as_deref().map_or(0, str::len),
+                            ) {
                                 self.overflow_dropped += 1;
                                 continue;
                             }
@@ -1380,10 +1396,17 @@ impl CodexScan {
                             if let Some(event) =
                                 parse_injected_recommendation(&self.session_id, &timestamp, &text)
                             {
-                                // recommended names are already capped
-                                // by the constructor; charge a flat
-                                // estimate for the event struct.
-                                if self.injected.len() >= MAX_SCAN_ITEMS || !self.charge(2048) {
+                                // Charge the event's real retained
+                                // size: fixed struct cost plus each
+                                // recommended name (the constructor
+                                // caps count at MAX_RECOMMENDED).
+                                let cost = 256
+                                    + event
+                                        .recommended
+                                        .iter()
+                                        .map(|r| r.name.len() + 48)
+                                        .sum::<usize>();
+                                if self.injected.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
                                     self.injected_dropped += 1;
                                 } else {
                                     self.injected.push(event);

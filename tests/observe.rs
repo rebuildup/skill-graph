@@ -850,3 +850,30 @@ fn codex_rollout_with_oversized_session_id_stays_bounded() {
     assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&50));
     assert_eq!(obs.sessions, 1);
 }
+
+/// Round-14 CodeRabbit: format is judged on the INPUT path's extension.
+/// A `link.db -> storage.sqlite` symlink must still be scanned as a
+/// database even though the canonical target has no `.db` suffix.
+#[cfg(unix)]
+#[test]
+fn db_symlink_to_different_extension_is_still_scanned_as_db() {
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("storage.sqlite");
+    let conn = rusqlite::Connection::open(&real).unwrap();
+    conn.execute(
+        "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m1','ses_1','user',1,1793321018917,1793321018917,?)",
+        [serde_json::json!({"time":{"created":1793321018917i64},"text":"hello"}).to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    std::os::unix::fs::symlink(&real, dir.path().join("link.db")).unwrap();
+
+    let obs = observe_path(dir.path()).unwrap();
+    assert!(obs.errors.is_empty(), "errors: {:?}", obs.errors);
+    assert!(obs.events.iter().any(|e| e.kind == EventKind::PromptSubmit));
+}
