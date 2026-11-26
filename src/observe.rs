@@ -30,6 +30,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 #[derive(Debug, Default, Serialize)]
 pub struct Observation {
@@ -47,6 +48,11 @@ pub struct Observation {
     /// Non-fatal per-file/per-table problems (missing tables, unreadable
     /// files, unsupported schema drift).
     pub errors: Vec<String>,
+    /// Set once `errors` hits MAX_OBSERVE_ERRORS; per-file failures
+    /// are routed through `obs_error` so thousands of bad inputs cannot
+    /// grow the vec past the documented cap (#144 r14).
+    #[serde(skip)]
+    pub errors_truncated: bool,
     /// Set once the retained-events cap notices truncation; further
     /// rejections stay silent so `errors` cannot grow with input size.
     #[serde(skip)]
@@ -79,6 +85,21 @@ pub struct SkillLoad {
     pub detection: String,
 }
 
+/// Observable format is judged on the INPUT path's extension, carried
+/// alongside the canonical path: a symlink `x.db -> storage.sqlite`
+/// must still be scanned as a database even though the resolved path
+/// has no `.db` extension (#144 r14).
+fn is_db_path(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("db")
+}
+
+fn observable_ext(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("jsonl") | Some("db")
+    )
+}
+
 pub fn observe_path(path: &Path) -> Result<Observation, String> {
     let (files, collect_errors) = collect_observables(path);
     let mut files = files;
@@ -86,7 +107,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     let mut obs = Observation::default();
     obs.errors.extend(collect_errors);
     let mut sessions = SessionSet::default();
-    for file in files {
+    for (file, is_db) in files {
         obs.files_scanned += 1;
         obs.current_file_len = file.display().to_string().len();
         // Size cap applies to every observable format — .db inputs are
@@ -94,7 +115,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
         // SQLite database the un-checkpointed WAL is read too, so its
         // size counts against the same cap.
         let mut size = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
-        if file.extension().and_then(|e| e.to_str()) == Some("db") {
+        if is_db {
             let mut wal = file.as_os_str().to_os_string();
             wal.push("-wal");
             if let Ok(meta) = fs::metadata(Path::new(&wal)) {
@@ -102,18 +123,17 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
             }
         }
         if size > MAX_OBSERVE_FILE_BYTES {
-            obs.errors
-                .push(format!("{}: file too large", file.display()));
+            obs_error(&mut obs, format!("{}: file too large", file.display()));
             continue;
         }
         let loads_before = obs.loads.len();
-        let result = if file.extension().and_then(|e| e.to_str()) == Some("db") {
+        let result = if is_db {
             observe_db(&file, &mut obs, &mut sessions)
         } else {
             observe_jsonl(&file, &mut obs, &mut sessions)
         };
         if let Err(err) = result {
-            obs.errors.push(format!("{}: {err}", file.display()));
+            obs_error(&mut obs, format!("{}: {err}", file.display()));
         }
         for load in obs.loads.iter_mut().skip(loads_before) {
             load.file = file.display().to_string();
@@ -121,8 +141,10 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     }
     obs.sessions = sessions.hashes.len();
     if sessions.truncated {
-        obs.errors
-            .push("distinct session ids truncated at cardinality cap".to_string());
+        obs_error(
+            &mut obs,
+            "distinct session ids truncated at cardinality cap".to_string(),
+        );
     }
     Ok(obs)
 }
@@ -195,6 +217,25 @@ const MAX_OBSERVE_FILES: usize = 4096;
 /// without bound.
 const MAX_OBSERVE_DEPTH: usize = 64;
 const MAX_OBSERVE_ERRORS: usize = 1024;
+/// Cardinality bounds on traversal itself: observable-file and depth
+/// caps alone leave `visited_dirs` and per-directory entry iteration
+/// unbounded — a tree of empty directories or one directory with
+/// millions of entries would burn CPU/memory without producing a
+/// single observable (#144 r14).
+const MAX_OBSERVE_DIRS: usize = 65_536;
+const MAX_OBSERVE_DIR_ENTRIES: usize = 1_000_000;
+
+/// Push an Observation error under the same cap as collection errors.
+fn obs_error(obs: &mut Observation, msg: String) {
+    if obs.errors.len() < MAX_OBSERVE_ERRORS {
+        obs.errors.push(msg);
+    } else if !obs.errors_truncated {
+        obs.errors_truncated = true;
+        obs.errors.push(format!(
+            "further scan errors suppressed at {MAX_OBSERVE_ERRORS}"
+        ));
+    }
+}
 
 /// Push a collection error, capped; the overflow note latches so a
 /// hostile tree cannot grow `errors` with input size.
@@ -209,7 +250,7 @@ fn note_error(errors: &mut Vec<String>, noted: &mut bool, msg: String) {
     }
 }
 
-fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
+fn collect_observables(path: &Path) -> (Vec<(PathBuf, bool)>, Vec<String>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let mut visited_dirs = std::collections::HashSet::new();
@@ -217,6 +258,8 @@ fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut cap_noted = false;
     let mut err_noted = false;
     let mut depth_noted = false;
+    let mut dir_noted = false;
+    let mut entries_seen = 0usize;
     collect_observables_inner(
         path,
         &mut out,
@@ -226,6 +269,8 @@ fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
         &mut cap_noted,
         &mut err_noted,
         &mut depth_noted,
+        &mut dir_noted,
+        &mut entries_seen,
         0,
     );
     (out, errors)
@@ -245,13 +290,15 @@ fn note_observable_cap(out_len: usize, errors: &mut Vec<String>, noted: &mut boo
 #[allow(clippy::too_many_arguments)]
 fn collect_observables_inner(
     path: &Path,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, bool)>,
     errors: &mut Vec<String>,
     visited_dirs: &mut std::collections::HashSet<PathBuf>,
     seen_files: &mut std::collections::HashSet<ObsKey>,
     cap_noted: &mut bool,
     err_noted: &mut bool,
     depth_noted: &mut bool,
+    dir_noted: &mut bool,
+    entries_seen: &mut usize,
     depth: usize,
 ) {
     if depth > MAX_OBSERVE_DEPTH {
@@ -270,10 +317,7 @@ fn collect_observables_inner(
         return;
     }
     if path.is_file() {
-        if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("jsonl") | Some("db")
-        ) {
+        if observable_ext(path) {
             push_observable(path, out, seen_files);
         }
         return;
@@ -290,6 +334,17 @@ fn collect_observables_inner(
     // Canonicalize each directory and visit it at most once — this also
     // dedups bind mounts and overlapping roots.
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if visited_dirs.len() >= MAX_OBSERVE_DIRS {
+        if !*dir_noted {
+            *dir_noted = true;
+            note_error(
+                errors,
+                err_noted,
+                format!("directory count exceeds {MAX_OBSERVE_DIRS}; deeper inputs skipped"),
+            );
+        }
+        return;
+    }
     if !visited_dirs.insert(canonical) {
         return;
     }
@@ -305,6 +360,20 @@ fn collect_observables_inner(
             note_observable_cap(out.len(), errors, cap_noted);
             break;
         }
+        *entries_seen += 1;
+        if *entries_seen > MAX_OBSERVE_DIR_ENTRIES {
+            if !*dir_noted {
+                *dir_noted = true;
+                note_error(
+                    errors,
+                    err_noted,
+                    format!(
+                        "directory entries exceed {MAX_OBSERVE_DIR_ENTRIES}; remaining inputs skipped"
+                    ),
+                );
+            }
+            return;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -317,12 +386,7 @@ fn collect_observables_inner(
             // Never recurse through symlinked directories (unbounded
             // scan risk), but a symlinked .jsonl/.db file is a single
             // bounded read and is followed — deduped by canonical target.
-            if p.is_file()
-                && matches!(
-                    p.extension().and_then(|e| e.to_str()),
-                    Some("jsonl") | Some("db")
-                )
-            {
+            if p.is_file() && observable_ext(&p) {
                 push_observable(&p, out, seen_files);
             }
             continue;
@@ -337,14 +401,11 @@ fn collect_observables_inner(
                 cap_noted,
                 err_noted,
                 depth_noted,
+                dir_noted,
+                entries_seen,
                 depth + 1,
             );
-        } else if p.is_file()
-            && matches!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("jsonl") | Some("db")
-            )
-        {
+        } else if p.is_file() && observable_ext(&p) {
             // is_file() rejects FIFOs/devices: read_to_string on a FIFO
             // would block forever waiting for a writer.
             push_observable(&p, out, seen_files);
@@ -376,11 +437,23 @@ fn observable_key(path: &Path) -> ObsKey {
 
 fn push_observable(
     path: &Path,
-    out: &mut Vec<PathBuf>,
+    out: &mut Vec<(PathBuf, bool)>,
     seen: &mut std::collections::HashSet<ObsKey>,
 ) {
+    // Format is judged on the input path's extension BEFORE
+    // canonicalization: a symlink `x.db -> storage.sqlite` must still
+    // be scanned as a database (#144 r14).
+    let is_db = is_db_path(path);
     if seen.insert(observable_key(path)) {
-        out.push(path.to_path_buf());
+        // Store the canonical path: every symlink component is resolved
+        // at collection time, so the O_NOFOLLOW open in observe_jsonl
+        // guards only the final component and a symlinked .jsonl is
+        // still scanned (its target, deduped by (dev,ino)) — read_dir
+        // order can no longer decide whether the file is seen (#144 r14).
+        out.push((
+            fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+            is_db,
+        ));
     }
 }
 
@@ -442,7 +515,7 @@ fn observe_jsonl(
         if let Some(sid) = line_session_id(&value) {
             sessions.insert(&sid);
         }
-        if try_passthrough_event(&value, obs) {
+        if try_passthrough_event(&value, line, obs) {
             continue;
         }
         if looks_like_codex_rollout(&value) {
@@ -458,11 +531,14 @@ fn observe_jsonl(
 }
 
 /// Contract-form event logs are passed through after validation.
-fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
+/// `line` is the raw JSON text: deserializing the struct straight from
+/// it avoids deep-cloning the already-parsed `Value` tree (~30x the
+/// line's retained size) just to convert it (#144 r14).
+fn try_passthrough_event(value: &Value, line: &str, obs: &mut Observation) -> bool {
     if value.get("kind").is_none() || value.get("schema_version").is_none() {
         return false;
     }
-    let Ok(mut event) = serde_json::from_value::<SkillUsageEvent>(value.clone()) else {
+    let Ok(mut event) = serde_json::from_str::<SkillUsageEvent>(line) else {
         obs.lines_skipped += 1;
         return true;
     };
@@ -705,8 +781,7 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
                 obs.skill_loads.insert(name.clone(), 1);
             } else if !obs.skill_loads_truncated {
                 obs.skill_loads_truncated = true;
-                obs.errors
-                    .push("skill_loads name cardinality truncated".to_string());
+                obs_error(obs, "skill_loads name cardinality truncated".to_string());
             }
             if under_cap(
                 obs.loads.len(),
@@ -776,6 +851,52 @@ fn detection_name(d: Detection) -> &'static str {
 // Claude Code transcript
 // ---------------------------------------------------------------------------
 
+/// Per-access path bound: extract_exec_commands output is bounded by
+/// the 4 MiB line cap, but a retained path String per access would let
+/// ~65K accesses pin hundreds of MB. Legitimate SKILL.md paths are far
+/// shorter.
+const MAX_SCAN_PATH_BYTES: usize = 4096;
+/// Cap on one captured tool output retained for frontmatter
+/// verification — frontmatter sits at the head of the output, so a
+/// bounded prefix suffices.
+const MAX_SCAN_OUTPUT_BYTES: usize = 256 * 1024;
+/// Cardinality/byte budgets for scanner-retained aggregates. Count
+/// caps alone do not bound bytes (each record can carry ~4 MiB of
+/// strings before Value amplification), so every retained collection
+/// also charges a shared byte budget (#144 r14).
+const MAX_SCAN_ITEMS: usize = 65_536;
+const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Conservative retained-size estimate for a serde_json::Value tree
+/// (strings + node overhead). Nesting is bounded by serde_json's
+/// recursion limit, so this cannot overflow the stack.
+fn value_bytes(v: &Value) -> usize {
+    match v {
+        Value::Null | Value::Bool(_) => 8,
+        Value::Number(_) => 16,
+        Value::String(s) => s.len() + 24,
+        Value::Array(a) => 24 + a.iter().map(value_bytes).sum::<usize>(),
+        Value::Object(o) => {
+            24 + o
+                .iter()
+                .map(|(k, v)| k.len() + value_bytes(v) + 16)
+                .sum::<usize>()
+        }
+    }
+}
+
+/// Truncate a string to at most `max` bytes on a char boundary.
+fn cap_bytes(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut n = max;
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    s[..n].to_string()
+}
+
 #[derive(Default)]
 struct ClaudeScan {
     /// (tool_use_id, session_id, timestamp, tool name, input)
@@ -784,18 +905,38 @@ struct ClaudeScan {
     results: HashMap<String, String>,
     /// (session_id, timestamp, text) user prompts
     prompts: Vec<(String, String, String)>,
+    /// Aggregate retained bytes across uses/results/prompts.
+    retained: usize,
+    uses_dropped: usize,
+    results_dropped: usize,
+    prompts_dropped: usize,
 }
 
 impl ClaudeScan {
+    /// Charge `bytes` against the shared retained budget; false means
+    /// the item must be dropped (counted by the caller).
+    fn charge(&mut self, bytes: usize) -> bool {
+        if self.retained.saturating_add(bytes) <= MAX_SCAN_BYTES {
+            self.retained += bytes;
+            true
+        } else {
+            false
+        }
+    }
+
     fn feed(&mut self, value: &Value) {
-        let Some(session_id) = value.get("sessionId").and_then(Value::as_str) else {
+        let Some(raw_session) = value.get("sessionId").and_then(Value::as_str) else {
             return;
         };
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // Sanitize once per line: the raw sessionId is unbounded input
+        // and is cloned into every retained use/prompt (#144 r14).
+        let session_id = events::sanitize_session_id(raw_session);
+        // Constructors truncate to 64 chars anyway; do it at ingest so
+        // the retained copies are already bounded.
+        let timestamp = cap_bytes(
+            value.get("timestamp").and_then(Value::as_str).unwrap_or(""),
+            64,
+        );
         let content = value.get("message").and_then(|m| m.get("content"));
         let is_user_line = value.get("type").and_then(Value::as_str) == Some("user");
         match content {
@@ -814,13 +955,22 @@ impl ClaudeScan {
                                 .unwrap_or("")
                                 .to_string();
                             let input = item.get("input").cloned().unwrap_or(Value::Null);
-                            self.uses.push((
-                                id,
-                                session_id.to_string(),
-                                timestamp.clone(),
-                                name,
-                                input,
-                            ));
+                            let cost = id.len()
+                                + session_id.len()
+                                + timestamp.len()
+                                + name.len()
+                                + value_bytes(&input);
+                            if self.uses.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
+                                self.uses_dropped += 1;
+                            } else {
+                                self.uses.push((
+                                    id,
+                                    session_id.clone(),
+                                    timestamp.clone(),
+                                    name,
+                                    input,
+                                ));
+                            }
                         }
                         Some("tool_result") => {
                             let id = item
@@ -828,17 +978,30 @@ impl ClaudeScan {
                                 .and_then(Value::as_str)
                                 .unwrap_or("")
                                 .to_string();
-                            let text =
-                                events::response_text(item.get("content").unwrap_or(&Value::Null));
-                            self.results.insert(id, text);
+                            let text = cap_bytes(
+                                &events::response_text(item.get("content").unwrap_or(&Value::Null)),
+                                MAX_SCAN_OUTPUT_BYTES,
+                            );
+                            let cost = id.len() + text.len();
+                            if self.results.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
+                                self.results_dropped += 1;
+                            } else {
+                                self.results.insert(id, text);
+                            }
                         }
                         Some("text") if is_user_line => {
                             if let Some(text) = item.get("text").and_then(Value::as_str) {
-                                self.prompts.push((
-                                    session_id.to_string(),
-                                    timestamp.clone(),
-                                    text.to_string(),
-                                ));
+                                let text = text.to_string();
+                                let cost = session_id.len() + timestamp.len() + text.len();
+                                if self.prompts.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
+                                    self.prompts_dropped += 1;
+                                } else {
+                                    self.prompts.push((
+                                        session_id.clone(),
+                                        timestamp.clone(),
+                                        text,
+                                    ));
+                                }
                             }
                         }
                         _ => {}
@@ -846,14 +1009,27 @@ impl ClaudeScan {
                 }
             }
             Some(Value::String(text)) if is_user_line => {
-                self.prompts
-                    .push((session_id.to_string(), timestamp.clone(), text.clone()));
+                let text = text.clone();
+                let cost = session_id.len() + timestamp.len() + text.len();
+                if self.prompts.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
+                    self.prompts_dropped += 1;
+                } else {
+                    self.prompts
+                        .push((session_id.clone(), timestamp.clone(), text));
+                }
             }
             _ => {}
         }
     }
 
     fn finish(self, obs: &mut Observation) {
+        let dropped = self.uses_dropped + self.results_dropped + self.prompts_dropped;
+        if dropped > 0 {
+            obs_error(
+                obs,
+                format!("claude transcript records truncated at scan budgets: {dropped}"),
+            );
+        }
         for (session, ts, text) in &self.prompts {
             if is_meaningful_prompt(text) {
                 record_event(
@@ -895,16 +1071,23 @@ impl ClaudeScan {
 // ---------------------------------------------------------------------------
 
 struct PendingCall {
-    call_id: String,
-    session_id: String,
-    timestamp: String,
+    /// Interned Rc<str>: a rollout's calls share the same session_id,
+    /// and timestamp/call_id are bounded at ingest, so retaining them
+    /// per access costs O(1) instead of cloning up-to-4MiB strings
+    /// per record (#144 r14).
+    call_id: Rc<str>,
+    session_id: Rc<str>,
+    timestamp: Rc<str>,
     /// (skill path, access kind) pairs extracted from exec JS commands
     accesses: Vec<(String, events::Access)>,
 }
 
 #[derive(Default)]
 struct CodexScan {
-    session_id: String,
+    /// Sanitized session id, interned: PendingCall/OverflowAccess share
+    /// this one allocation instead of cloning the raw (up to 4 MiB)
+    /// session_id string per retained access (#144 r14).
+    session_id: Rc<str>,
     pending: Vec<PendingCall>,
     /// Total `(path, access)` pairs retained across `pending` — bounded
     /// separately from the per-call MAX_CODEX_ACCESSES because the call
@@ -912,6 +1095,10 @@ struct CodexScan {
     /// String copied out of the input (multi-MB amplification on a
     /// hostile rollout).
     pending_accesses: usize,
+    /// Byte budget shared by every string this scanner retains:
+    /// pending/overflow records, captured outputs, prompts, injected
+    /// events. Count caps alone do not bound bytes (#144 r14).
+    retained: usize,
     /// Compact records for accesses beyond the pending cap: the SKILL.md
     /// path is dropped but everything needed to emit the same
     /// skill_load event (minus skill_path) is kept, so runtimes /
@@ -922,8 +1109,11 @@ struct CodexScan {
     overflow_dropped: usize,
     outputs: HashMap<String, String>,
     /// (session, timestamp, text)
-    prompts: Vec<(String, String, String)>,
+    prompts: Vec<(Rc<str>, Rc<str>, String)>,
+    prompts_dropped: usize,
     injected: Vec<SkillUsageEvent>,
+    injected_dropped: usize,
+    outputs_dropped: usize,
 }
 
 /// A retained skill-load access without its SKILL.md path. `first_read`
@@ -931,9 +1121,9 @@ struct CodexScan {
 /// captured output's frontmatter, mirroring the pending path's
 /// `frontmatter_available` rule.
 struct OverflowAccess {
-    session_id: String,
-    timestamp: String,
-    call_id: String,
+    session_id: Rc<str>,
+    timestamp: Rc<str>,
+    call_id: Rc<str>,
     access: events::Access,
     first_read: bool,
     /// Path-derived skill name; None means unattributable unless a
@@ -952,12 +1142,27 @@ const MAX_PENDING_ACCESSES_TOTAL: usize = 65_536;
 const MAX_OVERFLOW_ACCESSES: usize = 65_536;
 
 impl CodexScan {
+    /// Charge `bytes` against the shared retained budget; false means
+    /// the item must be dropped (counted by the caller).
+    fn charge(&mut self, bytes: usize) -> bool {
+        if self.retained.saturating_add(bytes) <= MAX_SCAN_BYTES {
+            self.retained += bytes;
+            true
+        } else {
+            false
+        }
+    }
+
     fn feed(&mut self, value: &Value) {
-        let timestamp = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        // Constructors truncate timestamps to 64 chars; do it at ingest
+        // so the interned Rc<str> retained per access is already small.
+        let timestamp: Rc<str> = Rc::from(
+            cap_bytes(
+                value.get("timestamp").and_then(Value::as_str).unwrap_or(""),
+                64,
+            )
+            .as_str(),
+        );
         let Some(payload) = value.get("payload") else {
             return;
         };
@@ -968,14 +1173,16 @@ impl CodexScan {
                     .or_else(|| payload.get("id"))
                     .and_then(Value::as_str)
                 {
-                    self.session_id = id.to_string();
+                    // Sanitize once: the raw session_id can be ~4 MiB and
+                    // was previously cloned into every retained access.
+                    self.session_id = Rc::from(events::sanitize_session_id(id).as_str());
                 }
             }
             Some("token_usage_record") => {
                 if self.session_id.is_empty()
                     && let Some(id) = payload.get("session_id").and_then(Value::as_str)
                 {
-                    self.session_id = id.to_string();
+                    self.session_id = Rc::from(events::sanitize_session_id(id).as_str());
                 }
             }
             Some("response_item") => match payload.get("type").and_then(Value::as_str) {
@@ -984,11 +1191,15 @@ impl CodexScan {
                     if name != "exec" {
                         return;
                     }
-                    let call_id = payload
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
+                    // call_id keys the outputs map and is retained per
+                    // access; bound it so a crafted id cannot amplify.
+                    let call_id: Rc<str> = Rc::from(
+                        cap_bytes(
+                            payload.get("call_id").and_then(Value::as_str).unwrap_or(""),
+                            1024,
+                        )
+                        .as_str(),
+                    );
                     let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
                     // Dedup by path keeping the stronger access so one
                     // call touching the same SKILL.md twice counts once.
@@ -1013,6 +1224,7 @@ impl CodexScan {
                             if deduped.len() >= MAX_CODEX_ACCESSES {
                                 break 'accesses;
                             }
+                            let path = cap_bytes(&path, MAX_SCAN_PATH_BYTES);
                             match dedup_index.get(&path) {
                                 Some(&i)
                                     if access == events::Access::Read
@@ -1038,6 +1250,7 @@ impl CodexScan {
                             if deduped.len() >= MAX_CODEX_ACCESSES {
                                 break;
                             }
+                            let path = cap_bytes(&path, MAX_SCAN_PATH_BYTES);
                             match dedup_index.get(&path) {
                                 Some(&i)
                                     if access == events::Access::Read
@@ -1066,13 +1279,29 @@ impl CodexScan {
                             deduped.iter().position(|(_, a)| *a == events::Access::Read);
                         let room = MAX_PENDING_ACCESSES_TOTAL.saturating_sub(self.pending_accesses);
                         let fit = deduped.len().min(room);
-                        let rest = if fit < deduped.len() {
-                            deduped.split_off(fit)
+                        // Byte budget: pending paths dominate retained
+                        // cost. If the shared budget cannot cover them,
+                        // demote the whole call to compact overflow
+                        // records rather than silently dropping loads.
+                        let pending_bytes = deduped[..fit]
+                            .iter()
+                            .map(|(p, _)| p.len() + 48)
+                            .sum::<usize>()
+                            + self.session_id.len()
+                            + timestamp.len()
+                            + call_id.len();
+                        let pending_n = if fit > 0 && self.charge(pending_bytes) {
+                            fit
                         } else {
-                            Vec::new()
+                            0
                         };
-                        if !deduped.is_empty() {
-                            self.pending_accesses += deduped.len();
+                        let rest = if pending_n > 0 {
+                            deduped.split_off(pending_n)
+                        } else {
+                            std::mem::take(&mut deduped)
+                        };
+                        if pending_n > 0 {
+                            self.pending_accesses += pending_n;
                             self.pending.push(PendingCall {
                                 call_id: call_id.clone(),
                                 session_id: self.session_id.clone(),
@@ -1085,26 +1314,48 @@ impl CodexScan {
                                 self.overflow_dropped += 1;
                                 continue;
                             }
+                            let name_hint = events::skill_name_from_path(path);
+                            // name_hint is derived from the (already
+                            // capped) path; charge the record's real
+                            // retained strings — distinct call_ids are
+                            // distinct allocations even though they are
+                            // Rc-shared within one call.
+                            if !self.charge(
+                                256 + call_id.len()
+                                    + timestamp.len()
+                                    + name_hint.as_deref().map_or(0, str::len),
+                            ) {
+                                self.overflow_dropped += 1;
+                                continue;
+                            }
                             self.overflow.push(OverflowAccess {
                                 session_id: self.session_id.clone(),
                                 timestamp: timestamp.clone(),
                                 call_id: call_id.clone(),
                                 access: *access,
-                                first_read: Some(fit + k) == first_read_pos,
-                                name_hint: events::skill_name_from_path(path),
+                                first_read: Some(pending_n + k) == first_read_pos,
+                                name_hint,
                             });
                         }
                     }
                 }
                 Some("custom_tool_call_output") => {
-                    let call_id = payload
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let text = codex_output_text(payload);
+                    // Same call_id bound as custom_tool_call so the
+                    // outputs key matches the interned PendingCall id.
+                    let call_id = cap_bytes(
+                        payload.get("call_id").and_then(Value::as_str).unwrap_or(""),
+                        1024,
+                    );
+                    // Frontmatter verification only reads the head of
+                    // the output; bound the retained copy.
+                    let text = cap_bytes(&codex_output_text(payload), MAX_SCAN_OUTPUT_BYTES);
                     if !call_id.is_empty() && !text.is_empty() {
-                        self.outputs.insert(call_id, text);
+                        let cost = call_id.len() + text.len();
+                        if self.outputs.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
+                            self.outputs_dropped += 1;
+                        } else {
+                            self.outputs.insert(call_id, text);
+                        }
                     }
                 }
                 Some("message") => {
@@ -1122,14 +1373,44 @@ impl CodexScan {
                         .unwrap_or_default();
                     match role {
                         "user" if is_meaningful_prompt(&text) => {
-                            self.prompts
-                                .push((self.session_id.clone(), timestamp.clone(), text));
+                            // Prompt text is hashed in full at emit
+                            // time (prompt_hash must match the hash the
+                            // hook/plugin computed on the untruncated
+                            // prompt), so it cannot be capped — only
+                            // budgeted. session_id/timestamp are shared
+                            // Rc<str>s already paid for by the call
+                            // records; charge the per-record text.
+                            if self.prompts.len() >= MAX_SCAN_ITEMS
+                                || !self.charge(timestamp.len() + text.len())
+                            {
+                                self.prompts_dropped += 1;
+                            } else {
+                                self.prompts.push((
+                                    self.session_id.clone(),
+                                    timestamp.clone(),
+                                    text,
+                                ));
+                            }
                         }
                         "developer" if text.starts_with("skill-graph:") => {
                             if let Some(event) =
                                 parse_injected_recommendation(&self.session_id, &timestamp, &text)
                             {
-                                self.injected.push(event);
+                                // Charge the event's real retained
+                                // size: fixed struct cost plus each
+                                // recommended name (the constructor
+                                // caps count at MAX_RECOMMENDED).
+                                let cost = 256
+                                    + event
+                                        .recommended
+                                        .iter()
+                                        .map(|r| r.name.len() + 48)
+                                        .sum::<usize>();
+                                if self.injected.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
+                                    self.injected_dropped += 1;
+                                } else {
+                                    self.injected.push(event);
+                                }
                             }
                         }
                         _ => {}
@@ -1166,11 +1447,8 @@ impl CodexScan {
         let mut frontmatter_consumed: std::collections::HashSet<&str> =
             std::collections::HashSet::new();
         for pending in &self.pending {
-            let output = self
-                .outputs
-                .get(&pending.call_id)
-                .map(String::as_str)
-                .unwrap_or("");
+            let call_id: &str = &pending.call_id;
+            let output = self.outputs.get(call_id).map(String::as_str).unwrap_or("");
             // One captured output can cover several SKILL.md reads; its
             // frontmatter block belongs to the first file emitted, so only
             // the first Read access may claim it.
@@ -1178,11 +1456,11 @@ impl CodexScan {
             for (path, access) in &pending.accesses {
                 let c = match access {
                     events::Access::Read => {
-                        let verify = frontmatter_available
-                            && !frontmatter_consumed.contains(pending.call_id.as_str());
+                        let verify =
+                            frontmatter_available && !frontmatter_consumed.contains(call_id);
                         frontmatter_available = false;
                         if verify {
-                            frontmatter_consumed.insert(pending.call_id.as_str());
+                            frontmatter_consumed.insert(call_id);
                             classify_with_output(path, output)
                         } else {
                             events::LoadClassification {
@@ -1220,18 +1498,16 @@ impl CodexScan {
             // Only the call's first Read may claim the captured output's
             // frontmatter — same rule as the pending path, shared across
             // duplicate call_ids via `frontmatter_consumed`.
-            let may_claim = ov.first_read && !frontmatter_consumed.contains(ov.call_id.as_str());
+            let call_id: &str = &ov.call_id;
+            let may_claim = ov.first_read && !frontmatter_consumed.contains(call_id);
             let output = if may_claim {
-                self.outputs
-                    .get(&ov.call_id)
-                    .map(String::as_str)
-                    .unwrap_or("")
+                self.outputs.get(call_id).map(String::as_str).unwrap_or("")
             } else {
                 ""
             };
             let (name, detection, confidence) = match ov.access {
                 events::Access::Read if may_claim => {
-                    frontmatter_consumed.insert(ov.call_id.as_str());
+                    frontmatter_consumed.insert(call_id);
                     match events::frontmatter_name(output) {
                         Some(n) => (Some(n), Detection::FileRead, Confidence::High),
                         None => (
@@ -1262,11 +1538,24 @@ impl CodexScan {
                 confidence,
             ));
         }
-        if self.overflow_dropped > 0 && obs.errors.len() < MAX_OBSERVE_ERRORS {
-            obs.errors.push(format!(
-                "codex rollout accesses truncated: {} beyond retention caps",
-                self.overflow_dropped
-            ));
+        let dropped = self.overflow_dropped
+            + self.prompts_dropped
+            + self.injected_dropped
+            + self.outputs_dropped;
+        if dropped > 0 {
+            obs_error(
+                obs,
+                format!("codex rollout records truncated at scan budgets: {dropped}"),
+            );
+        }
+        if self.overflow_dropped > 0 {
+            obs_error(
+                obs,
+                format!(
+                    "codex rollout accesses truncated: {} beyond retention caps",
+                    self.overflow_dropped
+                ),
+            );
         }
         events.sort_by_cached_key(|e| rfc3339_ms(&e.timestamp).unwrap_or(i64::MAX));
         for event in events {
@@ -1374,6 +1663,33 @@ fn parse_injected_recommendation(
 // ---------------------------------------------------------------------------
 
 fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> Result<(), String> {
+    // Same fd-level verification the JSONL path gets: the collect-time
+    // is_file()/size checks are TOCTOU, and rusqlite opens by path with
+    // no O_NOFOLLOW/O_NONBLOCK of its own. A residual swap window
+    // between this check and SQLite's open remains (documented in
+    // contracts.md) — narrowing it further would require an fd-based
+    // SQLite open, which cannot resolve the `-wal` sibling anyway.
+    {
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let handle = opts
+            .open(file)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        let md = handle
+            .metadata()
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+        if !md.is_file() {
+            return Err(format!("{}: not a regular file", file.display()));
+        }
+        if md.len() > MAX_OBSERVE_FILE_BYTES {
+            return Err(format!("{}: file too large", file.display()));
+        }
+    }
     let conn = open_sqlite_readonly(file)?;
     // Schema drift tolerance: the table may not exist in older/newer builds.
     let has_table: i64 = conn
@@ -1396,8 +1712,14 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
         })
         .unwrap_or(false);
     let order_col = if has_seq { "seq" } else { "rowid" };
+    // `data` is materialized via substr so an oversized cell never
+    // reaches Rust whole: length(data) counts characters, substr caps
+    // the transferred prefix, and the byte check below still applies.
+    // A row whose data exceeds the per-record bound is skipped before
+    // serde_json sees it (same contract as the JSONL line cap).
     let sql = format!(
-        "SELECT session_id, type, data, time_created FROM session_message ORDER BY session_id, {order_col}"
+        "SELECT session_id, type, length(data), substr(data, 1, {}), time_created FROM session_message ORDER BY session_id, {order_col}",
+        MAX_OBSERVE_LINE_BYTES + 1
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
@@ -1405,20 +1727,21 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })
         .map_err(|e| format!("query: {e}"))?;
     for row in rows {
         // A single malformed row (NULL column, type drift) must not abort
         // the whole database scan.
-        let Ok((session_id, kind, data, created_ms)) = row else {
+        let Ok((session_id, kind, data_chars, data, created_ms)) = row else {
             obs.lines_skipped += 1;
             continue;
         };
         sessions.insert(&session_id);
-        if data.len() > MAX_OBSERVE_LINE_BYTES {
+        if data_chars > MAX_OBSERVE_LINE_BYTES as i64 || data.len() > MAX_OBSERVE_LINE_BYTES {
             obs.lines_skipped += 1;
             continue;
         }

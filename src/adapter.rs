@@ -140,6 +140,18 @@ fn extra_overlay() -> Option<PathBuf> {
 /// `hook` subcommand — a stale v0.3.x binary earlier on PATH would embed
 /// a command that fails on every prompt.
 fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
+    // The resolved path is embedded verbatim into hook command text;
+    // a non-UTF-8 path would be corrupted by to_string_lossy into a
+    // hook pointing at a nonexistent binary (#144 r14).
+    let utf8 = |p: PathBuf| -> Result<PathBuf, String> {
+        if p.to_str().is_none() {
+            return Err(format!(
+                "skill-graph binary path is not valid UTF-8 and cannot be embedded in hook commands: {}",
+                p.display()
+            ));
+        }
+        Ok(p)
+    };
     if let Some(p) = override_path {
         let path = PathBuf::from(p);
         if !is_executable(&path) {
@@ -153,7 +165,7 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
         // Hooks run with an arbitrary cwd; embed an absolute path.
         // std::path::absolute does not resolve symlinks, so stable
         // shim/symlink paths (mise, npm bin) are preserved.
-        return Ok(std::path::absolute(&path).unwrap_or(path));
+        return utf8(std::path::absolute(&path).unwrap_or(path));
     }
     // SKILL_GRAPH_BIN is honored here for parity with the opencode
     // plugin, which resolves the same env var at runtime: an operator
@@ -175,7 +187,7 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
         }
         for candidate in candidates {
             if is_executable(&candidate) && supports_hook_subcommand(&candidate) {
-                return Ok(std::path::absolute(&candidate).unwrap_or(candidate));
+                return utf8(std::path::absolute(&candidate).unwrap_or(candidate));
             }
         }
         return Err(format!(
@@ -187,14 +199,14 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
         for dir in std::env::split_paths(&path_var) {
             let candidate = dir.join("skill-graph");
             if is_executable(&candidate) && supports_hook_subcommand(&candidate) {
-                return Ok(std::path::absolute(&candidate).unwrap_or(candidate));
+                return utf8(std::path::absolute(&candidate).unwrap_or(candidate));
             }
         }
     }
     // current_exe is this binary; `adapter` only exists on >= 0.4.0 so it
     // always supports `hook`.
     if let Ok(exe) = std::env::current_exe() {
-        return Ok(exe);
+        return utf8(exe);
     }
     Err("skill-graph binary not found on PATH".to_string())
 }
@@ -488,8 +500,17 @@ fn shell_words(command: &str) -> Vec<ShellWord> {
                         break;
                     }
                     if c2 == '\\' {
-                        if let Some(e) = chars.next() {
-                            push_char!(e, true);
+                        // POSIX: inside double quotes backslash escapes
+                        // only $ ` " \ (newline is a line continuation,
+                        // which we do not model — same rule as
+                        // `unquote_shell`, which keeps both chars).
+                        match chars.next() {
+                            Some(e @ ('"' | '\\' | '$' | '`')) => push_char!(e, true),
+                            Some(e) => {
+                                push_char!('\\', true);
+                                push_char!(e, true);
+                            }
+                            None => push_char!('\\', true),
                         }
                     } else {
                         push_char!(c2, true);

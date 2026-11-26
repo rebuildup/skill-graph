@@ -95,7 +95,9 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   funnel の `(runtime, session_id)` 集計とは sanitize 差異で一致しない
   ことがある（best-effort count）。
 - `observe` の保持量には集約上限がある: 入力ファイル数 4096、
-  ディレクトリ再帰深さ 64、走査エラー 1024 件、ファイル毎 256 MiB
+  ディレクトリ再帰深さ 64、走査ディレクトリ数 65,536・
+  ディレクトリエントリ総数 1,000,000、走査エラー 1024 件
+  （収集・ファイル毎の双方を含む）、ファイル毎 256 MiB
   （`.db` は `-wal` 込み）、JSONL 行・`.db` 行の `data` ペイロード毎
   4 MiB（`serde_json::Value` は入力の ~16-30 倍を占めるため、
   ファイル上限だけでは 1 行で数 GB を確保しうる）、retained
@@ -119,6 +121,25 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   いずれの打ち切りも `errors` に latched 通知が入り、
   `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される
   （`skill_loads` の name cardinality 打ち切りを除く）。
+  transcript scanner（Claude/Codex）が finish まで保持する
+  record にも count+byte の共有予算がある（`MAX_SCAN_ITEMS`
+  65,536・`MAX_SCAN_BYTES` 64 MiB/ scanner）: tool_use input は
+  `value_bytes` 推定で課金、tool output は先頭 256 KiB のみ保持
+  （frontmatter 検証は head のみを読む）、session_id は ingest で
+  sanitize・timestamp は 64 chars・call_id は 1,024 bytes・
+  access path は 4,096 bytes に丸め、Codex の
+  PendingCall/OverflowAccess が保持する session/timestamp/call_id
+  は `Rc<str>` で共有する（1 record あたりの複製を O(1) にする）。
+  予算超過分は drop され `errors` に件数が通知される。
+  `.db` の open も JSONL と同じ fd 検証（`O_NOFOLLOW|O_NONBLOCK` +
+  fstat で regular file・256 MiB 以下）を SQLite open の直前に
+  行うが、検査と rusqlite の path open の間の差し替え窓は残る
+  （fd ベースの SQLite open は `-wal` sibling を解決できないため
+  採用しない。project config の TOCTOU residual と同じ受容区分）。
+  `skill-graph detect` の stdin も hook と同じ 4 MiB parse 前
+  閾値と bounded drain を持つ。OpenCode plugin の
+  `prompt.skills` 由来 skill_load は 1 prompt あたり 1,024 entry・
+  session あたり 4,096 name で打ち切る。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を
@@ -167,7 +188,8 @@ JSONL で追記し、`observe <path>` が contract 形式の行を deserialize
 Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts`）は
 同一の安全契約に従う（issue #169、監査 D-01/D-02）:
 
-- open は `O_NOFOLLOW | O_NONBLOCK`（TS は `O_NOFOLLOW`）+ 作成時 mode `0600`。
+- open は `O_NOFOLLOW | O_NONBLOCK` + 作成時 mode `0600`（TS も同じ
+  flag を渡す）。
   symlink・FIFO・socket は open 段階で拒否され、FIFO による hook 停止を防ぐ。
 - ローテーション前のサイズ判定は symlink を辿らない
   （Rust: `symlink_metadata`、TS: `lstatSync`）。symlink は rename しない。
@@ -236,10 +258,17 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   巨大ファイルは `status`/`disable` 経路でも hang/OOM しない。
 - adapter の env 由来パス（`HOME`、`CODEX_HOME`、`XDG_CONFIG_HOME`、
   `XDG_DATA_HOME`、`SKILL_GRAPH_EXTRA_OVERLAY`）は絶対パスのみ有効。
-  相対値・非 UTF-8 は未設定として既定解決に縮退し、`file://` spec
+  相対値は未設定として既定解決に縮退し、`file://` spec
   には絶対パスのみを使う。hook 側も同規則で `TMPDIR`・
   `SKILL_GRAPH_EVENT_LOG`・`SKILL_GRAPH_HOOK_STATE` の相対値を
   未設定として扱う（hook の cwd は project tree でありうるため）。
+  OpenCode plugin 側も `SKILL_GRAPH_EVENT_LOG` と `tmpdir()` の
+  戻り値に同じ absolute-only 規則を適用する（server の cwd は
+  任意の project tree でありうるため）。
+  なお非 UTF-8 の絶対パスは Unix の `var_os` 経由で受理される
+  （path bytes を失わないため）。UTF-8 を要求するのは hook command
+  へ埋め込む `--bin`/`SKILL_GRAPH_BIN`/`PATH` 解決結果のみで、
+  その場合は `enable` がエラーを返す。
 - legacy hook 検出の shell 解析は quote/escape を考慮する:
   `'FOO=bar'` や `FOO\=bar` のように quote・escape された `NAME=`
   は env assignment ではなく command word であり、foreign hook と
@@ -248,6 +277,10 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   separator は word 解析の対象外であり、compound command 内の
   hook 呼出しは所有権検出・除去の対象にならない（under-claim で
   あり foreign command を巻き込まない方向に倒す既知の制限）。
+  同様に v0.4.x hook command の所有権検出は command word が
+  literal first word であることを要求し、`FOO=bar` 前置や
+  `env -u NAME` のような env 前置を持つ v0.4.x hook は認識
+  しない（under-claim：既存 entry を残したまま新規追加しうる）。
   v0.4.x hook command の parse は binary path の single/double
   quote と引数の quote を受理する。
 - plugin specifier の境界判定で、marker 直後の `%` は follower と
@@ -284,4 +317,7 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   残り枠分のみを保持する。
 - frontmatter `metadata` map は信頼できない入力として bounded:
   128 entry・value 1024 文字・合計 8,192 文字まで。retained byte
-  会計には metadata の key+value も含まれる。
+  会計には metadata の key+value も含まれる。打ち切りの生存 key は
+  `requires-skills`/`requires_skills` を優先し・残りを key sort で
+  決定的に選ぶ（HashMap 反復順は process 毎に random なため、
+  requires-link の admit 結果が run 間で変わらないようにする）。
