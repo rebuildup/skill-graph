@@ -35,6 +35,11 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) -> (String, i32) {
+        let (out, _, rc) = self.run_full(args);
+        (out, rc)
+    }
+
+    fn run_full(&self, args: &[&str]) -> (String, String, i32) {
         let out = Command::new(bin())
             .args(args)
             .current_dir(self.proj.path())
@@ -49,6 +54,7 @@ impl Fixture {
             .expect("spawn");
         (
             String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
             out.status.code().unwrap_or(-1),
         )
     }
@@ -251,6 +257,82 @@ fn opencode_enable_materializes_plugin() {
     let (_, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
     assert_eq!(rc, 0);
     assert!(f.config("opencode", "--user").is_none());
+    // the materialized plugin dir is removed too
+    assert!(
+        !f.home
+            .path()
+            .join(".local/share/skill-graph/opencode-plugin")
+            .exists()
+    );
+}
+
+#[test]
+fn opencode_foreign_plugin_names_preserved() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // names that contain "skill-graph" but are not ours
+    std::fs::write(
+        &path,
+        r#"{"plugins":["file:///x/my-skill-graph-utils","npm:skill-graph-extra","other-plugin"]}"#,
+    )
+    .unwrap();
+    let bin = f.bin_arg();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    let cfg = f.config("opencode", "--user").unwrap();
+    let plugins = cfg["plugins"].as_array().unwrap();
+    for keep in [
+        "file:///x/my-skill-graph-utils",
+        "npm:skill-graph-extra",
+        "other-plugin",
+    ] {
+        assert!(plugins.iter().any(|p| p == keep), "lost {keep}: {cfg}");
+    }
+    // disable strips only our entry
+    let (_, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let cfg = f.config("opencode", "--user").unwrap();
+    assert_eq!(cfg["plugins"].as_array().unwrap().len(), 3, "{cfg}");
+}
+
+#[test]
+fn opencode_legacy_plugin_detected_by_status() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"plugins":["file:///home/u/.local/share/skill-graph/0.3.0/adapters/opencode/skill-graph"]}"#,
+    )
+    .unwrap();
+    let (out, _) = f.run(&["adapter", "status", "opencode", "--user"]);
+    assert!(out.contains("enabled"), "{out}");
+    assert!(out.contains("legacy"), "{out}");
+    // enable migrates it to the materialized path
+    let bin = f.bin_arg();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    let cfg = f.config("opencode", "--user").unwrap();
+    let spec = cfg["plugins"][0].as_str().unwrap();
+    assert!(spec.contains("opencode-plugin"), "{spec}");
+}
+
+#[test]
+fn malformed_config_returns_error_not_panic() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, r#"{"hooks":"oops"}"#).unwrap();
+    let bin = f.bin_arg();
+    let (_, err, rc) = f.run_full(&["adapter", "enable", "claude-code", "--bin", &bin, "--user"]);
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("hooks"), "{err}");
+
+    // top-level non-object also errors cleanly
+    std::fs::write(&path, r#"["not","an","object"]"#).unwrap();
+    let (_, err, rc) = f.run_full(&["adapter", "status", "claude-code", "--user"]);
+    assert_ne!(rc, 0, "{err}");
 }
 
 #[test]
