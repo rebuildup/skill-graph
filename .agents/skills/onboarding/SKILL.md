@@ -1,6 +1,14 @@
 ---
 name: onboarding
 description: 新規参入者が会話履歴や個人環境に依存せずprojectを理解・起動・検証・開発開始・作業復旧できるdocumentationを初期化・更新する時に使用する。
+keywords:
+  - new teammate
+  - newcomer
+  - bootstrap
+  - startup
+  - repo
+  - repository
+  - runbook
 ---
 
 # Onboarding

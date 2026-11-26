@@ -654,6 +654,7 @@ const STOPWORDS: &[&str] = &[
     "up",
     "very",
     "was",
+    "want",
     "we",
     "were",
     "what",
@@ -1164,5 +1165,14 @@ mod tests {
         assert!(t.iter().any(|x| x == "pr"), "{t:?}");
         let t = terms("review the changes");
         assert!(!t.iter().any(|x| x == "pr"), "{t:?}");
+    }
+
+    #[test]
+    fn modal_filler_is_stopworded() {
+        // #184: "want" is modal filler like "please"; letting it match
+        // description text admitted unrelated skills (e.g. code-review via
+        // "the user wants") on verification-setup phrasing.
+        let t = terms("i want a repeatable way to confirm the project works");
+        assert!(!t.iter().any(|x| x == "want"), "{t:?}");
     }
 }
