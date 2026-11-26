@@ -62,6 +62,20 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Verify tag and version consistency
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          # Tag names reach shell via env only; validate before any use.
+          [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || {
+            echo "invalid tag: $RELEASE_TAG"; exit 1; }
+          want="${RELEASE_TAG#v}"
+          got=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
+          [ "$want" = "$got" ] || {
+            echo "tag $RELEASE_TAG does not match Cargo.toml version $got"; exit 1; }
+          # The checked-out ref must actually be this tag.
+          git rev-parse "refs/tags/$RELEASE_TAG" >/dev/null || {
+            echo "tag $RELEASE_TAG does not exist"; exit 1; }
       - name: Checksums
         run: |
           cd dist
@@ -70,8 +84,9 @@ jobs:
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           notes="docs/release/${tag}.md"
           [ -f "$notes" ] || notes=""
           gh release create "$tag" dist/* sha256sums.txt \
