@@ -1,6 +1,8 @@
 ---
 name: gamma-skill
 description: Use when preparing release notes, changelogs, and version announcements.
+keywords:
+  - hotfix
 ---
 
 # Gamma Skill

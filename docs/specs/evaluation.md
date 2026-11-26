@@ -49,6 +49,27 @@
 
 性能目標は E03（ADR-0002）で確定した: 推薦 warm p95 100ms 以下、Hook 全体 250ms 以下、推薦最大 3 件。C03（500 skills、release で process p95 約 13ms）と X03（hook end-to-end 約 42ms）の実測で予算内を確認済み。実 corpus での再計測は P01/P02 で行う。
 
+## Skill metadata convention（#184 / ADR-0006）
+
+推薦 recall は query と skill metadata の語彙共通部分に強く依存する。
+holdout のような description 語彙を避けた自然言語 query では、
+cross-lingual（英語 query ↔ 和文 description 等）と言い換えの双方で
+語彙ギャップが admission 不成立を起こす。
+
+規約:
+
+- `description` は用途が分かる最小文とし、利用者が実際に使う言語・
+  言い換え・略称は frontmatter `keywords` に列挙する。和文 description
+  の skill は英語 alias を、英語 description の skill は和文 alias を
+  `keywords` に持つことを推奨する。
+- `keywords` は具体語を選ぶ。admission は description 2 語以上一致 +
+  低 df 語を要求するため、汎用語だけの `keywords` は到達性を改善しない。
+- skill 固有の語彙追加の正本はその skill の upstream repo とし、
+  skill-graph 側は eval corpus として観測・記録する
+  （`docs/specs/v0.3.0-integration-boundaries.md`）。
+- admission 閾値の緩和や embedding 導入で recall を改善しない。
+  v1.0.0 spec §6 の embedding 不採用判定を維持する。
+
 ## Experiment groups
 
 | Group | Intervention |

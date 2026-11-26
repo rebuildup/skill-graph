@@ -9,7 +9,7 @@
 | `id` | yes | Stable case identifier. |
 | `query` | yes | User task text presented to the recommender. May be Japanese or English. |
 | `context` | no | Additional work-context text. Used with `query` for admission and ranking. |
-| `skill_root` | yes | Repository-relative root passed to discovery. Skill identity is `(skill_root, name)`; the same name under another root is a different skill. |
+| `skill_root` | yes | Repository-relative root passed to discovery. Skill identity is `(skill_root, name)`; the same name under another root is a different skill. Must resolve to real directories: discovery does not follow symlinked directories (`docs/specs/core-contract.md`), so a root that only contains per-skill symlinks (e.g. `skills/` in this repo) yields an empty corpus. Point at the canonical copy (`.agents/skills`) instead. |
 | `expected_required` | no | Skill names that must be recommended for the case to count as a required hit. |
 | `expected_optional` | no | Skill names that may be recommended without penalty. Often used for legitimate `requires` dependencies. |
 | `forbidden` | no | Skill names that must not be recommended. |

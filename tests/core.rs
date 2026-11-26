@@ -65,6 +65,20 @@ fn recommends_with_reasons_and_empty_when_no_match() {
 }
 
 #[test]
+fn keywords_bridge_paraphrased_task_phrasing() {
+    // #184: natural phrasing that avoids description vocabulary still
+    // reaches the skill through opt-in `keywords` aliases.
+    let graph = build(discover(&[fixture_root()]));
+    let recs = recommend(
+        &graph,
+        "we need to tell customers what changed in tonight's hotfix — draft the announcement",
+        "",
+        3,
+    );
+    assert_eq!(recs[0].skill.name, "gamma-skill");
+}
+
+#[test]
 fn stopword_and_punctuation_only_queries_do_not_recommend() {
     // Regression for #46: generic English function words and punctuation
     // matched description text and admitted irrelevant skills on real
