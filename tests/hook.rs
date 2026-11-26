@@ -278,7 +278,7 @@ fn skill_load_uses_session_recommended_as_context() {
     std::fs::create_dir_all(&state).unwrap();
     // Seed session context whose terms hit beta-skill's description
     // ("tests", "verification harnesses") — admits it via context alone.
-    std::fs::write(state.join("s1.recommended"), "tests harness\n").unwrap();
+    std::fs::write(state.join("s1.recommended"), "tests\nharness\n").unwrap();
     let payload = json!({
         "session_id":"s1",
         "tool_name":"Skill",
@@ -336,4 +336,55 @@ fn nostate_records_no_session_recommendations() {
     );
     assert_eq!(rc, 0);
     assert!(!dir.path().join("state").join("s1.recommended").exists());
+}
+
+#[test]
+fn skill_load_accepts_name_key_tool_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    // OpenCode-style payloads may carry the tool name under `name`.
+    let payload = json!({
+        "session_id":"s1",
+        "name":"Skill",
+        "input":{"skill":"kappa-skill"}
+    });
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "skill-load"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    assert!(
+        events.iter().any(|e| e["kind"] == "skill_load"),
+        "expected skill_load event, got: {events:?}"
+    );
+    let _ = out;
+}
+
+#[test]
+fn non_object_stdin_writes_no_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let bin = env!("CARGO_BIN_EXE_skill-graph");
+    for raw in ["42", "\"x\"", "[1,2]", "true"] {
+        let mut child = std::process::Command::new(bin)
+            .args(["hook", "claude-code", "prompt"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(raw.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stdout.is_empty());
+    }
+    assert!(!dir.path().join("events.jsonl").exists());
 }

@@ -7,6 +7,7 @@ use crate::resolver::build;
 use crate::search::recommend;
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -234,11 +235,15 @@ pub fn run() -> Result<(), String> {
                 other => return Err(format!("unknown observed_via: {other}")),
             };
             let mut input = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+            std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024 + 1)
+                .read_to_string(&mut input)
                 .map_err(|e| format!("stdin: {e}"))?;
+            if input.len() as u64 > 16 * 1024 * 1024 {
+                return Err("stdin payload too large".to_string());
+            }
             let payload: serde_json::Value =
                 serde_json::from_str(&input).map_err(|e| format!("payload json: {e}"))?;
-            if let Some(event) = events::detect_from_payload(runtime, via, &payload) {
+            for event in events::detect_all_from_payload(runtime, via, &payload) {
                 println!(
                     "{}",
                     serde_json::to_string(&event).map_err(|e| e.to_string())?

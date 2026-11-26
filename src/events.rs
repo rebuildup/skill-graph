@@ -311,7 +311,9 @@ pub fn frontmatter_name(text: &str) -> Option<String> {
             let line = line.trim_end();
             if let Some(value) = line.strip_prefix("name:") {
                 let value = value.trim().trim_matches('"').trim_matches('\'');
-                if !value.is_empty() {
+                // Only spec-conforming names may flow into events/state;
+                // anything else is treated as absent.
+                if !value.is_empty() && crate::parser::valid_skill_name(value) {
                     return Some(value.to_string());
                 }
             }
@@ -424,26 +426,26 @@ const TRANSPARENT_PREFIXES: &[&str] = &[
     "sudo", "env", "time", "nice", "nohup", "command", "builtin", "xargs", "exec", "doas",
 ];
 
-/// Classify how `command` accesses SKILL.md files. Returns `None` when no
-/// SKILL.md path is referenced at all.
-pub fn classify_command(command: &str) -> Option<(String, Access)> {
-    let paths: Vec<String> = skill_md_paths(command)
-        .into_iter()
-        .filter(|p| is_skill_md_path(p))
-        .collect();
-    let path = paths.into_iter().next()?;
-    let access = if command_has_read_verb(command) {
-        Access::Read
-    } else {
-        Access::Reference
-    };
-    Some((path, access))
-}
-
-fn command_has_read_verb(command: &str) -> bool {
-    command
-        .split(['&', ';', '|', '\n'])
-        .any(segment_has_read_verb)
+/// Classify how `command` accesses SKILL.md files. Returns every
+/// `(path, access)` pair — each command segment is classified on its own
+/// read verbs, so `cat a/SKILL.md; grep b/SKILL.md` yields a Read for `a`
+/// and a Reference for `b`. Empty when no SKILL.md path is referenced.
+pub fn classify_command(command: &str) -> Vec<(String, Access)> {
+    let mut out: Vec<(String, Access)> = Vec::new();
+    for segment in command.split(['&', ';', '|', '\n']) {
+        let access = if segment_has_read_verb(segment) {
+            Access::Read
+        } else {
+            Access::Reference
+        };
+        for path in skill_md_paths(segment) {
+            if !is_skill_md_path(&path) || out.iter().any(|(p, _)| *p == path) {
+                continue;
+            }
+            out.push((path, access));
+        }
+    }
+    out
 }
 
 fn segment_has_read_verb(segment: &str) -> bool {
@@ -494,8 +496,13 @@ fn is_command_tool(tool: &str) -> bool {
 ///
 /// `tool` is the runtime tool name; `input` its arguments object; `output`
 /// the captured tool output text when available (may be empty).
-/// Returns `None` when the access is not skill-related at all.
-pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<LoadClassification> {
+/// Returns every distinct skill access — a command touching several
+/// SKILL.md files yields one classification per file.
+pub fn classify_tool_access_all(
+    tool: &str,
+    input: &Value,
+    output: &str,
+) -> Vec<LoadClassification> {
     let lower = tool.to_ascii_lowercase();
     if lower == "skill" {
         let raw = input
@@ -504,41 +511,56 @@ pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<L
             .or_else(|| input.get("skill_name"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        return Some(LoadClassification {
+        return vec![LoadClassification {
             skill_name: normalize_skill_name(raw),
             skill_path: None,
             detection: Detection::NativeInvocation,
             confidence: Confidence::High,
-        });
+        }];
     }
     if is_read_tool(&lower) {
         for key in ["path", "file_path", "notebook_path"] {
             if let Some(path) = input.get(key).and_then(Value::as_str)
                 && is_skill_md_path(path)
             {
-                return Some(classify_file_read(path, output));
+                return vec![classify_file_read(path, output)];
             }
         }
-        return None;
+        return Vec::new();
     }
     if is_command_tool(&lower) {
+        let mut out = Vec::new();
         for key in ["command", "cmd", "input"] {
-            if let Some(command) = input.get(key).and_then(Value::as_str)
-                && let Some((path, access)) = classify_command(command)
-            {
-                return Some(match access {
-                    Access::Read => classify_file_read(&path, output),
-                    Access::Reference => LoadClassification {
-                        skill_name: skill_name_from_path(&path),
-                        skill_path: Some(path),
-                        detection: Detection::Mention,
-                        confidence: Confidence::Low,
-                    },
-                });
+            if let Some(command) = input.get(key).and_then(Value::as_str) {
+                for (path, access) in classify_command(command) {
+                    let c = match access {
+                        Access::Read => classify_file_read(&path, output),
+                        Access::Reference => LoadClassification {
+                            skill_name: skill_name_from_path(&path),
+                            skill_path: Some(path),
+                            detection: Detection::Mention,
+                            confidence: Confidence::Low,
+                        },
+                    };
+                    if !out.iter().any(|o: &LoadClassification| {
+                        o.skill_path == c.skill_path && o.detection == c.detection
+                    }) {
+                        out.push(c);
+                    }
+                }
             }
         }
+        return out;
     }
-    None
+    Vec::new()
+}
+
+/// Single best classification for callers that can only carry one event.
+/// Kept for compatibility; prefer `classify_tool_access_all`.
+pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<LoadClassification> {
+    classify_tool_access_all(tool, input, output)
+        .into_iter()
+        .max_by_key(rank)
 }
 
 #[derive(Clone, Debug)]
@@ -569,12 +591,11 @@ fn classify_file_read(path: &str, output: &str) -> LoadClassification {
 }
 
 /// Normalize a skill name: strip namespace/path prefixes (`plugin:foo/bar`
-/// -> `bar`).
+/// -> `bar`). Returns `None` for names outside the Agent Skills spec
+/// charset — they must never reach events, dedup state, or `.recommended`.
 pub fn normalize_skill_name(raw: &str) -> Option<String> {
-    raw.rsplit(['/', ':'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let name = raw.rsplit(['/', ':']).next().filter(|s| !s.is_empty())?;
+    crate::parser::valid_skill_name(name).then(|| name.to_string())
 }
 
 /// Extract `exec_command({cmd: "..."})` command strings from Codex `exec`
@@ -714,18 +735,18 @@ pub fn response_text(value: &Value) -> String {
     }
 }
 
-/// Normalize a runtime hook/plugin payload into a `skill_load` event.
+/// Normalize a runtime hook/plugin payload into `skill_load` events —
+/// one per distinct skill access (a command may touch several SKILL.md
+/// files). Empty when the payload carries no skill-load signal.
 ///
 /// Accepts the union of shapes emitted by the shell-hook adapters
 /// (`tool_name`/`tool_input`/`tool_response`/`session_id`) and the OpenCode
-/// plugin (`tool`/`input`/`result`/`sessionID`). Returns `None` when the
-/// payload carries no skill-load signal — callers use this for cheap early
-/// exclusion before doing any recommendation work.
-pub fn detect_from_payload(
+/// plugin (`tool`/`input`/`result`/`sessionID`).
+pub fn detect_all_from_payload(
     runtime: Runtime,
     observed_via: ObservedVia,
     payload: &Value,
-) -> Option<SkillUsageEvent> {
+) -> Vec<SkillUsageEvent> {
     let tool = payload
         .get("tool_name")
         .or_else(|| payload.get("tool"))
@@ -750,33 +771,28 @@ pub fn detect_from_payload(
         .or_else(|| payload.get("sessionId"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let to_event = |c: LoadClassification| {
+        SkillUsageEvent::skill_load(
+            runtime,
+            observed_via,
+            session_id,
+            &rfc3339_now(),
+            Some(tool.to_string()),
+            c.skill_name,
+            c.skill_path,
+            c.detection,
+            c.confidence,
+        )
+    };
 
     // Codex `exec` tool: input is JS source, not a shell command. Extract
-    // exec_command cmd strings and classify each; emit the strongest signal.
+    // exec_command cmd strings and classify every SKILL.md access.
     if tool.eq_ignore_ascii_case("exec") {
-        let js = input.as_str().unwrap_or("");
-        let mut best: Option<LoadClassification> = None;
-        for cmd in extract_exec_commands(js) {
-            if let Some((path, access)) = classify_command(&cmd) {
-                let c = match access {
-                    Access::Read => classify_file_read(&path, &output),
-                    Access::Reference => LoadClassification {
-                        skill_name: skill_name_from_path(&path),
-                        skill_path: Some(path),
-                        detection: Detection::Mention,
-                        confidence: Confidence::Low,
-                    },
-                };
-                if best.as_ref().is_none_or(|b| rank(&c) > rank(b)) {
-                    best = Some(c);
-                }
-            }
-        }
-        if js.contains("SKILL.md")
-            && best.is_none()
-            && let Some((path, access)) = classify_command(js)
-        {
-            best = Some(match access {
+        let js = exec_source(&input);
+        let mut seen = std::collections::HashSet::new();
+        let mut events = Vec::new();
+        let mut push = |path: String, access: Access, events: &mut Vec<SkillUsageEvent>| {
+            let c = match access {
                 Access::Read => classify_file_read(&path, &output),
                 Access::Reference => LoadClassification {
                     skill_name: skill_name_from_path(&path),
@@ -784,38 +800,57 @@ pub fn detect_from_payload(
                     detection: Detection::Mention,
                     confidence: Confidence::Low,
                 },
-            });
+            };
+            let key = (c.skill_name.clone(), c.skill_path.clone());
+            if c.skill_name.is_some() && seen.insert(key) {
+                events.push(to_event(c));
+            }
+        };
+        for cmd in extract_exec_commands(&js) {
+            for (path, access) in classify_command(&cmd) {
+                push(path, access, &mut events);
+            }
         }
-        return best.map(|c| {
-            SkillUsageEvent::skill_load(
-                runtime,
-                observed_via,
-                session_id,
-                &rfc3339_now(),
-                Some(tool.to_string()),
-                c.skill_name,
-                c.skill_path,
-                c.detection,
-                c.confidence,
-            )
-        });
+        // Fallback: unparsed JS may still reference SKILL.md in raw text.
+        if events.is_empty() && js.contains("SKILL.md") {
+            for (path, access) in classify_command(&js) {
+                push(path, access, &mut events);
+            }
+        }
+        return events;
     }
 
-    classify_tool_access(tool, &input, &output)
+    classify_tool_access_all(tool, &input, &output)
+        .into_iter()
         .filter(|c| c.skill_name.is_some())
-        .map(|c| {
-            SkillUsageEvent::skill_load(
-                runtime,
-                observed_via,
-                session_id,
-                &rfc3339_now(),
-                Some(tool.to_string()),
-                c.skill_name,
-                c.skill_path,
-                c.detection,
-                c.confidence,
-            )
-        })
+        .map(to_event)
+        .collect()
+}
+
+/// Single-event view kept for callers that can only carry one result
+/// (e.g. `skill-graph detect` prints the strongest access first).
+pub fn detect_from_payload(
+    runtime: Runtime,
+    observed_via: ObservedVia,
+    payload: &Value,
+) -> Option<SkillUsageEvent> {
+    detect_all_from_payload(runtime, observed_via, payload)
+        .into_iter()
+        .next()
+}
+
+/// Extract the JS source for a Codex `exec` tool input: a plain string,
+/// a `cmd`/`command` field, or the serialized object as a last resort.
+fn exec_source(input: &Value) -> String {
+    if let Some(s) = input.as_str() {
+        return s.to_string();
+    }
+    for key in ["cmd", "command", "input"] {
+        if let Some(s) = input.get(key).and_then(Value::as_str) {
+            return s.to_string();
+        }
+    }
+    input.to_string()
 }
 
 fn rank(c: &LoadClassification) -> u8 {
@@ -857,18 +892,33 @@ mod tests {
 
     #[test]
     fn classify_command_distinguishes_read_and_reference() {
-        let (p, a) = classify_command("cat .agents/skills/x/SKILL.md").unwrap();
-        assert_eq!(p, ".agents/skills/x/SKILL.md");
-        assert_eq!(a, Access::Read);
-        let (_, a) = classify_command("grep foo .agents/skills/x/SKILL.md").unwrap();
-        assert_eq!(a, Access::Reference);
-        let (_, a) = classify_command("find . -name SKILL.md").unwrap();
-        assert_eq!(a, Access::Reference);
-        let (_, a) = classify_command("sed -n '1,5p' x/SKILL.md | head").unwrap();
-        assert_eq!(a, Access::Read);
-        assert!(classify_command("ls .agents/skills").is_none());
-        let (_, a) = classify_command("sudo cat /tmp/sg/SKILL.md").unwrap();
-        assert_eq!(a, Access::Read);
+        let accesses = classify_command("cat .agents/skills/x/SKILL.md");
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].0, ".agents/skills/x/SKILL.md");
+        assert_eq!(accesses[0].1, Access::Read);
+        assert_eq!(
+            classify_command("grep foo .agents/skills/x/SKILL.md")[0].1,
+            Access::Reference
+        );
+        assert_eq!(
+            classify_command("find . -name SKILL.md")[0].1,
+            Access::Reference
+        );
+        assert_eq!(
+            classify_command("sed -n '1,5p' x/SKILL.md | head")[0].1,
+            Access::Read
+        );
+        assert!(classify_command("ls .agents/skills").is_empty());
+        assert_eq!(
+            classify_command("sudo cat /tmp/sg/SKILL.md")[0].1,
+            Access::Read
+        );
+        // Multiple SKILL.md paths in one command are all classified,
+        // each with its own segment's access kind.
+        let multi = classify_command("cat a/SKILL.md; grep x b/SKILL.md");
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi[0].1, Access::Read);
+        assert_eq!(multi[1].1, Access::Reference);
     }
 
     #[test]
