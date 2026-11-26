@@ -322,7 +322,18 @@ fn unquote_shell(word: &str) -> String {
 /// runtime binary. Hook runtimes embed a resolved path instead.
 fn opencode_bin_resolvable() -> bool {
     if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN") {
-        return is_executable(Path::new(&p));
+        let raw = PathBuf::from(&p);
+        // The plugin spawns SKILL_GRAPH_BIN directly, so a bare command
+        // name resolves via PATH — mirror resolve_bin's path/bare-name
+        // split instead of treating every value as a literal path.
+        if raw.components().count() > 1 || raw.is_absolute() {
+            return is_executable(&raw);
+        }
+        return std::env::var_os("PATH")
+            .map(|path_var| {
+                std::env::split_paths(&path_var).any(|dir| is_executable(&dir.join(&raw)))
+            })
+            .unwrap_or(false);
     }
     std::env::var_os("PATH")
         .map(|path_var| {
@@ -530,6 +541,31 @@ fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
         }
     }
     Err(format!("{}: could not create temp file", target.display()))
+}
+
+/// A project-scope config lives inside an untrusted repository: a
+/// symlink there could point at an unrelated user file (`.claude/
+/// settings.json -> ~/.gitconfig`), and `write_text_atomic` resolves
+/// symlinks before renaming — writing through would destroy the
+/// target. User scope keeps write-through for dotfiles-managed configs.
+/// A project symlink that stays inside the project (e.g. a shared base
+/// file next to the config) is allowed.
+fn check_project_symlink(path: &Path, scope: Scope) -> Result<(), String> {
+    if scope != Scope::Project || !path.is_symlink() {
+        return Ok(());
+    }
+    let target = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    if !target.starts_with(&root) {
+        return Err(format!(
+            "{}: project config is a symlink resolving outside the project ({}); \
+             refusing to write through it — replace the link with a regular file",
+            path.display(),
+            target.display()
+        ));
+    }
+    Ok(())
 }
 
 /// Write JSON without the delete-on-empty behavior of `write_config` —
@@ -781,6 +817,7 @@ fn clean_extra_overlay() {
 }
 
 fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
+    check_project_symlink(path, args.scope)?;
     // Resolve before touching anything: a resolution failure must not leave
     // a half-written install. OpenCode uses a file:// plugin specifier and
     // never embeds the binary path.
@@ -870,6 +907,7 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
 }
 
 fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
+    check_project_symlink(path, args.scope)?;
     if !path.exists() {
         outln!("no config file: {}", path.display());
     } else {
@@ -988,15 +1026,20 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 outln!("  warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH");
             }
         } else {
-            // Check the embedded binary of EVERY owned v0.4.x hook
-            // command — a healthy UserPromptSubmit must not mask a
-            // broken PostToolUse bin. Existence/executable-bit checks
-            // only: config-embedded paths are untrusted input (project
-            // scope reads repo files) and must never be executed
-            // (#167). Version capability is likewise unverified here,
-            // so `enabled` means "entries present and bins exist",
-            // nothing more.
-            for bin_path in owned_hook_bins(&config) {
+            // Check the embedded binary of EVERY owned hook command —
+            // v0.4.x and legacy v0.3.x alike: a healthy UserPromptSubmit
+            // must not mask a broken PostToolUse bin, and a config whose
+            // only entries are legacy hooks must not report `enabled`
+            // while every invocation is dead. Existence/executable-bit
+            // checks only: config-embedded paths are untrusted input
+            // (project scope reads repo files) and must never be
+            // executed (#167). Version capability is likewise
+            // unverified here, so `enabled` means "entries present and
+            // bins exist", nothing more.
+            for bin_path in owned_hook_bins(&config)
+                .into_iter()
+                .chain(legacy_hook_bins(&config))
+            {
                 let bin = Path::new(&bin_path);
                 if !bin.exists() {
                     broken = true;
@@ -1062,6 +1105,25 @@ fn owned_hook_bins(config: &Value) -> Vec<String> {
         .filter(|c| is_our_hook_command(c))
         .filter_map(|c| embedded_bin(c))
         .filter(|b| seen.insert(b.clone()))
+        .collect()
+}
+
+/// Unique legacy v0.3.x hook binary paths in `config`. `status` checks
+/// these too: a config whose only entries are legacy hooks must not
+/// report `enabled` while every invocation is dead.
+fn legacy_hook_bins(config: &Value) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    hook_commands(config)
+        .iter()
+        .flat_map(|c| c.split_whitespace())
+        .map(|tok| tok.trim_matches(|c| c == '\'' || c == '"'))
+        .filter(|tok| {
+            !tok.contains("://")
+                && tok.contains('/')
+                && Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
+        })
+        .filter(|b| seen.insert(b.to_string()))
+        .map(str::to_string)
         .collect()
 }
 

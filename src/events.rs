@@ -138,16 +138,28 @@ pub struct SkillUsageEvent {
     pub tool: Option<String>,
 }
 
+/// Bound on `recommended` items retained per event. Constructors cap
+/// their input and the observe passthrough truncates to the same bound,
+/// so a hostile payload cannot retain an unbounded name list.
+pub(crate) const MAX_RECOMMENDED: usize = 32;
+
 /// Session ids come from agent-controlled payloads and transcripts;
 /// bound them like `tool`/`skill_path` so a hostile payload cannot write
 /// unbounded strings into every event line. Charset matches the hook's
 /// sanitizer so hook- and detect-emitted events agree.
 pub(crate) fn sanitize_session_id(session_id: &str) -> String {
-    let safe: String = session_id
+    let filtered: String = session_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        .take(128)
         .collect();
+    if filtered.chars().count() > 128 {
+        // Truncation must not merge distinct ids that share a 128-char
+        // prefix: keep a bounded head plus a hash suffix of the original,
+        // mirroring the plugin's safeSessionID exactly.
+        let head: String = filtered.chars().take(119).collect();
+        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
+    }
+    let safe = filtered;
     if safe.is_empty() && !session_id.is_empty() {
         // Distinct invalid ids must not collapse into one "unknown"
         // funnel session: derive a deterministic suffix from the
@@ -175,7 +187,7 @@ impl SkillUsageEvent {
             kind: EventKind::PromptSubmit,
             runtime,
             session_id: sanitize_session_id(session_id),
-            timestamp: timestamp.to_string(),
+            timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: Some(sha256_hex(prompt.as_bytes())),
             trigger: None,
@@ -210,13 +222,21 @@ impl SkillUsageEvent {
             kind: EventKind::Recommendation,
             runtime,
             session_id: sanitize_session_id(session_id),
-            timestamp: timestamp.to_string(),
+            timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash,
             trigger: Some(trigger),
-            recommended: names,
+            recommended: names
+                .into_iter()
+                .take(MAX_RECOMMENDED)
+                .map(|mut item| {
+                    item.name = item.name.chars().take(256).collect();
+                    item.digest = item.digest.map(|d| d.chars().take(128).collect());
+                    item
+                })
+                .collect(),
             emitted: Some(emitted),
-            reason: Some(reason.to_string()),
+            reason: Some(reason.chars().take(1024).collect()),
             recommend_ms,
             skill_name: None,
             skill_path: None,
@@ -246,7 +266,7 @@ impl SkillUsageEvent {
             kind: EventKind::SkillLoad,
             runtime,
             session_id: sanitize_session_id(session_id),
-            timestamp: timestamp.to_string(),
+            timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: None,
             trigger: None,
@@ -602,11 +622,24 @@ pub fn classify_tool_access_all(
         let mut out = Vec::new();
         let mut seen: std::collections::HashSet<(Option<String>, Detection)> =
             std::collections::HashSet::new();
+        // One tool output can cover several SKILL.md files (`cat a b`); its
+        // single frontmatter block belongs to the first file emitted, so
+        // only the first Read access may claim it — attributing it to every
+        // path would stamp the wrong skill name on the rest.
+        let mut frontmatter_available = true;
         for key in ["command", "cmd", "input"] {
             if let Some(command) = input.get(key).and_then(Value::as_str) {
                 for (path, access) in classify_command(command) {
                     let c = match access {
-                        Access::Read => classify_file_read(&path, output),
+                        Access::Read => {
+                            let verify = frontmatter_available;
+                            frontmatter_available = false;
+                            if verify {
+                                classify_file_read(&path, output)
+                            } else {
+                                classify_file_read_unverified(&path)
+                            }
+                        }
                         Access::Reference => LoadClassification {
                             skill_name: skill_name_from_path(&path),
                             skill_path: Some(path),
@@ -642,7 +675,6 @@ pub struct LoadClassification {
 }
 
 fn classify_file_read(path: &str, output: &str) -> LoadClassification {
-    let dir_name = skill_name_from_path(path);
     if let Some(name) = frontmatter_name(output) {
         LoadClassification {
             skill_name: Some(name),
@@ -651,12 +683,18 @@ fn classify_file_read(path: &str, output: &str) -> LoadClassification {
             confidence: Confidence::High,
         }
     } else {
-        LoadClassification {
-            skill_name: dir_name,
-            skill_path: Some(path.to_string()),
-            detection: Detection::PathReference,
-            confidence: Confidence::Medium,
-        }
+        classify_file_read_unverified(path)
+    }
+}
+
+/// Path-derived classification for reads whose output cannot be tied to
+/// this specific file (multi-file tool output, or no frontmatter found).
+fn classify_file_read_unverified(path: &str) -> LoadClassification {
+    LoadClassification {
+        skill_name: skill_name_from_path(path),
+        skill_path: Some(path.to_string()),
+        detection: Detection::PathReference,
+        confidence: Confidence::Medium,
     }
 }
 
@@ -890,34 +928,62 @@ pub fn detect_all_from_payload(
     // exec_command cmd strings and classify every SKILL.md access.
     if tool.eq_ignore_ascii_case("exec") {
         let js = exec_source(&input);
-        let mut seen = std::collections::HashSet::new();
-        let mut events = Vec::new();
-        let mut push = |path: String, access: Access, events: &mut Vec<SkillUsageEvent>| {
-            let c = match access {
-                Access::Read => classify_file_read(&path, &output),
+        // Dedup by skill identity (path preferred, name otherwise) keeping
+        // the strongest classification: `grep` before `cat` on the same
+        // SKILL.md must not let the weaker mention shadow the verified
+        // file_read, and one path must not emit two events under different
+        // derived names.
+        let mut classes: Vec<LoadClassification> = Vec::new();
+        let mut index: std::collections::HashMap<Option<String>, usize> =
+            std::collections::HashMap::new();
+        // Same single-frontmatter rule as classify_tool_access_all: only
+        // the first Read access may claim the output's frontmatter name.
+        let mut frontmatter_available = true;
+        let mut classify = |path: &str, access: &Access| -> LoadClassification {
+            match access {
+                Access::Read => {
+                    let verify = frontmatter_available;
+                    frontmatter_available = false;
+                    if verify {
+                        classify_file_read(path, &output)
+                    } else {
+                        classify_file_read_unverified(path)
+                    }
+                }
                 Access::Reference => LoadClassification {
-                    skill_name: skill_name_from_path(&path),
-                    skill_path: Some(path),
+                    skill_name: skill_name_from_path(path),
+                    skill_path: Some(path.to_string()),
                     detection: Detection::Mention,
                     confidence: Confidence::Low,
                 },
-            };
-            let key = (c.skill_name.clone(), c.skill_path.clone());
-            if c.skill_name.is_some() && seen.insert(key) {
-                events.push(to_event(c));
+            }
+        };
+        let mut push = |c: LoadClassification, classes: &mut Vec<LoadClassification>| {
+            if c.skill_name.is_none() {
+                return;
+            }
+            let key = c.skill_path.clone().or_else(|| c.skill_name.clone());
+            match index.get(&key) {
+                Some(&i) if rank(&classes[i]) >= rank(&c) => {}
+                Some(&i) => classes[i] = c,
+                None => {
+                    index.insert(key, classes.len());
+                    classes.push(c);
+                }
             }
         };
         for cmd in extract_exec_commands(&js) {
             for (path, access) in classify_command(&cmd) {
-                push(path, access, &mut events);
+                push(classify(&path, &access), &mut classes);
             }
         }
         // Fallback: unparsed JS may still reference SKILL.md in raw text.
-        if events.is_empty() && js.contains("SKILL.md") {
+        if classes.is_empty() && js.contains("SKILL.md") {
             for (path, access) in classify_command(&js) {
-                push(path, access, &mut events);
+                push(classify(&path, &access), &mut classes);
             }
         }
+        let mut events: Vec<SkillUsageEvent> = classes.into_iter().map(to_event).collect();
         events.truncate(MAX_EVENTS_PER_PAYLOAD);
         return events;
     }
@@ -1014,6 +1080,27 @@ mod tests {
         assert_eq!(sanitize_session_id(""), "");
         // Overlong ids are truncated at 128 chars.
         assert_eq!(sanitize_session_id(&"x".repeat(200)).len(), 128);
+    }
+
+    #[test]
+    fn sanitize_session_id_truncation_keeps_prefix_sharing_ids_distinct() {
+        // Two ids sharing a 128-char valid prefix must not collapse into
+        // one funnel session: the bounded head carries a hash suffix of
+        // the original bytes (parity with the plugin's safeSessionID).
+        let a = format!("{}-aaa", "x".repeat(200));
+        let b = format!("{}-bbb", "x".repeat(200));
+        let sa = sanitize_session_id(&a);
+        let sb = sanitize_session_id(&b);
+        assert_eq!(sa.len(), 128);
+        assert_eq!(sb.len(), 128);
+        assert_ne!(sa, sb);
+        assert!(sa.starts_with(&"x".repeat(119)));
+        assert!(sa.contains('-'));
+        // Deterministic: the same id sanitizes identically for joins.
+        assert_eq!(sa, sanitize_session_id(&a));
+        // Exactly-128-char ids pass through unsuffixed.
+        let exact = "y".repeat(128);
+        assert_eq!(sanitize_session_id(&exact), exact);
     }
 
     #[test]

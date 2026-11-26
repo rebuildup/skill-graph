@@ -44,10 +44,14 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 - event log の JSONL 行は `kind` / `schema_version` を持つ行のみ
   contract イベントとして deserialize され、`schema_version` が
   `SCHEMA_VERSION` と一致しない行は `lines_skipped` に計上される。
-- passthrough event の `session_id` / `skill_path` / `tool` /
-  `skill_name` は emit 側 constructor と同じ上限に正規化される
-  （`session_id` は `[A-Za-z0-9._-]`・128 文字、`skill_path` 1024、
-  `tool`/`skill_name` 256 文字）。charset 違反のみで構成される
+- passthrough event の payload 由来文字列フィールドは emit 側
+  constructor と同じ上限に正規化される: `session_id` は
+  `[A-Za-z0-9._-]`・128 文字（`unknown-<hash>` 正規化と同様に、
+  128 文字を超える id は先頭 119 文字 + `-` + hash 8 桁で区別される）、
+  `skill_path` 1024、`tool`/`skill_name`/`recommended[].name` 256、
+  `reason` 1024、`prompt_hash`/`skill_digest`/`recommended[].digest` 128、
+  `timestamp` 64 文字。`recommended` は最大 32 件
+  （`MAX_RECOMMENDED`）で打ち切られる。charset 違反のみで構成される
   `session_id` は `unknown-<hash>` に正規化され、互いに異なる不正 id が
   同一 funnel session に merge されない。`recommended[].name` は schema の
   `minLength: 1` より厳しく valid skill name を要求する — schema 適合でも
@@ -62,6 +66,11 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   plugin の `emitted` は injection キュー投入時点の値であり、context
   hook での実注入までは保証しない（pending FIFO eviction で未注入に
   なりうる）。
+- `SKILL_GRAPH_HOOK_NOSTATE=1` の dedup 意味論は adapter 間で異なる:
+  Rust hook は state marker を無効化し repeat prompt 毎に recommend を
+  再実行するが、OpenCode plugin の in-memory dedup map は NOSTATE 下でも
+  有効で、repeat `(session, prompt)` と skill-load 依存パスを抑制し続ける。
+  NOSTATE は永続化の抑止であり、plugin のメモリ内重複排除は残る。
 - `observe --summary` の `by_session` は `(runtime, session_id)` キーの
   辞書順先頭 500 session まで。`collection_errors` / `errors` /
   `errors_omitted` / `by_session_omitted` で打ち切り・収集失敗を通知する。

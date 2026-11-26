@@ -861,3 +861,86 @@ fn disable_without_our_hooks_leaves_file_bytes_untouched() {
     assert_eq!(rc, 0);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
 }
+
+/// Round-10: `opencode_bin_resolvable` must mirror the plugin's spawn
+/// semantics — a bare command name in SKILL_GRAPH_BIN resolves via PATH,
+/// not as a cwd-relative file.
+#[test]
+#[cfg(unix)]
+fn opencode_status_accepts_bare_name_skill_graph_bin() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let bindir = f.home.path().join("opbin");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let shim = bindir.join("my-sg");
+    std::fs::write(&shim, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let envs = [
+        ("SKILL_GRAPH_BIN", "my-sg"),
+        ("PATH", bindir.to_str().unwrap()),
+    ];
+    // enable must not emit the "no binary resolvable" warning
+    let (_, stderr, rc) = f.run_full_env(&["adapter", "enable", "opencode", "--user"], &envs);
+    assert_eq!(rc, 0, "{stderr}");
+    assert!(
+        !stderr.contains("no skill-graph binary resolvable"),
+        "{stderr}"
+    );
+    // and status must not report broken for the same reason
+    let (out, _) = f.run_env(&["adapter", "status", "opencode", "--user"], &envs);
+    assert!(out.contains("enabled"), "{out}");
+    assert!(!out.contains("broken"), "{out}");
+}
+
+/// Round-10: a project-scope config symlinked outside the project must
+/// not be written through — a hostile repo could point
+/// `.claude/settings.json` at `~/.gitconfig` and `adapter enable` would
+/// atomically replace it. Symlinks resolving inside the project stay
+/// allowed (shared base-file pattern).
+#[test]
+#[cfg(unix)]
+fn project_config_symlink_outside_project_is_refused() {
+    let f = Fixture::new();
+    let outside = f.home.path().join("gitconfig-target.json");
+    std::fs::write(&outside, "{\"hooks\":{}}\n").unwrap();
+    let link_dir = f.proj.path().join(".claude");
+    std::fs::create_dir_all(&link_dir).unwrap();
+    let link = link_dir.join("settings.json");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let (_, stderr, rc) = f.run_full(&["adapter", "enable", "claude-code", "--project"]);
+    assert_ne!(rc, 0, "enable should refuse: {stderr}");
+    assert!(stderr.contains("outside the project"), "{stderr}");
+    // The link target must be untouched.
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "{\"hooks\":{}}\n"
+    );
+    // The symlink itself must still be a symlink (no replace-with-file).
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+
+    let (_, stderr, rc) = f.run_full(&["adapter", "disable", "claude-code", "--project"]);
+    assert_ne!(rc, 0, "disable should refuse: {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "{\"hooks\":{}}\n"
+    );
+}
+
+/// Round-10: `status` must existence-check legacy v0.3.x hook binaries
+/// too — a config whose only entries are dead legacy hooks is `broken`,
+/// not `enabled`.
+#[test]
+fn status_reports_broken_for_missing_legacy_bin() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"'/nonexistent/skill-graph/0.3.0/bin/skill-graph-recommend-hook' prompt"}]}]}}"#,
+    )
+    .unwrap();
+    let (out, _) = f.run(&["adapter", "status", "claude-code", "--user"]);
+    assert!(out.contains("broken"), "{out}");
+    assert!(out.contains("not found"), "{out}");
+}

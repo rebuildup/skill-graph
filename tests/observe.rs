@@ -102,6 +102,49 @@ fn claude_file_read_is_file_read_with_tool_result() {
     assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&1));
 }
 
+/// One tool output covering several SKILL.md reads: the single
+/// frontmatter block belongs to the first file emitted, so only the
+/// first Read access may claim it — later reads fall back to
+/// path-derived classification instead of inheriting the wrong name.
+#[test]
+fn claude_multi_file_output_attributes_frontmatter_to_first_read() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "multi.jsonl",
+        &[
+            r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cat .agents/skills/alpha/SKILL.md .agents/skills/beta/SKILL.md"}}]}}"#,
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"---\nname: alpha-real\n---\nalpha body\n---\nname: beta-real\n---\nbeta body"}]}}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    let loads: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .collect();
+    assert_eq!(loads.len(), 2, "events: {:?}", obs.events);
+    let first = loads
+        .iter()
+        .find(|e| e.skill_name.as_deref() == Some("alpha-real"))
+        .expect("first read keeps frontmatter name");
+    assert_eq!(
+        first.detection.map(|d| serde_json::to_value(d).unwrap()),
+        Some(serde_json::json!("file_read"))
+    );
+    // The second file must NOT inherit alpha-real: it falls back to its
+    // directory name at path_reference confidence.
+    let second = loads
+        .iter()
+        .find(|e| e.skill_path.as_deref() == Some(".agents/skills/beta/SKILL.md"))
+        .expect("second read present");
+    assert_eq!(second.skill_name.as_deref(), Some("beta"));
+    assert_eq!(
+        second.detection.map(|d| serde_json::to_value(d).unwrap()),
+        Some(serde_json::json!("path_reference"))
+    );
+}
+
 #[test]
 fn codex_rollout_normalizes_exec_loads_and_injection() {
     let dir = TempDir::new().unwrap();
@@ -619,6 +662,42 @@ fn summary_timeliness_uses_millisecond_precision() {
     assert_eq!(v["timeliness_ms"]["count"], 1);
     assert_eq!(v["timeliness_ms"]["p50"], 500);
     assert_eq!(v["timeliness_ms"]["max"], 500);
+}
+
+/// Mixed valid/invalid timestamps: the conversion fallback compares
+/// input (encounter) order, not timestamp-sorted position — an
+/// unparseable timestamp sorts to i64::MAX and would otherwise
+/// fabricate "missing ts = latest" and invert real ordering.
+#[test]
+fn summary_mixed_timestamps_use_input_order() {
+    use skill_graph::observe::{Observation, summary};
+
+    // Load precedes the recommendation in log order but carries an
+    // invalid timestamp: it must NOT convert — the old position
+    // fallback sorted it last and credited a backwards conversion.
+    let obs = Observation {
+        events: vec![
+            load_event("s", "not-a-time", "alpha"),
+            rec_event("s", "2026-01-01T00:00:00Z", &["alpha"], true),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 0);
+
+    // Recommendation precedes the load in log order; the rec's own
+    // timestamp is invalid — input order still pairs them.
+    let obs = Observation {
+        events: vec![
+            rec_event("s", "not-a-time", &["alpha"], true),
+            load_event("s", "2026-01-01T00:00:01Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+    // No timeliness delta without two valid timestamps.
+    assert_eq!(v["timeliness_ms"]["count"], 0);
 }
 
 /// Round-9: the conversion scan indexes loads by name — verify greedy
