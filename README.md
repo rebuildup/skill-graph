@@ -9,69 +9,64 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 
 ## Install
 
-### Installer script（推奨）
+パッケージマネージャから導入する。hook の有効化は install では行われず、
+後述の `skill-graph adapter enable` で明示的に opt-in する。
+
+### mise
 
 ```bash
-curl -fsSL https://github.com/rebuildup/skill-graph/releases/latest/download/install.sh | bash
+mise use -g github:rebuildup/skill-graph          # 最新版
+mise use -g github:rebuildup/skill-graph@0.4.0   # バージョン固定
 ```
 
-または release の `install.sh` を直接実行。OS/arch を自動検出し、
-`sha256sums.txt` を検証したうえで以下を行う:
-
-- `~/.local/share/skill-graph/<version>/` に binary + adapter bundle を展開
-- `current` symlink で version 非依存の参照パスを維持（更新・Codex trust
-  の hash-pin をまたいで有効）
-- `~/.local/bin/skill-graph` シンボリックリンクを作成（PATH/shell rc は
-  変更しない。`--bin-dir` / `SKILL_GRAPH_NO_BIN=1` で調整可）
-- `--runtime claude-code|codex|opencode` で adapter を opt-in 有効化
+### npm / Bun / pnpm
 
 ```bash
-./install.sh --runtime claude-code --runtime codex --runtime opencode
-./install.sh --version 0.3.0      # バージョン固定
-./install.sh --uninstall [--purge]  # adapter 復元 + bin リンク除去
+npm install -g @rebuildup/skill-graph
+bun add -g @rebuildup/skill-graph
+pnpm add -g @rebuildup/skill-graph
 ```
 
-前提: `curl`、`tar`、`jq`（adapter install 時）。Windows は WSL2 経由。
+プラットフォーム別バイナリを optional dependency として同梱する
+（postinstall のダウンロード・ビルドなし）。pin は
+`npm install -g @rebuildup/skill-graph@0.4.0`。
 
-### Manual
+### Homebrew
 
-[GitHub Releases](https://github.com/rebuildup/skill-graph/releases) から
-OS/arch に対応する `skill-graph-<target>.tar.gz` と
-`skill-graph-adapters.tar.gz`、`sha256sums.txt` を取得し checksum を
-検証する。展開先は versioned ディレクトリ + `current` symlink を推奨
-（Codex の `/hooks` trust がコマンド文字列の hash-pin のため、参照パスを
-version 非依存に保つと更新をまたいで trust が維持される）。
+```bash
+brew install rebuildup/tap/skill-graph
+```
 
-| Asset | Target |
-|---|---|
-| `skill-graph-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc), WSL2 含む |
-| `skill-graph-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 (glibc) |
-| `skill-graph-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-| `skill-graph-x86_64-apple-darwin.tar.gz` | macOS Intel |
+### crates.io
 
-`skill-graph-adapters.tar.gz` に `adapters/`・`contracts/`・`plugins/`
-が同梱される。PATH 登録は不要 — `install.sh` は絶対パスで配線する
-（`SKILL_GRAPH_BIN` にバイナリのパスを指定）。
+```bash
+cargo install skill-graph
+```
 
-### Source
-
-Rust toolchain（`rust-toolchain.toml` 参照）があれば:
+ソースからビルドする場合（Rust toolchain は `rust-toolchain.toml` 参照）:
 
 ```bash
 git clone https://github.com/rebuildup/skill-graph && cd skill-graph
 cargo build --release   # -> target/release/skill-graph
 ```
 
+### 対応プラットフォーム
+
+Linux x86_64/ARM64 (glibc, WSL2 含む)、macOS x86_64/ARM64。
+Windows は WSL2 経由。musl・Windows native は対象外。
+
 ## CLI
 
 ```bash
-skill-graph discover [--root <dir>]...     # スキル列挙
-skill-graph search <query> [--root ...]     # キーワード検索
-skill-graph recommend <query> [--root ...] # 推薦（JSON: --format json）
-skill-graph resolve <target> [--root ...]  # 名前/リンク解決
-skill-graph observe <path>                 # transcript/DB/イベントログの観測集計
-skill-graph detect --runtime <rt> --via <via>  # hook/plugin 用イベント正規化（stdin）
-skill-graph bench <dataset> / perf         # 評価・性能ハーネス
+skill-graph discover [--root <dir>]...                  # スキル列挙
+skill-graph search <query> [--root ...]                  # キーワード検索
+skill-graph recommend <query> [--root ...]               # 推薦（--format json）
+skill-graph resolve <target> [--root ...]                # 名前/リンク解決
+skill-graph observe <path>                               # transcript/DB/イベントログの観測集計
+skill-graph detect --runtime <rt> --via <via>            # hook/plugin 用イベント正規化（stdin）
+skill-graph hook <claude-code|codex> <prompt|skill-load> # ランタイム hook 入口（stdin、fail-open）
+skill-graph adapter <enable|disable|status> <rt>         # adapter ライフサイクル管理
+skill-graph bench <dataset> / perf                       # 評価・性能ハーネス
 ```
 
 既定の探索 root: `~/.claude/skills`、`~/.agents/skills`、`./skills`、
@@ -80,24 +75,27 @@ skill-graph bench <dataset> / perf         # 評価・性能ハーネス
 
 ## Runtime adapters（opt-in）
 
-`adapters/install.sh` がランタイムのネイティブ設定へ hook/plugin を
+`skill-graph adapter` がランタイムのネイティブ設定へ hook/plugin を
 **絶対パス・冪等 merge** で追加する。PATH・shell rc・無関係な設定は
-変更しない。前提: `jq` と `skill-graph` バイナリ（`SKILL_GRAPH_BIN`）。
+変更しない。`--user`（既定）/ `--project`（カレントプロジェクト）を選択可。
 
 ```bash
-tar -xzf skill-graph-adapters.tar.gz
-export SKILL_GRAPH_BIN=$PWD/path/to/skill-graph   # or PATH 上の名前
-./adapters/install.sh claude-code --user|--project|--dry-run
-./adapters/install.sh codex       --user|--project
-./adapters/install.sh opencode    --user|--project
-./adapters/install.sh <rt> <scope> --uninstall    # 完全復元（冪等）
+skill-graph adapter enable  claude-code
+skill-graph adapter enable  codex
+skill-graph adapter enable  opencode
+skill-graph adapter status  claude-code   # enabled/disabled/legacy/broken
+skill-graph adapter disable claude-code   # 追加エントリのみ除去・完全復元
 ```
 
 | Runtime | Mechanism | 備考 |
 |---|---|---|
-| claude-code | `settings.json` hooks（UserPromptSubmit / PostToolUse `Skill`） | dotfiles compose 環境でも overlay ごと正しく uninstall される |
+| claude-code | `settings.json` hooks（UserPromptSubmit / PostToolUse `Skill`） | hook コマンドは `<bin> hook claude-code <mode>` |
 | codex | `hooks.json`（UserPromptSubmit / PostToolUse `Bash`） | 初回は Codex TUI の `/hooks` で trust が必要（通常導入経路） |
-| opencode | `opencode.json` `plugins` → TS plugin | `file://` specifier を merge |
+| opencode | `opencode.json` `plugins` → 同梱 TS plugin | `file://` specifier、plugin は `~/.local/share/skill-graph/opencode-plugin/` に materialize |
+
+hook コマンドには enable 時に PATH 解決した `skill-graph` の絶対パスを
+埋め込む。mise shim・npm global bin・brew のいずれのパスでも動作する。
+明示指定は `--bin <path>`。
 
 ### 挙動
 
@@ -105,24 +103,44 @@ export SKILL_GRAPH_BIN=$PWD/path/to/skill-graph   # or PATH 上の名前
   OpenCode の system context）として注入。
 - SKILL.md の実読み込みを検出すると `skill_load` イベントを発行し、
   宣言された依存スキルを追加推薦。
-- 対象外 tool call は jq pre-filter で binary 起動前に除外。
+- すべて fail-open: バイナリ不在・内部エラーでもセッションをブロック
+  しない（hook は常に exit 0、plugin は spawn 失敗を握りつぶす）。
+  パッケージ削除後に壊れた hook が残っても runtime の通常動作は妨げない。
 - イベントは `${TMPDIR}/skill-graph-events.jsonl`（JSONL）へ。
   prompt は SHA-256 hash のみで本文・コマンド・tool response は
   **一切保存しない**。`SKILL_GRAPH_EVENT_LOG` で保存先変更、
   `SKILL_GRAPH_HOOK_NOSTATE=1` で全書き込み無効化、
   `SKILL_GRAPH_EVENT_LOG_MAX`（既定 64MiB）でローテーション。
-- すべて fail-open: 内部エラーでもセッションをブロックしない。
 
 ## Update / Uninstall
 
-- **更新**: 新バージョンのバイナリを同じパスに置き換えるだけ。
-  adapter 設定は絶対パス参照のため再 install 不要（hook script 更新時は
-  Codex の `/hooks` trust が hash 変更で再要求される）。
-- **無効化（一時）**: `SKILL_GRAPH_HOOK_NOSTATE=1` でイベント書き込み停止、
-  または hook/plugin を設定から外す。
-- **削除**: `adapters/install.sh <rt> <scope> --uninstall`。
+- **更新**: 各パッケージマネージャの通常手順（`mise upgrade`、
+  `npm install -g @rebuildup/skill-graph@latest`、`brew upgrade`、
+  `cargo install --force`）。hook コマンドのパスが変わらない限り
+  adapter の再 enable は不要。パスが変わった場合は
+  `adapter disable && adapter enable` で張り替える。
+- **無効化（一時）**: `SKILL_GRAPH_HOOK_NOSTATE=1` でイベント書き込み停止。
+- **adapter のみ無効化**: `skill-graph adapter disable <rt>`。
   追加したエントリのみ除去し、他の hook/plugin・設定は保持。
   `{}` まで減った設定ファイルは削除される。
+- **完全削除**: パッケージマネージャの uninstall に加え、事前に
+  `adapter disable` を実行して hook/plugin 参照を除去する
+  （残っても fail-open だが、設定を清潔に保つため推奨）。
+
+## v0.3.x からの移行
+
+v0.3.x の `install.sh` / `adapters/install.sh` で導入した環境は、
+新版インストール後に一度だけ移行する:
+
+```bash
+skill-graph adapter enable <rt>   # 旧 skill-graph-recommend-hook /
+                                  # /skill-graph plugin 参照を自動検出・除去して置き換え
+skill-graph adapter status <rt>   # enabled を確認後、旧配置を削除
+rm -rf ~/.local/share/skill-graph ~/.local/bin/skill-graph
+```
+
+Codex の `/hooks` trust はコマンド文字列の hash-pin のため、移行で
+コマンドが変わると **一度だけ再 trust が必要**（ユーザー操作）。
 
 ## Privacy
 
@@ -135,11 +153,11 @@ export SKILL_GRAPH_BIN=$PWD/path/to/skill-graph   # or PATH 上の名前
 
 ## Known limitations
 
-- macOS は x86_64 / arm64 バイナリを提供するが実機検証は WSL2/Linux のみ。
-- OpenCode の `tool.execute.after` 検出経路は provider 認証環境での
-  live 確認が今後の観測対象（`detect` CLI 自体はテスト済み）。
-- Codex は skill-load を `PostToolUse` matcher `Bash` のコマンド分類で
-  検出する（Codex に Skill tool は存在しない）。
+- macOS バイナリは提供するが実機検証は限定的。
+- Codex の skill-load 検出は `PostToolUse` matcher `Bash` のコマンド分類
+  （Codex に Skill tool は存在しない）。
+- bun は os/cpu gating を適用しないため全 platform package を取得する
+  （shim が正しい arch を選択するため動作上の問題はない）。
 - 永続キャッシュ・MCP・Embedding は意図的に未実装（効果実証まで保留）。
 
 ## Development
