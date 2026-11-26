@@ -18,10 +18,10 @@ use std::path::{Path, PathBuf};
 
 /// v0.3.x shell-hook script name — legacy marker.
 const LEGACY_HOOK_MARKER: &str = "skill-graph-recommend-hook";
-/// v0.4.x hook invocation marker (`<bin> hook <rt> <mode>`).
-const HOOK_MARKER: &str = "skill-graph hook";
-/// Plugin specifiers are file:// URLs into a skill-graph plugin dir.
-const PLUGIN_MARKER: &str = "skill-graph";
+/// v0.4.x materialized plugin dir marker (`.../skill-graph/opencode-plugin`).
+const PLUGIN_MARKER: &str = "skill-graph/opencode-plugin";
+/// v0.3.x bundled plugin dir marker (`.../adapters/opencode/skill-graph`).
+const LEGACY_PLUGIN_MARKER: &str = "adapters/opencode/skill-graph";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -148,13 +148,47 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// v0.4.x hook command shape: first token is the embedded `skill-graph`
+/// binary path (optionally single-quoted), followed by `hook <rt> <mode>`.
+/// Structural match avoids false positives on foreign commands that merely
+/// contain the substring "skill-graph hook".
+fn is_v040_hook_command(command: &str) -> bool {
+    let cmd = command.trim_start();
+    let (bin, rest) = if let Some(r) = cmd.strip_prefix('\'') {
+        match r.split_once('\'') {
+            Some((b, tail)) => (b, tail.trim_start()),
+            None => return false,
+        }
+    } else {
+        match cmd.split_once(char::is_whitespace) {
+            Some((b, tail)) => (b, tail.trim_start()),
+            None => return false,
+        }
+    };
+    (bin == "skill-graph" || bin.ends_with("/skill-graph")) && rest.starts_with("hook ")
+}
+
 fn is_our_hook_command(command: &str) -> bool {
-    command.contains(LEGACY_HOOK_MARKER) || command.contains(HOOK_MARKER)
+    command.contains(LEGACY_HOOK_MARKER) || is_v040_hook_command(command)
 }
 
 fn is_our_plugin(spec: &Value) -> bool {
     spec.as_str()
-        .map(|s| s.contains(PLUGIN_MARKER))
+        .map(|s| {
+            s.contains(PLUGIN_MARKER)
+                || s.contains(LEGACY_PLUGIN_MARKER)
+                || s.ends_with("/skill-graph")
+        })
+        .unwrap_or(false)
+}
+
+fn is_legacy_plugin(spec: &Value) -> bool {
+    spec.as_str()
+        .map(|s| {
+            is_our_plugin(spec)
+                && !s.contains(PLUGIN_MARKER)
+                && (s.contains(LEGACY_PLUGIN_MARKER) || s.ends_with("/skill-graph"))
+        })
         .unwrap_or(false)
 }
 
@@ -314,6 +348,14 @@ fn count_plugin_entries(config: &Value) -> usize {
         .unwrap_or(0)
 }
 
+fn count_legacy_plugin_entries(config: &Value) -> usize {
+    config
+        .get("plugins")
+        .and_then(Value::as_array)
+        .map(|p| p.iter().filter(|s| is_legacy_plugin(s)).count())
+        .unwrap_or(0)
+}
+
 fn opencode_plugin_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -351,6 +393,12 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
     let bin = resolve_bin(args.bin.as_deref())?;
     let mut config = read_config(path)?;
+    if !config.is_object() {
+        return Err(format!(
+            "{}: top-level JSON must be an object",
+            path.display()
+        ));
+    }
 
     if args.runtime == Runtime::Opencode {
         // Drop any prior skill-graph specifier (any generation), then append ours.
@@ -360,9 +408,10 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             .expect("config object")
             .entry("plugins")
             .or_insert_with(|| json!([]));
-        if let Some(arr) = plugins.as_array_mut() {
-            arr.push(json!(opencode_plugin_spec()));
-        }
+        let arr = plugins
+            .as_array_mut()
+            .ok_or_else(|| format!("{}: \"plugins\" must be an array", path.display()))?;
+        arr.push(json!(opencode_plugin_spec()));
     } else {
         strip_our_hooks(&mut config);
         let hooks = config
@@ -370,7 +419,9 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             .expect("config object")
             .entry("hooks")
             .or_insert_with(|| json!({}));
-        let hooks = hooks.as_object_mut().expect("hooks object");
+        let hooks = hooks
+            .as_object_mut()
+            .ok_or_else(|| format!("{}: \"hooks\" must be an object", path.display()))?;
         for (event, matcher, command, status_message) in desired_hooks(&bin, args.runtime) {
             let mut group = hook_group(&command, status_message.as_deref());
             if let Some(m) = matcher {
@@ -383,7 +434,7 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 .entry(event)
                 .or_insert_with(|| json!([]))
                 .as_array_mut()
-                .expect("event array")
+                .ok_or_else(|| format!("{}: hook event must be an array", path.display()))?
                 .push(group);
         }
     }
@@ -409,6 +460,12 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         println!("no config file: {}", path.display());
     } else {
         let mut config = read_config(path)?;
+        if !config.is_object() {
+            return Err(format!(
+                "{}: top-level JSON must be an object",
+                path.display()
+            ));
+        }
         if args.runtime == Runtime::Opencode {
             strip_our_plugins(&mut config);
         } else {
@@ -421,6 +478,11 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             args.scope.flag(),
             path.display()
         );
+    }
+
+    if args.runtime == Runtime::Opencode {
+        // Remove the materialized plugin so no stale copy is left behind.
+        let _ = std::fs::remove_dir_all(opencode_plugin_dir());
     }
 
     // dotfiles-managed machines compose ~/.claude/settings.json from a
@@ -448,8 +510,17 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         return Ok(());
     }
     let config = read_config(path)?;
+    if !config.is_object() {
+        return Err(format!(
+            "{}: top-level JSON must be an object",
+            path.display()
+        ));
+    }
     let (ours, legacy) = if args.runtime == Runtime::Opencode {
-        (count_plugin_entries(&config), 0)
+        (
+            count_plugin_entries(&config),
+            count_legacy_plugin_entries(&config),
+        )
     } else {
         (count_hook_entries(&config), count_legacy_entries(&config))
     };
@@ -466,8 +537,9 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     if legacy > 0 {
         println!("  legacy v0.3.x entries present: {legacy} (run `adapter enable` to migrate)");
     }
-    // Broken-path detection: extract the first embedded binary path from a
-    // matching hook command and check it still exists.
+    // Broken-path detection: only v0.4.x commands (`<bin> hook <rt> <mode>`)
+    // start with the embedded binary path; legacy env-prefix commands are
+    // skipped to avoid false warnings.
     if ours > 0
         && args.runtime != Runtime::Opencode
         && let Some(cmd) = first_hook_command(&config)
@@ -511,7 +583,7 @@ fn first_hook_command(config: &Value) -> Option<String> {
         .filter_map(|g| g.get("hooks").and_then(Value::as_array))
         .flatten()
         .filter_map(|h| h.get("command").and_then(Value::as_str))
-        .find(|c| is_our_hook_command(c))
+        .find(|c| is_v040_hook_command(c))
         .map(str::to_string)
 }
 
