@@ -156,8 +156,15 @@ pub fn run() -> Result<(), String> {
         }
         Command::Hook { runtime, mode } => {
             use crate::events::Runtime;
-            let runtime =
-                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            // Hooks must fail open: unusable arguments still exit 0.
+            let Some(runtime) = Runtime::parse(&runtime) else {
+                eprintln!("skill-graph: unknown runtime: {runtime}");
+                return Ok(());
+            };
+            if !matches!(mode.as_str(), "prompt" | "skill-load") {
+                eprintln!("skill-graph: unknown hook mode: {mode}");
+                return Ok(());
+            }
             crate::hook::run_hook(runtime, &mode)
         }
         Command::Adapter {
