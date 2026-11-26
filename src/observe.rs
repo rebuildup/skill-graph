@@ -17,7 +17,7 @@ use crate::events::{
     SkillUsageEvent, Trigger,
 };
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -754,4 +754,264 @@ fn is_meaningful_prompt(text: &str) -> bool {
     !t.is_empty()
         && !t.starts_with("<environment_context")
         && !t.starts_with("<skills_instructions>")
+}
+
+/// Funnel metrics defined by docs/specs/v0.3.0-observation-pilot.md,
+/// computed from normalized events. Read-only; printed by
+/// `observe --summary`.
+pub fn summary(obs: &Observation) -> Value {
+    let all: Vec<&crate::events::SkillUsageEvent> = obs.events.iter().collect();
+    let mut out = funnel_for(&all).into_json();
+    let mut by_runtime = serde_json::Map::new();
+    for runtime in ["claude-code", "codex", "opencode"] {
+        let subset: Vec<&crate::events::SkillUsageEvent> = all
+            .iter()
+            .copied()
+            .filter(|e| e.runtime.as_str() == runtime)
+            .collect();
+        if !subset.is_empty() {
+            by_runtime.insert(runtime.to_string(), funnel_for(&subset).into_json());
+        }
+    }
+    out["by_runtime"] = Value::Object(by_runtime);
+    out["events"] = json!(obs.events.len());
+    out["files_scanned"] = json!(obs.files_scanned);
+    out["lines_skipped"] = json!(obs.lines_skipped);
+    out
+}
+
+/// RFC 3339 (`YYYY-MM-DDTHH:MM:SS[.fff]Z` or `±hh:mm`) → epoch seconds.
+/// None for unparseable input; callers treat that as "unknown time".
+fn rfc3339_secs(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 20 {
+        return None;
+    }
+    let num = |i: usize, n: usize| -> Option<i64> { s.get(i..i + n)?.parse().ok() };
+    let (y, mo, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
+    let (h, mi, sec) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
+    if b.get(10) != Some(&b'T') || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    // days-from-civil (Howard Hinnant)
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec;
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+        }
+    }
+    match b.get(i) {
+        Some(b'Z') | None => Some(secs),
+        Some(sign @ (b'+' | b'-')) => {
+            let off_h = num(i + 1, 2)?;
+            let off_m = if b.get(i + 3) == Some(&b':') {
+                num(i + 4, 2)?
+            } else {
+                num(i + 3, 2)?
+            };
+            let off = off_h * 3600 + off_m * 60;
+            Some(secs + if *sign == b'+' { -off } else { off })
+        }
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct Funnel {
+    sessions: BTreeSet<String>,
+    prompt_submits: usize,
+    recommendations: usize,
+    emitted: usize,
+    load_grade_loads: usize,
+    sessions_with_loads: BTreeSet<String>,
+    converted: usize,
+    unnecessary_loads: usize,
+    deltas_ms: Vec<i64>,
+    emitted_per_session: BTreeMap<String, usize>,
+}
+
+/// Compute funnel metrics over a set of events (overall or one runtime).
+fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
+    use crate::events::EventKind;
+    let mut f = Funnel::default();
+    // Stable per-session ordering: (timestamp, input order).
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.sort_by_key(|&i| (rfc3339_secs(&events[i].timestamp).unwrap_or(i64::MAX), i));
+    let mut by_session: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for &i in &order {
+        by_session
+            .entry(events[i].session_id.as_str())
+            .or_default()
+            .push(i);
+    }
+    for idxs in by_session.values() {
+        let recs: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| events[i].kind == EventKind::Recommendation)
+            .collect();
+        let loads: Vec<usize> = idxs
+            .iter()
+            .copied()
+            .filter(|&i| events[i].counts_as_load())
+            .collect();
+        for &i in idxs {
+            let e = events[i];
+            f.sessions.insert(e.session_id.clone());
+            match e.kind {
+                EventKind::PromptSubmit => f.prompt_submits += 1,
+                EventKind::Recommendation => {
+                    f.recommendations += 1;
+                    if e.emitted == Some(true) {
+                        f.emitted += 1;
+                        *f.emitted_per_session
+                            .entry(e.session_id.clone())
+                            .or_default() += 1;
+                    }
+                }
+                EventKind::SkillLoad if e.counts_as_load() => {
+                    f.load_grade_loads += 1;
+                    f.sessions_with_loads.insert(e.session_id.clone());
+                }
+                _ => {}
+            }
+        }
+        session_funnel(&mut f, events, &recs, &loads);
+    }
+    f
+}
+
+/// conversion / unnecessary-load / timeliness for one session's
+/// timestamp-ordered event indexes.
+fn session_funnel(
+    f: &mut Funnel,
+    events: &[&crate::events::SkillUsageEvent],
+    recs: &[usize],
+    loads: &[usize],
+) {
+    // recommended names from emitted recommendations only — loads of
+    // names we never surfaced count as unnecessary per the pilot def.
+    let mut recommended_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for &ri in recs {
+        let e = events[ri];
+        if e.emitted == Some(true) {
+            for r in &e.recommended {
+                recommended_names.insert(r.name.as_str());
+            }
+        }
+    }
+    for &li in loads {
+        let name = events[li].skill_name.as_deref().unwrap_or("");
+        if !recommended_names.contains(name) {
+            f.unnecessary_loads += 1;
+        }
+    }
+
+    // Greedy conversion: each emitted recommendation converts the first
+    // later load-grade load naming one of its recommendations; each load
+    // converts at most one recommendation.
+    let mut consumed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for &ri in recs {
+        let rec = events[ri];
+        if rec.emitted != Some(true) {
+            continue;
+        }
+        let names: std::collections::BTreeSet<&str> =
+            rec.recommended.iter().map(|r| r.name.as_str()).collect();
+        if names.is_empty() {
+            continue;
+        }
+        let rec_ts = rfc3339_secs(&rec.timestamp);
+        for &li in loads {
+            if consumed.contains(&li) {
+                continue;
+            }
+            let load = events[li];
+            if !names.contains(load.skill_name.as_deref().unwrap_or("")) {
+                continue;
+            }
+            let load_ts = rfc3339_secs(&load.timestamp);
+            let after = match (rec_ts, load_ts) {
+                (Some(a), Some(b)) => b >= a,
+                _ => li > ri,
+            };
+            if !after {
+                continue;
+            }
+            consumed.insert(li);
+            f.converted += 1;
+            if let (Some(a), Some(b)) = (rec_ts, load_ts) {
+                f.deltas_ms.push((b - a) * 1000);
+            }
+            break;
+        }
+    }
+}
+
+impl Funnel {
+    fn into_json(self) -> Value {
+        let pct = |num: usize, den: usize| -> Value {
+            if den == 0 {
+                Value::Null
+            } else {
+                json!((num as f64 / den as f64 * 1000.0).round() / 10.0)
+            }
+        };
+        let mut deltas = self.deltas_ms;
+        deltas.sort_unstable();
+        let percentile = |p: f64| -> Value {
+            if deltas.is_empty() {
+                return Value::Null;
+            }
+            let idx = ((deltas.len() - 1) as f64 * p).round() as usize;
+            json!(deltas[idx])
+        };
+        let eps: Vec<usize> = self.emitted_per_session.values().copied().collect();
+        let (avg, max) = if eps.is_empty() {
+            (Value::Null, Value::Null)
+        } else {
+            (
+                json!(
+                    (eps.iter().sum::<usize>() as f64 / eps.len() as f64 * 100.0).round() / 100.0
+                ),
+                json!(eps.iter().max().unwrap()),
+            )
+        };
+        json!({
+            "sessions": self.sessions.len(),
+            "prompt_submits": self.prompt_submits,
+            "recommendations": self.recommendations,
+            "emitted_recommendations": self.emitted,
+            "delivery_rate_pct": pct(self.emitted, self.recommendations),
+            "load_grade_loads": self.load_grade_loads,
+            "sessions_with_loads": self.sessions_with_loads.len(),
+            "loads_per_session": if self.sessions.is_empty() { Value::Null } else {
+                json!((self.load_grade_loads as f64 / self.sessions.len() as f64 * 100.0).round() / 100.0)
+            },
+            "converted_recommendations": self.converted,
+            "conversion_rate_pct": pct(self.converted, self.emitted),
+            "unnecessary_loads": self.unnecessary_loads,
+            "unnecessary_load_rate_pct": pct(self.unnecessary_loads, self.load_grade_loads),
+            "timeliness_ms": {
+                "count": deltas.len(),
+                "p50": percentile(0.50),
+                "p95": percentile(0.95),
+                "max": deltas.last().map(|d| json!(d)).unwrap_or(Value::Null),
+            },
+            "context_consumption": {
+                "emitted_total": self.emitted,
+                "emitted_per_session_avg": avg,
+                "emitted_per_session_max": max,
+            },
+        })
+    }
 }

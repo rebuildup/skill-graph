@@ -238,3 +238,94 @@ fn opencode_db_normalizes_messages() {
     );
     assert_eq!(obs.runtimes.get("opencode"), Some(&1));
 }
+
+fn rec_event(
+    session: &str,
+    ts: &str,
+    names: &[&str],
+    emitted: bool,
+) -> skill_graph::events::SkillUsageEvent {
+    use skill_graph::events::{ObservedVia, RecommendedSkill, Runtime, Trigger};
+    skill_graph::events::SkillUsageEvent::recommendation(
+        Runtime::ClaudeCode,
+        ObservedVia::Hook,
+        session,
+        ts,
+        None,
+        Trigger::PromptSubmit,
+        names
+            .iter()
+            .map(|n| RecommendedSkill {
+                name: n.to_string(),
+                digest: None,
+            })
+            .collect(),
+        emitted,
+        "test",
+        None,
+    )
+}
+
+fn load_event(session: &str, ts: &str, name: &str) -> skill_graph::events::SkillUsageEvent {
+    use skill_graph::events::{Confidence, Detection, ObservedVia, Runtime};
+    skill_graph::events::SkillUsageEvent::skill_load(
+        Runtime::ClaudeCode,
+        ObservedVia::Hook,
+        session,
+        ts,
+        None,
+        Some(name.to_string()),
+        None,
+        Detection::FileRead,
+        Confidence::High,
+    )
+}
+
+#[test]
+fn summary_computes_funnel_metrics() {
+    use skill_graph::events::Runtime;
+    use skill_graph::observe::{Observation, summary};
+
+    // s1: emitted rec recommends alpha+beta; alpha loads 60s later
+    //     (converted), beta never loads; gamma loads unprompted
+    //     (unnecessary). s2: non-emitted rec; delta-skill loads.
+    let obs = Observation {
+        events: vec![
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha", "beta"], true),
+            rec_event("s1", "2026-01-01T00:10:00Z", &["beta"], false),
+            rec_event("s2", "2026-01-01T00:00:00Z", &["delta"], true),
+            load_event("s1", "2026-01-01T00:01:00Z", "alpha"),
+            load_event("s1", "2026-01-01T00:02:00Z", "gamma"),
+            load_event("s2", "2026-01-01T00:00:30Z", "delta"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["recommendations"], 3);
+    assert_eq!(v["emitted_recommendations"], 2);
+    assert_eq!(v["delivery_rate_pct"], 66.7);
+    assert_eq!(v["load_grade_loads"], 3);
+    assert_eq!(v["converted_recommendations"], 2);
+    assert_eq!(v["conversion_rate_pct"], 100.0);
+    // gamma was never recommended -> unnecessary; alpha/delta converted
+    assert_eq!(v["unnecessary_loads"], 1);
+    assert_eq!(v["unnecessary_load_rate_pct"], 33.3);
+    assert_eq!(v["timeliness_ms"]["count"], 2);
+    assert_eq!(v["timeliness_ms"]["p50"], 60000);
+    assert_eq!(v["timeliness_ms"]["max"], 60000);
+    assert_eq!(v["sessions"], 2);
+    assert!(v["by_runtime"]["claude-code"].is_object());
+
+    // events of other runtimes land in their own bucket only
+    let mut e = load_event("s3", "2026-01-01T00:00:00Z", "alpha");
+    e.runtime = Runtime::Codex;
+    let obs2 = Observation {
+        events: vec![e],
+        ..Default::default()
+    };
+    let v2 = summary(&obs2);
+    assert_eq!(v2["load_grade_loads"], 1);
+    assert_eq!(v2["unnecessary_loads"], 1);
+    assert_eq!(v2["by_runtime"]["codex"]["load_grade_loads"], 1);
+    assert!(v2["by_runtime"].get("claude-code").is_none());
+}

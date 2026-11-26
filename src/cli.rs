@@ -68,6 +68,9 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value = "json")]
         format: String,
+        /// Print funnel/summary metrics instead of the raw observation.
+        #[arg(long)]
+        summary: bool,
     },
     /// Runtime hook entry point: reads one hook payload JSON on stdin,
     /// emits Skill Usage Events, and prints additionalContext injection.
@@ -150,8 +153,20 @@ pub fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        Command::Observe { path, format } => {
+        Command::Observe {
+            path,
+            format,
+            summary,
+        } => {
             let obs = observe::observe_path(&path)?;
+            if summary {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&observe::summary(&obs))
+                        .map_err(|e| e.to_string())?
+                );
+                return Ok(());
+            }
             print_result(json!(obs), &format)
         }
         Command::Hook { runtime, mode } => {
