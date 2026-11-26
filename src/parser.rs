@@ -48,14 +48,27 @@ fn yaml_text(value: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+/// Upper bounds for opt-in `keywords`: they are concatenated into the
+/// description match text, so an unbounded list would let one SKILL.md
+/// inflate per-term corpus scans in recommend().
+const MAX_KEYWORDS: usize = 32;
+const MAX_KEYWORD_CHARS: usize = 128;
+
 /// Accept `keywords` as either a single string or a sequence of strings.
 fn de_string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    let bounded = |items: Vec<String>| {
+        items
+            .into_iter()
+            .take(MAX_KEYWORDS)
+            .map(|k| k.chars().take(MAX_KEYWORD_CHARS).collect())
+            .collect()
+    };
     match serde_yaml::Value::deserialize(deserializer)? {
-        serde_yaml::Value::String(s) => Ok(vec![s]),
-        serde_yaml::Value::Sequence(seq) => Ok(seq.iter().filter_map(yaml_text).collect()),
+        serde_yaml::Value::String(s) => Ok(bounded(vec![s])),
+        serde_yaml::Value::Sequence(seq) => Ok(bounded(seq.iter().filter_map(yaml_text).collect())),
         _ => Ok(Vec::new()),
     }
 }
@@ -290,6 +303,30 @@ mod tests {
         assert_eq!(skill.keywords, vec!["single".to_string()]);
         assert!(skill.parse_error.is_none());
         assert!(skill.links.iter().any(|l| l.target == "a-skill"));
+    }
+
+    #[test]
+    fn keywords_are_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let many: Vec<String> = (0..40).map(|i| format!("kw{i}")).collect();
+        let path = write_skill(
+            &dir.path().join("kw-skill"),
+            &format!(
+                "name: kw-skill\ndescription: d\nkeywords: [{}]",
+                many.join(", ")
+            ),
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert_eq!(skill.keywords.len(), 32);
+        assert_eq!(skill.keywords[0], "kw0");
+
+        let long = "k".repeat(300);
+        let path = write_skill(
+            &dir.path().join("kw-long"),
+            &format!("name: kw-long\ndescription: d\nkeywords: [{long}]"),
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert_eq!(skill.keywords[0].chars().count(), 128);
     }
 
     #[test]

@@ -66,6 +66,23 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     let mut sessions = BTreeSet::new();
     for file in files {
         obs.files_scanned += 1;
+        // Size cap applies to every observable format — .db inputs are
+        // scanned row-by-row and would otherwise have no bound. For a
+        // SQLite database the un-checkpointed WAL is read too, so its
+        // size counts against the same cap.
+        let mut size = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        if file.extension().and_then(|e| e.to_str()) == Some("db") {
+            let mut wal = file.as_os_str().to_os_string();
+            wal.push("-wal");
+            if let Ok(meta) = fs::metadata(Path::new(&wal)) {
+                size = size.saturating_add(meta.len());
+            }
+        }
+        if size > MAX_OBSERVE_FILE_BYTES {
+            obs.errors
+                .push(format!("{}: file too large", file.display()));
+            continue;
+        }
         let loads_before = obs.loads.len();
         let result = if file.extension().and_then(|e| e.to_str()) == Some("db") {
             observe_db(&file, &mut obs, &mut sessions)
@@ -112,19 +129,36 @@ fn line_session_id(value: &Value) -> Option<String> {
 /// through multiple paths (symlinked/hardlinked transcripts) are scanned
 /// once — canonicalizing the file dedups them so events are not
 /// double-counted.
+/// Aggregate bound on observable inputs: per-file caps alone still allow
+/// `observe ~` to read an unbounded number of files into memory.
+const MAX_OBSERVE_FILES: usize = 4096;
+
 fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let mut visited_dirs = std::collections::HashSet::new();
     let mut seen_files: std::collections::HashSet<ObsKey> = std::collections::HashSet::new();
+    let mut cap_noted = false;
     collect_observables_inner(
         path,
         &mut out,
         &mut errors,
         &mut visited_dirs,
         &mut seen_files,
+        &mut cap_noted,
     );
     (out, errors)
+}
+
+/// Record the aggregate-cap truncation once, however many directories
+/// hit the limit.
+fn note_observable_cap(out_len: usize, errors: &mut Vec<String>, noted: &mut bool) {
+    if out_len >= MAX_OBSERVE_FILES && !*noted {
+        *noted = true;
+        errors.push(format!(
+            "observable inputs truncated at {MAX_OBSERVE_FILES} files"
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,7 +168,12 @@ fn collect_observables_inner(
     errors: &mut Vec<String>,
     visited_dirs: &mut std::collections::HashSet<PathBuf>,
     seen_files: &mut std::collections::HashSet<ObsKey>,
+    cap_noted: &mut bool,
 ) {
+    if out.len() >= MAX_OBSERVE_FILES {
+        note_observable_cap(out.len(), errors, cap_noted);
+        return;
+    }
     if path.is_file() {
         if matches!(
             path.extension().and_then(|e| e.to_str()),
@@ -163,6 +202,10 @@ fn collect_observables_inner(
         }
     };
     for entry in entries {
+        if out.len() >= MAX_OBSERVE_FILES {
+            note_observable_cap(out.len(), errors, cap_noted);
+            break;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
@@ -186,7 +229,7 @@ fn collect_observables_inner(
             continue;
         }
         if p.is_dir() {
-            collect_observables_inner(&p, out, errors, visited_dirs, seen_files);
+            collect_observables_inner(&p, out, errors, visited_dirs, seen_files, cap_noted);
         } else if matches!(
             p.extension().and_then(|e| e.to_str()),
             Some("jsonl") | Some("db")
@@ -237,11 +280,6 @@ fn observe_jsonl(
     obs: &mut Observation,
     sessions: &mut BTreeSet<String>,
 ) -> Result<(), String> {
-    if let Ok(meta) = fs::metadata(file)
-        && meta.len() > MAX_OBSERVE_FILE_BYTES
-    {
-        return Err(format!("{}: file too large", file.display()));
-    }
     let content = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut claude = ClaudeScan::default();
     let mut codex = CodexScan::default();
@@ -277,7 +315,7 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
     if value.get("kind").is_none() || value.get("schema_version").is_none() {
         return false;
     }
-    let Ok(event) = serde_json::from_value::<SkillUsageEvent>(value.clone()) else {
+    let Ok(mut event) = serde_json::from_value::<SkillUsageEvent>(value.clone()) else {
         obs.lines_skipped += 1;
         return true;
     };
@@ -331,6 +369,26 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
         obs.lines_skipped += 1;
         return true;
     }
+    // skill_load requires an attributable name; an empty string passes
+    // the presence check above but record_event would drop it silently,
+    // so count it here instead.
+    if event.kind == EventKind::SkillLoad
+        && event
+            .skill_name
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
+        obs.lines_skipped += 1;
+        return true;
+    }
+    // Normalize payload-controlled fields to the bounds the event
+    // constructors apply; a contract-shaped log line can otherwise carry
+    // unbounded strings into downstream map keys.
+    event.session_id = events::sanitize_session_id(&event.session_id);
+    event.skill_path = event.skill_path.map(|p| p.chars().take(1024).collect());
+    event.tool = event.tool.map(|t| t.chars().take(256).collect());
+    event.skill_name = event.skill_name.map(|n| n.chars().take(256).collect());
     // `recommended` item constraints apply whenever the field is present,
     // not only on recommendation events (schema property-level rule).
     // Names must be non-empty valid skill names; items may carry only

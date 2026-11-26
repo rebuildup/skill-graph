@@ -107,11 +107,13 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
 fn corpus_root(size: usize) -> Result<PathBuf, String> {
     // Private tempdir: a predictable shared-/tmp path would let another
     // local user pre-plant SKILL.md symlinks and redirect the writes.
-    let root = tempfile::Builder::new()
+    let tmp = tempfile::Builder::new()
         .prefix("skill-graph-perf-")
         .tempdir()
-        .map_err(|e| e.to_string())?
-        .keep();
+        .map_err(|e| e.to_string())?;
+    // Keep the TempDir guard until success: keep()ing up front would leak
+    // the corpus into /tmp when corpus generation fails partway.
+    let root = tmp.path();
     for index in 0..size {
         let name = format!("perf-skill-{index:04}");
         let description = if index == 0 {
@@ -136,7 +138,7 @@ fn corpus_root(size: usize) -> Result<PathBuf, String> {
         fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         fs::write(dir.join("SKILL.md"), content).map_err(|err| err.to_string())?;
     }
-    Ok(root)
+    Ok(tmp.keep())
 }
 
 fn percentile(samples: &[Duration], p: f64) -> f64 {

@@ -44,6 +44,25 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 - event log の JSONL 行は `kind` / `schema_version` を持つ行のみ
   contract イベントとして deserialize され、`schema_version` が
   `SCHEMA_VERSION` と一致しない行は `lines_skipped` に計上される。
+- passthrough event の `session_id` / `skill_path` / `tool` /
+  `skill_name` は emit 側 constructor と同じ上限に正規化される
+  （`session_id` は `[A-Za-z0-9._-]`・128 文字、`skill_path` 1024、
+  `tool`/`skill_name` 256 文字）。`recommended[].name` は schema の
+  `minLength: 1` より厳しく valid skill name を要求する — schema 適合でも
+  観測側の join キーにならない名前は `lines_skipped` に計上される。
+- `detect` は 1 payload あたり最大 64 event を emit する
+  （`MAX_EVENTS_PER_PAYLOAD`）。超過分は打ち切られ、通知はない。
+- dedup event の記録は adapter 固有: Rust hook は repeat を
+  `emitted:false, reason:"dedup_skip"` の recommendation event として
+  残すが、OpenCode plugin は dedup 時に event を出さない。`reason`
+  語彙と dedup event の有無は runtime 間で一致せず、delivery_rate の
+  分母構造が異なる（pilot spec は runtime 間比較を前提としない）。
+  plugin の `emitted` は injection キュー投入時点の値であり、context
+  hook での実注入までは保証しない（pending FIFO eviction で未注入に
+  なりうる）。
+- `observe --summary` の `by_session` は `(runtime, session_id)` キーの
+  辞書順先頭 500 session まで。`collection_errors` / `errors` /
+  `errors_omitted` / `by_session_omitted` で打ち切り・収集失敗を通知する。
 
 ## Skill Usage Event（v1）
 

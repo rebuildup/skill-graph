@@ -84,14 +84,10 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             text
         })
         .collect();
-    // Body text gets the same glossary expansion so English query terms can
-    // reach Japanese-heavy skill bodies. Expansion is appended, never
-    // rewritten, so original text still matches verbatim.
-    let skill_bodies: Vec<String> = graph
-        .skills
-        .iter()
-        .map(|skill| expand_gloss(&skill.body_text.to_lowercase()))
-        .collect();
+    // Body text is expanded lazily inside the admitted-only loop below:
+    // expand_gloss runs ~290 substring scans per body and bodies can be
+    // ~1 MiB each, so building this for every corpus skill up front would
+    // dominate recommend() even though non-admitted bodies are never read.
     // Recommendation identity is the skill name: duplicate installs of the
     // same skill across roots collapse to one candidate. The representative is
     // the first copy without a parse error (discovery order is deterministic).
@@ -273,26 +269,23 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
     // Body-text weak evidence applies only to admitted skills: it can
     // raise an admitted skill's rank but cannot admit a skill by itself,
-    // so scanning ~1 MiB bodies for non-admitted skills is wasted work.
+    // so expanding ~1 MiB bodies for non-admitted skills is wasted work.
+    // Glossary expansion is appended, never rewritten, so original text
+    // still matches verbatim.
     for &index in admitted.keys() {
         let Some(info) = infos[index].as_mut() else {
             continue;
         };
-        info.weak += field_score(
-            &query,
-            &query_terms,
-            &skill_bodies[index],
-            2.0,
-            "body",
-            &mut info.reasons,
-        ) + field_score(
-            &context,
-            &context_terms,
-            &skill_bodies[index],
-            1.0,
-            "context+body",
-            &mut info.reasons,
-        );
+        let body = expand_gloss(&graph.skills[index].body_text.to_lowercase());
+        info.weak += field_score(&query, &query_terms, &body, 2.0, "body", &mut info.reasons)
+            + field_score(
+                &context,
+                &context_terms,
+                &body,
+                1.0,
+                "context+body",
+                &mut info.reasons,
+            );
     }
 
     let mut out: Vec<Recommendation> = infos
