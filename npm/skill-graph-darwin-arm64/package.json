@@ -1,0 +1,13 @@
+{
+  "name": "@rebuildup/skill-graph-darwin-arm64",
+  "version": "0.4.0",
+  "description": "skill-graph native binary for darwin/arm64",
+  "license": "MIT",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "files": ["bin/skill-graph"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rebuildup/skill-graph.git"
+  }
+}
