@@ -6,13 +6,14 @@
 # removes exactly the entries whose command references skill-graph.
 #
 # Usage:
-#   install.sh <claude-code|codex> [--user|--project] [--dry-run]
-#   install.sh <claude-code|codex> --uninstall [--user|--project]
+#   install.sh <claude-code|codex|opencode> [--user|--project] [--dry-run]
+#   install.sh <claude-code|codex|opencode> --uninstall [--user|--project]
 #
 # Env:
 #   SKILL_GRAPH_HOME   repo/dist root containing bin/skill-graph and adapters/
 #                      (default: parent dir of this script's repo layout,
 #                      i.e. two levels up)
+#   XDG_CONFIG_HOME    opencode --user config dir override (default ~/.config)
 set -euo pipefail
 
 usage() { sed -n '2,20p' "$0"; exit "${1:-0}"; }
@@ -20,7 +21,7 @@ usage() { sed -n '2,20p' "$0"; exit "${1:-0}"; }
 runtime="" scope="--user" uninstall=0 dry=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    claude-code|codex) runtime="$1" ;;
+    claude-code|codex|opencode) runtime="$1" ;;
     --user|--project) scope="$1" ;;
     --uninstall) uninstall=1 ;;
     --dry-run) dry=1 ;;
@@ -44,17 +45,49 @@ case "$runtime:$scope" in
   claude-code:--project) hooks_file="$PWD/.claude/settings.json" ;;
   codex:--user)          hooks_file="${CODEX_HOME:-$HOME/.codex}/hooks.json" ;;
   codex:--project)       hooks_file="$PWD/.codex/hooks.json" ;;
+  opencode:--user)       cfg_file="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/opencode.json" ;;
+  opencode:--project)    cfg_file="$PWD/opencode.json" ;;
 esac
 
-adapter_bin="$here/$runtime/skill-graph/bin/skill-graph-recommend-hook"
-[ -f "$adapter_bin" ] || { echo "adapter script missing: $adapter_bin" >&2; exit 1; }
-adapter_bin="$(cd "$(dirname "$adapter_bin")" && pwd)/$(basename "$adapter_bin")"
+if [ "$runtime" = opencode ]; then
+  hooks_file="$cfg_file"
+  plugin_dir="$here/opencode/skill-graph"
+  [ -f "$plugin_dir/index.ts" ] || { echo "opencode plugin missing: $plugin_dir" >&2; exit 1; }
+  plugin_dir="$(cd "$plugin_dir" && pwd)"
+  plugin_spec="file://$plugin_dir"
+fi
+
+if [ "$runtime" != opencode ]; then
+  adapter_bin="$here/$runtime/skill-graph/bin/skill-graph-recommend-hook"
+  [ -f "$adapter_bin" ] || { echo "adapter script missing: $adapter_bin" >&2; exit 1; }
+  adapter_bin="$(cd "$(dirname "$adapter_bin")" && pwd)/$(basename "$adapter_bin")"
+fi
 
 mktemp_json() { mktemp "${TMPDIR:-/tmp}/skill-graph-install.XXXXXX.json"; }
 
 if [ "$uninstall" = 1 ]; then
-  [ -f "$hooks_file" ] || { echo "no hooks file: $hooks_file"; exit 0; }
+  [ -f "$hooks_file" ] || { echo "no config file: $hooks_file"; exit 0; }
   tmp="$(mktemp_json)"
+  # A config reduced to {} carries no information; remove it so uninstall
+  # fully restores the pre-install state (no stray empty files).
+  finish_uninstall() {
+    if jq -e 'keys | length == 0' "$tmp" >/dev/null; then
+      rm -f "$hooks_file"
+    else
+      mv "$tmp" "$hooks_file"
+    fi
+    rm -f "$tmp"
+  }
+  if [ "$runtime" = opencode ]; then
+    # Drop our plugin specifier, then prune an emptied plugins array.
+    jq --arg p "$plugin_spec" '
+      .plugins = ((.plugins // []) | map(select(. != $p)))
+      | if (.plugins | length) == 0 then del(.plugins) else . end
+    ' "$hooks_file" > "$tmp"
+    finish_uninstall
+    echo "uninstalled skill-graph plugin from $hooks_file"
+    exit 0
+  fi
   # Drop hook command objects referencing our adapter, then prune emptied
   # matcher groups and event arrays. Other hooks are untouched.
   jq --arg m "$adapter_bin" '
@@ -63,16 +96,21 @@ if [ "$uninstall" = 1 ]; then
         | select((.hooks | length) > 0))
     ) | with_entries(select(.value | length > 0)))
     | if (.hooks | length) == 0 then del(.hooks) else . end
-  ' "$hooks_file" > "$tmp" && mv "$tmp" "$hooks_file"
+  ' "$hooks_file" > "$tmp"
+  finish_uninstall
   echo "uninstalled skill-graph hooks from $hooks_file"
   exit 0
 fi
 
-# Build the hooks fragment with absolute paths substituted. The adapter
+# Build the config fragment with absolute paths substituted. The adapter
 # script is the hook entrypoint; SKILL_GRAPH_BIN points it at the CLI
-# binary so nothing needs to be on PATH.
+# binary so nothing needs to be on PATH. OpenCode has no hooks.json — its
+# extension point is a TS plugin listed in opencode.json `plugins`.
 frag="$(mktemp_json)"
 case "$runtime" in
+  opencode)
+    jq -n --arg p "$plugin_spec" '{plugins: [$p]}' > "$frag"
+    ;;
   claude-code)
     jq -n --arg h "$adapter_bin" --arg sg "$bin" '{
       hooks: {
@@ -103,6 +141,17 @@ merge() {
     echo "--- would merge into $target ---"; cat "$fragment"; return 0
   fi
   mkdir -p "$(dirname "$target")"
+  if [ "$runtime" = opencode ]; then
+    # Append our plugin specifier once, preserving other plugins and keys.
+    if [ -f "$target" ]; then
+      jq --arg p "$plugin_spec" '
+        .plugins = (((.plugins // []) | map(select(. != $p))) + [$p])
+      ' "$target" > "$target.new" && mv "$target.new" "$target"
+    else
+      jq -n --arg p "$plugin_spec" '{plugins: [$p]}' > "$target"
+    fi
+    return 0
+  fi
   # Append our matcher groups per event; first drop any existing entries that
   # already reference this adapter so re-running install is idempotent and
   # other hooks in the same event are preserved.
@@ -126,4 +175,6 @@ merge "$hooks_file" "$frag"
 rm -f "$frag"
 echo "installed skill-graph ($runtime, $scope) -> $hooks_file"
 echo "binary: $bin"
-[ "$runtime" = codex ] && echo "note: trust the new hooks via /hooks in Codex"
+if [ "$runtime" = codex ]; then
+  echo "note: trust the new hooks via /hooks in Codex"
+fi
