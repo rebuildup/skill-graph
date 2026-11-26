@@ -277,6 +277,28 @@ fn skill_usage_events_validate_against_event_schema() {
     }
 }
 
+/// Passthrough events are the path that consumes untrusted input —
+/// every retained event must still serialize to a schema-valid
+/// skill-usage-event instance after normalization.
+#[test]
+fn passthrough_events_validate_against_event_schema() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let lines = [
+        r#"{"schema_version":1,"kind":"prompt_submit","runtime":"claude-code","session_id":"s1","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","prompt_hash":"abc123"}"#,
+        r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-01-01T00:00:01Z","observed_via":"plugin","trigger":"prompt_submit","recommended":[{"name":"alpha-skill","digest":"d1"},{"name":"beta-skill"}],"emitted":true,"reason":"recommended","recommend_ms":42}"#,
+        r#"{"schema_version":1,"kind":"skill_load","runtime":"opencode","session_id":"!!!invalid!!!","timestamp":"","observed_via":"db","skill_name":"gamma-skill","skill_path":"/x/SKILL.md","skill_digest":"dd","detection":"file_read","confidence":"high","tool":"Read"}"#,
+    ];
+    let path = dir.path().join("events.jsonl");
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    let obs = skill_graph::observe::observe_path(dir.path()).unwrap();
+    assert_eq!(obs.events.len(), 3, "events: {:?}", obs.events);
+    let schema = include_str!("../contracts/v1/skill-usage-event.schema.json");
+    for e in &obs.events {
+        let v = serde_json::to_value(e).unwrap();
+        assert_schema_valid(schema, &v, "passthrough-event");
+    }
+}
+
 #[test]
 fn contract_schemas_reject_invalid_instances() {
     use serde_json::json;

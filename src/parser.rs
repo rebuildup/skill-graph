@@ -88,48 +88,75 @@ struct Frontmatter {
     allowed_tools: Option<String>,
 }
 
-pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
-    let meta_len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if meta_len > MAX_SKILL_BYTES {
-        let dir_name = path
-            .parent()
-            .and_then(|p| p.file_name())
-            .map(|s| s.to_string_lossy().into_owned())
-            .filter(|n| valid_skill_name(n))
-            // Include a path hash so unrelated oversized files don't
-            // collapse onto one ambiguous name.
-            .unwrap_or_else(|| {
-                let h = hex_digest(path.to_string_lossy().as_bytes());
-                format!("invalid-oversized-{}", &h[..8])
-            });
-        // Non-empty placeholder: skill-summary.schema.json requires
-        // digest minLength 1 even for parse-error skills.
-        let placeholder: String =
-            format!("unread-{}", dir_name.chars().take(8).collect::<String>());
-        return Ok(Skill {
-            name: dir_name,
-            description: String::new(),
-            keywords: Vec::new(),
-            path: path.to_path_buf(),
-            root: root.to_path_buf(),
-            digest: placeholder,
-            metadata: HashMap::new(),
-            links: Vec::new(),
-            body_text: String::new(),
-            parse_error: Some(format!("SKILL.md exceeds {} bytes", MAX_SKILL_BYTES)),
+/// Read at most `MAX_SKILL_BYTES + 1` bytes. The size cap is enforced
+/// on bytes actually read — pre-read metadata can be falsified by a
+/// file that grows between `metadata()` and `read()`, is swapped, or
+/// lives on a filesystem reporting misleading sizes.
+fn read_skill_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut buf = Vec::new();
+    file.take(MAX_SKILL_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(buf)
+}
+
+/// Placeholder skill for files over `MAX_SKILL_BYTES`: keeps discovery
+/// total and gives consumers a stable (non-spec) name plus a digest
+/// minLength-1 placeholder per skill-summary.schema.json.
+fn oversized_skill(path: &Path, root: &Path) -> Skill {
+    let dir_name = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|n| valid_skill_name(n))
+        // Include a path hash so unrelated oversized files don't
+        // collapse onto one ambiguous name.
+        .unwrap_or_else(|| {
+            let h = hex_digest(path.to_string_lossy().as_bytes());
+            format!("invalid-oversized-{}", &h[..8])
         });
+    let placeholder: String = format!("unread-{}", dir_name.chars().take(8).collect::<String>());
+    Skill {
+        name: dir_name,
+        description: String::new(),
+        keywords: Vec::new(),
+        path: path.to_path_buf(),
+        root: root.to_path_buf(),
+        digest: placeholder,
+        metadata: HashMap::new(),
+        links: Vec::new(),
+        body_text: String::new(),
+        parse_error: Some(format!("SKILL.md exceeds {} bytes", MAX_SKILL_BYTES)),
     }
-    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+}
+
+pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
+    let bytes = read_skill_bytes(path)?;
+    if bytes.len() as u64 > MAX_SKILL_BYTES {
+        return Ok(oversized_skill(path, root));
+    }
     let digest = hex_digest(&bytes);
     let text = String::from_utf8_lossy(&bytes);
-    let (frontmatter, body) = split_frontmatter(&text);
+    let (frontmatter, body, unterminated) = match split_frontmatter(&text) {
+        FmSplit::Absent(body) => ("", body, false),
+        FmSplit::Present(fm, body) => (fm, body, false),
+        FmSplit::Unterminated(body) => ("", body, true),
+    };
 
-    let mut parse_error = None;
+    let mut parse_error = unterminated.then(|| "unterminated frontmatter fence".to_string());
     let mut meta = Frontmatter::default();
     if !frontmatter.trim().is_empty() {
         match serde_yaml::from_str::<Frontmatter>(frontmatter) {
             Ok(parsed) => meta = parsed,
-            Err(err) => parse_error = Some(format!("frontmatter: {err}")),
+            Err(err) => {
+                let msg = format!("frontmatter: {err}");
+                parse_error = Some(match parse_error {
+                    Some(prev) => format!("{prev}; {msg}"),
+                    None => msg,
+                });
+            }
         }
     }
 
@@ -235,16 +262,29 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
     })
 }
 
-fn split_frontmatter(text: &str) -> (&str, &str) {
+/// Frontmatter split result. `Unterminated` is distinct from `Absent`:
+/// an opening `---` fence that never closes is malformed metadata —
+/// treating it as "no frontmatter" would silently drop name/description
+/// and let the whole file become body text.
+enum FmSplit<'a> {
+    /// No opening fence; the payload is body text.
+    Absent(&'a str),
+    /// Well-formed block: (yaml text, body text).
+    Present(&'a str, &'a str),
+    /// Opening fence present but never closed; payload is body text.
+    Unterminated(&'a str),
+}
+
+fn split_frontmatter(text: &str) -> FmSplit<'_> {
     // Tolerate a UTF-8 BOM and leading blank lines before the fence.
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let text = text.trim_start_matches(['\n', '\r']);
     let Some(rest) = text.strip_prefix("---") else {
-        return ("", text);
+        return FmSplit::Absent(text);
     };
     // The opening fence must be `---` alone on its line.
     if !(rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n")) {
-        return ("", text);
+        return FmSplit::Absent(text);
     }
     // The closing fence must be `---` alone on its line; `find("\n---")`
     // would also accept `---x`/`--- extra` and fences inside YAML block
@@ -259,7 +299,7 @@ fn split_frontmatter(text: &str) -> (&str, &str) {
         offset += line.len();
     }
     let Some((fence_start, fence_end)) = fence else {
-        return ("", text);
+        return FmSplit::Unterminated(text);
     };
     let fm = &rest[..fence_start];
     let frontmatter = fm
@@ -271,7 +311,7 @@ fn split_frontmatter(text: &str) -> (&str, &str) {
         .strip_prefix('\n')
         .or_else(|| after.strip_prefix("\r\n"))
         .unwrap_or(after);
-    (frontmatter, body)
+    FmSplit::Present(frontmatter, body)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -351,6 +391,25 @@ mod tests {
         );
         let skill = parse_skill(&path, dir.path()).unwrap();
         assert_eq!(skill.keywords[0].chars().count(), 128);
+    }
+
+    #[test]
+    fn unterminated_frontmatter_is_a_parse_error_not_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken").join("SKILL.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Opening fence with no closing fence: previously parsed as "no
+        // frontmatter" with name falling back silently.
+        std::fs::write(
+            &path,
+            "---\nname: broken-skill\ndescription: d\nbody without end\n",
+        )
+        .unwrap();
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert_eq!(
+            skill.parse_error.as_deref(),
+            Some("unterminated frontmatter fence")
+        );
     }
 
     #[test]

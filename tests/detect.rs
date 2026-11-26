@@ -197,3 +197,63 @@ fn detect_exec_tool_extracts_js_commands() {
     assert_eq!(event["kind"], "skill_load");
     assert_eq!(event["skill_name"], "alpha-skill");
 }
+
+/// Exec-branch dedup keys on skill identity and keeps the strongest
+/// classification: `grep` (mention) before `cat` (file_read) on the same
+/// SKILL.md must not shadow the verified read — and one path must not
+/// emit two events under different derived names.
+#[test]
+fn detect_exec_dedup_keeps_strongest_classification() {
+    let payload = json!({
+        "tool_name": "exec",
+        "tool_input": {"input": "await exec_command({cmd: \"grep foo /repo/skills/x-skill/SKILL.md\"})\nawait exec_command({cmd: \"cat /repo/skills/x-skill/SKILL.md\"})"},
+        "tool_response": "---\nname: x-real\n---\nbody",
+        "session_id": "s-exec-dedup"
+    });
+    let (out, rc) = run_detect(
+        &["detect", "--runtime", "codex", "--via", "hook"],
+        &payload.to_string(),
+    );
+    assert_eq!(rc, 0, "{out}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected one deduped event: {out}");
+    let event: Value = serde_json::from_str(lines[0]).expect("event json");
+    assert_eq!(event["detection"], "file_read");
+    assert_eq!(event["skill_name"], "x-real");
+}
+
+/// One tool output covering several SKILL.md reads: the frontmatter
+/// block belongs to the first file emitted — later reads must fall back
+/// to path-derived classification instead of inheriting the wrong name.
+#[test]
+fn detect_multi_skill_md_output_attributes_frontmatter_to_first_only() {
+    let payload = json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat /repo/skills/alpha/SKILL.md /repo/skills/beta/SKILL.md"},
+        "tool_response": "---\nname: alpha-real\n---\nalpha body\n---\nname: beta-real\n---\nbeta body",
+        "session_id": "s-multi"
+    });
+    let (out, rc) = run_detect(
+        &["detect", "--runtime", "claude-code", "--via", "hook"],
+        &payload.to_string(),
+    );
+    assert_eq!(rc, 0, "{out}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected two events: {out}");
+    let events: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("event json"))
+        .collect();
+    let first = events
+        .iter()
+        .find(|e| e["skill_path"] == "/repo/skills/alpha/SKILL.md")
+        .expect("alpha event");
+    assert_eq!(first["skill_name"], "alpha-real");
+    assert_eq!(first["detection"], "file_read");
+    let second = events
+        .iter()
+        .find(|e| e["skill_path"] == "/repo/skills/beta/SKILL.md")
+        .expect("beta event");
+    assert_eq!(second["skill_name"], "beta");
+    assert_eq!(second["detection"], "path_reference");
+}

@@ -85,6 +85,8 @@ fn run_size_inner(root: &PathBuf, size: usize, iterations: usize) -> Result<Valu
             .args([
                 "recommend",
                 QUERY,
+                "--context",
+                CONTEXT,
                 "--root",
                 root_arg,
                 "--max",

@@ -14,10 +14,34 @@ struct Evidence {
     reasons: Vec<String>,
 }
 
+impl Evidence {
+    fn empty() -> Self {
+        Evidence {
+            direct: 0.0,
+            weak: 0.0,
+            necessity: 0.0,
+            name_hits: Vec::new(),
+            description_hits: Vec::new(),
+            context_hits: Vec::new(),
+            reasons: Vec::new(),
+        }
+    }
+}
+
 // Agent-controlled input (hook stdin, --query-stdin, MCP args) must not
 // turn term extraction into unbounded work: cap raw text and unique terms.
 const MAX_RECOMMEND_INPUT_CHARS: usize = 32 * 1024;
 const MAX_RECOMMEND_TERMS: usize = 1024;
+
+/// Global term×byte work budget for the matching/admission phase.
+/// Input caps bound query size and corpus size independently, but
+/// skills × terms × field_bytes can still reach hundreds of GB of
+/// substring scans before admission or the body budget is reached.
+/// Past this budget later skills are skipped in deterministic index
+/// order, uncomputed df terms count as non-rare, and glossary
+/// expansion is skipped corpus-wide — under-admission on absurd
+/// inputs beats a hang (#144 round-10).
+const MAX_MATCH_TERM_WORK: usize = 1024 * 1024 * 1024;
 
 pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<Recommendation> {
     let query = query
@@ -44,31 +68,19 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         query_tagged.into_iter().take(MAX_RECOMMEND_TERMS).collect();
     let query_terms: Vec<String> = query_tagged.iter().map(|(t, _)| t.clone()).collect();
     let query_sources = term_sources(&query_tagged);
-    let context_terms: Vec<String> = terms(&context)
+    // Context terms carry provenance too: a single CJK run's bigram
+    // cluster must not satisfy context admission by itself, same rule
+    // as description admission (#144 round-10).
+    let context_tagged: Vec<(String, String)> = terms_tagged(&context)
         .into_iter()
         .take(MAX_RECOMMEND_TERMS)
         .collect();
+    let context_terms: Vec<String> = context_tagged.iter().map(|(t, _)| t.clone()).collect();
+    let context_sources = term_sources(&context_tagged);
     let skill_names: Vec<String> = graph
         .skills
         .iter()
         .map(|skill| skill.name.to_lowercase())
-        .collect();
-    // Match text for description-level evidence: the description plus any
-    // declared `keywords` (e.g. translations or aliases). Keywords are
-    // opt-in frontmatter, so corpus df stays honest. CJK substrings are
-    // additionally expanded through the built-in glossary so Japanese
-    // descriptions remain reachable from English query terms (#78).
-    let skill_descriptions: Vec<String> = graph
-        .skills
-        .iter()
-        .map(|skill| {
-            let mut text = skill.description.to_lowercase();
-            for keyword in &skill.keywords {
-                text.push(' ');
-                text.push_str(&keyword.to_lowercase());
-            }
-            expand_gloss(&text)
-        })
         .collect();
     // Unexpanded description text: context-level admission counts hits here
     // only, so glossary expansion cannot inflate the weakest signal (#78).
@@ -84,6 +96,27 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             text
         })
         .collect();
+    // Glossary expansion costs ~|GLOSS| substring scans per CJK-containing
+    // description; on a max-size corpus that alone can dwarf the match
+    // budget. Estimate first and degrade uniformly (literal text only)
+    // rather than hanging or expanding an arbitrary prefix.
+    let skill_descriptions: Vec<String> = {
+        // gloss_terms scans every GLOSS key for ANY non-ASCII text
+        // (its fast path is is_ascii, not is_cjk) — count all of it.
+        let cjk_work: usize = skill_descriptions_base
+            .iter()
+            .filter(|d| !d.is_ascii())
+            .map(|d| d.len().saturating_mul(GLOSS.len()))
+            .fold(0usize, usize::saturating_add);
+        if cjk_work <= MAX_MATCH_TERM_WORK {
+            skill_descriptions_base
+                .iter()
+                .map(|d| expand_gloss(d))
+                .collect()
+        } else {
+            skill_descriptions_base.clone()
+        }
+    };
     // Body text is expanded lazily inside the admitted-only loop below:
     // expand_gloss runs ~290 substring scans per body and bodies can be
     // ~1 MiB each, so building this for every corpus skill up front would
@@ -113,9 +146,27 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
+    let mut match_work = 0usize;
 
     for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
+            continue;
+        }
+        // Charge this skill's estimated term×byte scan cost against the
+        // global budget before matching anything: name+description are
+        // scanned once per query term and once per context term for
+        // scoring AND again for the hit lists, and every link target is
+        // matched against the whole query. Skills past the budget keep
+        // `infos[index] = None` and cannot be admitted — deterministic
+        // index order, same degrade direction as the body budget.
+        let scan_terms = query_terms.len() + context_terms.len();
+        let link_bytes: usize = skill.links.iter().map(|l| l.target.len()).sum();
+        let skill_work = scan_terms
+            .saturating_mul(2)
+            .saturating_mul(skill_names[index].len() + skill_descriptions[index].len())
+            .saturating_add(link_bytes);
+        match_work = match_work.saturating_add(skill_work);
+        if match_work > MAX_MATCH_TERM_WORK {
             continue;
         }
         let name_lower = &skill_names[index];
@@ -192,15 +243,23 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             .cloned()
             .collect::<Vec<_>>();
 
-        infos[index] = Some(Evidence {
-            direct,
-            weak,
-            necessity: 0.0,
-            name_hits,
-            description_hits,
-            context_hits,
-            reasons,
-        });
+        // Materialize Evidence only for skills carrying signal: direct or
+        // weak score > 0 covers every hit (each hit field is a subset of a
+        // scored field), and skills with no signal can never be admitted or
+        // ranked — requires-admitted targets get a zeroed Evidence on
+        // demand in the propagation loop below. This keeps per-skill hit
+        // and reason vectors from being retained for the whole corpus.
+        if direct > 0.0 || weak > 0.0 {
+            infos[index] = Some(Evidence {
+                direct,
+                weak,
+                necessity: 0.0,
+                name_hits,
+                description_hits,
+                context_hits,
+                reasons,
+            });
+        }
     }
 
     // Document frequency is needed only for admission decisions on terms
@@ -223,6 +282,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         &skill_names,
         &skill_descriptions,
         hit_terms.iter().copied(),
+        &mut match_work,
     );
 
     // Admission is structural, not score-based:
@@ -238,9 +298,21 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
     for (index, info) in infos.iter().enumerate() {
-        if info.as_ref().is_some_and(|info| {
-            directly_admitted(info, &query_sources, &document_frequency, df_bound)
-        }) {
+        // An exact name match is the strongest possible signal and admits
+        // even names too short to survive term extraction (e.g. a 1-char
+        // ASCII name produces no query terms at all).
+        let exact_name = !query.is_empty() && skill_names[index] == query;
+        if exact_name
+            || info.as_ref().is_some_and(|info| {
+                directly_admitted(
+                    info,
+                    &query_sources,
+                    &context_sources,
+                    &document_frequency,
+                    df_bound,
+                )
+            })
+        {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
@@ -262,11 +334,22 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                     continue;
                 }
                 let is_seed = infos[target].as_ref().is_some_and(|info| {
-                    directly_admitted(info, &query_sources, &document_frequency, df_bound)
+                    directly_admitted(
+                        info,
+                        &query_sources,
+                        &context_sources,
+                        &document_frequency,
+                        df_bound,
+                    )
                 });
                 let entry = admitted.entry(target).or_default();
                 entry.push(format!("required by {}", graph.skills[*seed].name));
-                if !is_seed && let Some(info) = infos[target].as_mut() {
+                if !is_seed {
+                    // A requires target with no query signal has no stored
+                    // Evidence; materialize a zeroed one so the necessity
+                    // bump and recommendation emission behave exactly as
+                    // before the deferred-materialization change.
+                    let info = infos[target].get_or_insert_with(Evidence::empty);
                     info.necessity += 2.0;
                 }
             }
@@ -379,6 +462,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 fn directly_admitted(
     info: &Evidence,
     query_sources: &HashMap<String, String>,
+    context_sources: &HashMap<String, String>,
     document_frequency: &HashMap<String, usize>,
     df_bound: usize,
 ) -> bool {
@@ -415,7 +499,20 @@ fn directly_admitted(
     let description_admitted = info.description_hits.len() >= 2
         && description_sources.len() >= 2
         && info.description_hits.iter().any(|term| rare(term));
-    let context_admitted = info.context_hits.len() >= 2;
+    // Context admission applies the same independence rule: hits must
+    // come from at least two distinct provenance sources, so one CJK
+    // run's bigram cluster cannot self-admit through context (#144).
+    let context_hit_sources: HashSet<&str> = info
+        .context_hits
+        .iter()
+        .map(|term| {
+            context_sources
+                .get(term)
+                .map(String::as_str)
+                .unwrap_or(term.as_str())
+        })
+        .collect();
+    let context_admitted = info.context_hits.len() >= 2 && context_hit_sources.len() >= 2;
     multiple_name_hits
         || unique_name_hit
         || name_plus_description
@@ -429,13 +526,30 @@ fn document_frequency<'a>(
     skill_names: &[String],
     skill_descriptions: &[String],
     terms: impl Iterator<Item = &'a str>,
+    match_work: &mut usize,
 ) -> HashMap<String, usize> {
     let mut unique = HashSet::new();
     for term in terms {
         unique.insert(term);
     }
+    // Deterministic degradation order under budget exhaustion.
+    let mut unique: Vec<&str> = unique.into_iter().collect();
+    unique.sort_unstable();
+    // Per-term cost is bounded by scanning every candidate's
+    // name+description; charge the full field bytes (any() short-
+    // circuits on a match, so this overestimates — acceptable for a
+    // heuristic budget). Uncomputed terms stay absent from the map and
+    // read as non-rare via the df() fallback.
+    let field_bytes: usize = candidates
+        .iter()
+        .map(|&i| skill_names[i].len() + skill_descriptions[i].len())
+        .sum();
     let mut frequencies = HashMap::new();
     for term in unique {
+        *match_work = match_work.saturating_add(field_bytes);
+        if *match_work > MAX_MATCH_TERM_WORK {
+            break;
+        }
         // df counts distinct skill names: a term matches a name when any
         // installed copy of that name contains it, so duplicate installs do
         // not inflate frequency.
@@ -695,6 +809,7 @@ const STOPWORDS: &[&str] = &[
     "yourselves",
 ];
 
+#[cfg(test)]
 fn terms(text: &str) -> Vec<String> {
     terms_tagged(text)
         .into_iter()
@@ -729,21 +844,30 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // CJK has no whitespace and no case: emit character bigrams so
         // substring matching works against Japanese descriptions (#61),
         // plus English glossary terms for known dev vocabulary so queries
-        // can reach English-only skill text (#78). Bigram terms share the
-        // whole run as provenance — one run's bigram cluster is a single
-        // piece of literal-text evidence and cannot satisfy the
-        // two-independent-sources admission rule by itself (#144). Gloss
-        // expansions keep per-key provenance: distinct dictionary words
-        // inside one run (e.g. 不具合…再現) are independent evidence, while
-        // a lone word still collapses to one source because its bigram
-        // source equals the key string.
+        // can reach English-only skill text (#78). Provenance is scoped
+        // to the evidence unit: a bigram inside a recognized dictionary
+        // word shares that word's source, bigrams outside every key (and
+        // spanning key boundaries) share the whole run, and gloss
+        // expansions keep their key. One CJK word's literal bigrams and
+        // its gloss expansion are therefore ONE evidence unit and cannot
+        // satisfy the two-independent-sources admission rule by
+        // themselves; distinct dictionary words in one run (e.g.
+        // 不具合…再現) remain independent (#144).
         let run: String = cjk.chars().collect();
+        let gloss = gloss_terms(&run);
+        let keys: Vec<&str> = gloss.iter().map(|(_, key)| key.as_str()).collect();
         let chars: Vec<char> = run.chars().collect();
         for window in chars.windows(2) {
             let bigram: String = window.iter().collect();
-            out.push((bigram, run.clone()));
+            let source = keys
+                .iter()
+                .filter(|key| key.contains(bigram.as_str()))
+                .min_by_key(|key| key.len())
+                .map(|key| (*key).to_string())
+                .unwrap_or_else(|| run.clone());
+            out.push((bigram, source));
         }
-        for (gloss, key) in gloss_terms(&run) {
+        for (gloss, key) in gloss {
             if !STOPWORDS.contains(&gloss.as_str()) {
                 out.push((gloss, key));
             }
@@ -1182,12 +1306,15 @@ mod tests {
     fn cjk_provenance_splits_bigrams_from_gloss_keys() {
         let tagged = terms_tagged("文章を自然にしたい");
         let sources = term_sources(&tagged);
-        // Round-9: the run's bigram cluster shares the whole run as one
-        // provenance, while each glossary expansion keeps its dictionary
-        // key — distinct words in one run are independent evidence.
+        // Round-10: provenance is scoped to the evidence unit — a bigram
+        // inside a recognized dictionary word shares that word's source
+        // (so the word's literal bigrams and its gloss expansion count as
+        // ONE evidence unit), bigrams outside every key share the run,
+        // and distinct words in one run stay independent.
         let run = "文章を自然にしたい";
-        assert_eq!(sources.get("文章").map(String::as_str), Some(run));
+        assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("章を").map(String::as_str), Some(run));
+        assert_eq!(sources.get("自然").map(String::as_str), Some("自然"));
         assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
     }

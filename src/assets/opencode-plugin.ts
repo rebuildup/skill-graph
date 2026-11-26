@@ -28,11 +28,14 @@ const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
 // NOSTATE suppresses debug output too: no diagnostics are persisted.
 const DBG = process.env.SKILL_GRAPH_DEBUG === "1" && !NOSTATE
 const dbg = (m: string) => { if (DBG) try { console.error(`[skill-graph] ${m}`) } catch {} }
-// Mirror the Rust hook's env parsing: positive integers only, anything
-// else falls back to the default.
+// Mirror the Rust hook's env parsing: `parse::<u64>()` accepts only
+// decimal digits, so anything else — floats, hex, exponents, signs,
+// whitespace — falls back to the default on both entry points.
 function envUint(name: string, fallback: number): number {
-  const n = Number(process.env[name])
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+  const raw = process.env[name]
+  if (raw === undefined || !/^[0-9]+$/.test(raw)) return fallback
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n >= 0 ? n : fallback
 }
 const EVENT_LOG_MAX = envUint("SKILL_GRAPH_EVENT_LOG_MAX", 64 * 1024 * 1024)
 // Bound in-memory state: this plugin lives for the whole OpenCode server
@@ -60,8 +63,13 @@ function validSkillName(name: string): boolean {
 // "unknown" funnel session.
 function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
-  const safe = s.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128)
-  if (safe) return safe
+  const filtered = s.replace(/[^A-Za-z0-9._-]/g, "")
+  // Distinct ids sharing a 128-char prefix must not collapse: bounded
+  // head plus a hash suffix of the original (parity with Rust).
+  if (filtered.length > 128) {
+    return `${filtered.slice(0, 119)}-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 8)}`
+  }
+  if (filtered) return filtered
   if (!s) return ""
   return `unknown-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16)}`
 }

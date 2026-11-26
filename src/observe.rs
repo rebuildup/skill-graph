@@ -402,7 +402,9 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
     event.prompt_hash = event.prompt_hash.map(|h| h.chars().take(128).collect());
     event.skill_digest = event.skill_digest.map(|d| d.chars().take(128).collect());
     event.timestamp = event.timestamp.chars().take(64).collect();
+    event.recommended.truncate(events::MAX_RECOMMENDED);
     for item in &mut event.recommended {
+        item.name = item.name.chars().take(256).collect();
         if let Some(d) = &mut item.digest {
             *d = d.chars().take(128).collect();
         }
@@ -810,20 +812,21 @@ impl CodexScan {
     }
 
     fn finish(self, obs: &mut Observation) {
-        for event in self.injected {
-            record_event(event, obs);
-        }
+        // Emit in encounter (timestamp) order, not collection order:
+        // injected recommendations, prompts, and exec loads are gathered
+        // from different payload types, and downstream funnel logic
+        // falls back to vector order when a timestamp is unparseable.
+        // A stable sort keeps same-timestamp events in feed order.
+        let mut events: Vec<SkillUsageEvent> = Vec::new();
+        events.extend(self.injected);
         for (session, ts, text) in &self.prompts {
-            record_event(
-                SkillUsageEvent::prompt_submit(
-                    Runtime::Codex,
-                    ObservedVia::Transcript,
-                    session,
-                    ts,
-                    text,
-                ),
-                obs,
-            );
+            events.push(SkillUsageEvent::prompt_submit(
+                Runtime::Codex,
+                ObservedVia::Transcript,
+                session,
+                ts,
+                text,
+            ));
         }
         for pending in &self.pending {
             let output = self
@@ -831,9 +834,26 @@ impl CodexScan {
                 .get(&pending.call_id)
                 .map(String::as_str)
                 .unwrap_or("");
+            // One captured output can cover several SKILL.md reads; its
+            // frontmatter block belongs to the first file emitted, so only
+            // the first Read access may claim it.
+            let mut frontmatter_available = true;
             for (path, access) in &pending.accesses {
                 let c = match access {
-                    events::Access::Read => classify_with_output(path, output),
+                    events::Access::Read => {
+                        let verify = frontmatter_available;
+                        frontmatter_available = false;
+                        if verify {
+                            classify_with_output(path, output)
+                        } else {
+                            events::LoadClassification {
+                                skill_name: events::skill_name_from_path(path),
+                                skill_path: Some(path.clone()),
+                                detection: events::Detection::PathReference,
+                                confidence: events::Confidence::Medium,
+                            }
+                        }
+                    }
                     events::Access::Reference => events::LoadClassification {
                         skill_name: events::skill_name_from_path(path),
                         skill_path: Some(path.clone()),
@@ -841,21 +861,22 @@ impl CodexScan {
                         confidence: Confidence::Low,
                     },
                 };
-                record_event(
-                    SkillUsageEvent::skill_load(
-                        Runtime::Codex,
-                        ObservedVia::Transcript,
-                        &pending.session_id,
-                        &pending.timestamp,
-                        Some("exec".to_string()),
-                        c.skill_name,
-                        c.skill_path,
-                        c.detection,
-                        c.confidence,
-                    ),
-                    obs,
-                );
+                events.push(SkillUsageEvent::skill_load(
+                    Runtime::Codex,
+                    ObservedVia::Transcript,
+                    &pending.session_id,
+                    &pending.timestamp,
+                    Some("exec".to_string()),
+                    c.skill_name,
+                    c.skill_path,
+                    c.detection,
+                    c.confidence,
+                ));
             }
+        }
+        events.sort_by_cached_key(|e| rfc3339_ms(&e.timestamp).unwrap_or(i64::MAX));
+        for event in events {
+            record_event(event, obs);
         }
     }
 }
@@ -1304,7 +1325,7 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
     let mut f = Funnel::default();
     // Stable per-session ordering: (timestamp, input order).
     let mut order: Vec<usize> = (0..events.len()).collect();
-    order.sort_by_key(|&i| (rfc3339_ms(&events[i].timestamp).unwrap_or(i64::MAX), i));
+    order.sort_by_cached_key(|&i| (rfc3339_ms(&events[i].timestamp).unwrap_or(i64::MAX), i));
 
     // Top-level counters cover every event, including unattributable
     // ones (empty session_id) — they just never join a session funnel.
@@ -1444,9 +1465,15 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
                 continue;
             }
             let load_ts = timestamps[&li];
+            // When either timestamp is unparseable, fall back to input
+            // (encounter) order — events are collected in transcript/log
+            // order, which is the best available chronology. The
+            // timestamp-sorted position must NOT be used here: missing
+            // timestamps sort to i64::MAX, so a position comparison would
+            // fabricate "missing ts = latest" and invert real ordering.
             let after = match (rec_ts, load_ts) {
                 (Some(a), Some(b)) => b >= a,
-                _ => pos.get(&li).zip(pos.get(&ri)).is_some_and(|(l, r)| l > r),
+                _ => li > ri,
             };
             if !after {
                 continue;
