@@ -99,6 +99,26 @@ const MAX_DISCOVER_ENTRIES: usize = 100_000;
 /// without caps a hostile or pathological tree could exhaust memory.
 const MAX_SKILLS: usize = 10_000;
 const MAX_SKILL_BYTES: u64 = 512 * 1024 * 1024;
+/// Parse/read failures are bounded independently of MAX_SKILLS: they
+/// consume neither the skill nor the byte budget, so an unreadable
+/// corpus would otherwise grow `errors` without limit.
+const MAX_DISCOVER_ERRORS: usize = 1024;
+
+/// Every diagnostic shares one bound — root errors, walk errors,
+/// parse errors, and truncation notices alike — so no input shape can
+/// grow `errors` past MAX_DISCOVER_ERRORS. The last slot is reserved
+/// for the latched truncation notice.
+fn push_discovery_error(errors: &mut Vec<String>, msg: String, noted: &mut bool) {
+    if errors.len() + 1 < MAX_DISCOVER_ERRORS {
+        errors.push(msg);
+    } else if !*noted {
+        *noted = true;
+        errors.push(format!(
+            "further discovery errors truncated at {}",
+            MAX_DISCOVER_ERRORS - 1
+        ));
+    }
+}
 
 pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
@@ -107,22 +127,29 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut seen_files = HashSet::new();
     let mut total_bytes = 0u64;
     let mut capacity_truncated = false;
+    let mut errored = 0usize;
+    let mut errors_noted = false;
 
     for requested in roots {
         if capacity_truncated {
             break;
         }
         let Ok(root) = std::fs::canonicalize(requested) else {
-            errors.push(format!(
-                "root not found or unreadable: {}",
-                requested.display()
-            ));
+            push_discovery_error(
+                &mut errors,
+                format!("root not found or unreadable: {}", requested.display()),
+                &mut errors_noted,
+            );
             continue;
         };
         if !root.is_dir() {
             // An existing non-directory root (e.g. a file path) is an
             // operator/agent error worth surfacing, not a silent skip.
-            errors.push(format!("root is not a directory: {}", requested.display()));
+            push_discovery_error(
+                &mut errors,
+                format!("root is not a directory: {}", requested.display()),
+                &mut errors_noted,
+            );
             continue;
         }
         if !seen_roots.insert(root.clone()) {
@@ -149,13 +176,17 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 Ok(e) => e,
                 Err(err) => {
                     if walk_errors < 100 {
-                        errors.push(format!(
-                            "{}: walk error at {}: {err}",
-                            root.display(),
-                            err.path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_default()
-                        ));
+                        push_discovery_error(
+                            &mut errors,
+                            format!(
+                                "{}: walk error at {}: {err}",
+                                root.display(),
+                                err.path()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_default()
+                            ),
+                            &mut errors_noted,
+                        );
                     }
                     walk_errors += 1;
                     continue;
@@ -183,29 +214,63 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             }
             match parse_skill(path, &root) {
                 Ok(skill) => {
-                    total_bytes += file_bytes;
+                    // Charge retained bytes, not pre-read metadata:
+                    // from_utf8_lossy can expand invalid UTF-8 ~3x and
+                    // a file that grows between metadata() and the
+                    // capped read is undercounted by file_bytes.
+                    let retained = (skill.body_text.len()
+                        + skill.name.len()
+                        + skill.description.len()
+                        + skill.keywords.iter().map(|k| k.len()).sum::<usize>()
+                        + skill
+                            .links
+                            .iter()
+                            .map(|l| l.target.len() + 64)
+                            .sum::<usize>()
+                        + skill.path.as_os_str().len()
+                        + 256) as u64;
+                    total_bytes = total_bytes.saturating_add(retained.max(file_bytes));
                     skills.push(skill);
                 }
-                Err(err) => errors.push(err),
+                Err(err) => {
+                    // Parse failures do not consume the skill/byte caps,
+                    // so bound them separately: an unreadable corpus
+                    // must not grow `errors`/`seen_files` without limit
+                    // in a long-lived MCP server.
+                    errored += 1;
+                    push_discovery_error(&mut errors, err, &mut errors_noted);
+                    if errored >= MAX_SKILLS {
+                        capacity_truncated = true;
+                        break;
+                    }
+                }
             }
         }
         // `consumed` counts every iterator item including walk errors;
         // truncation is about consumed budget, not successfully read entries.
         if consumed >= MAX_DISCOVER_ENTRIES && entries.next().is_some() {
-            errors.push(format!(
-                "{}: entry scan truncated at {} entries",
-                root.display(),
-                MAX_DISCOVER_ENTRIES
-            ));
+            push_discovery_error(
+                &mut errors,
+                format!(
+                    "{}: entry scan truncated at {} entries",
+                    root.display(),
+                    MAX_DISCOVER_ENTRIES
+                ),
+                &mut errors_noted,
+            );
         }
     }
 
     if capacity_truncated {
-        errors.push(format!(
-            "discovery truncated: skill limit {} or total size limit {} MiB reached",
-            MAX_SKILLS,
-            MAX_SKILL_BYTES / (1024 * 1024)
-        ));
+        push_discovery_error(
+            &mut errors,
+            format!(
+                "discovery truncated: skill limit {} or total size limit {} MiB reached",
+                MAX_SKILLS,
+                MAX_SKILL_BYTES / (1024 * 1024)
+            ),
+            &mut errors_noted,
+        );
     }
 
     Discovery { skills, errors }

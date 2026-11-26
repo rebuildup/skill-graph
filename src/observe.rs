@@ -56,6 +56,11 @@ pub struct Observation {
     /// accurate; only retained detail is dropped past the budget.
     #[serde(skip)]
     pub retained_bytes: usize,
+    /// Byte length of the observable file currently being scanned —
+    /// SkillLoad.file is backfilled after the scan, so the retained-
+    /// bytes estimate charges this up front instead of undercounting.
+    #[serde(skip)]
+    pub current_file_len: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +82,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     let mut sessions = BTreeSet::new();
     for file in files {
         obs.files_scanned += 1;
+        obs.current_file_len = file.display().to_string().len();
         // Size cap applies to every observable format — .db inputs are
         // scanned row-by-row and would otherwise have no bound. For a
         // SQLite database the un-checkpointed WAL is read too, so its
@@ -293,10 +299,14 @@ fn collect_observables_inner(
                 depth_noted,
                 depth + 1,
             );
-        } else if matches!(
-            p.extension().and_then(|e| e.to_str()),
-            Some("jsonl") | Some("db")
-        ) {
+        } else if p.is_file()
+            && matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("jsonl") | Some("db")
+            )
+        {
+            // is_file() rejects FIFOs/devices: read_to_string on a FIFO
+            // would block forever waiting for a writer.
             push_observable(&p, out, seen_files);
         }
     }
@@ -628,7 +638,10 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
                         .unwrap_or_default()
                         .to_string(),
                 };
-                let lb = load_retained_bytes(&load);
+                // file is backfilled with the source path after the
+                // scan; charge the current file's length up front so
+                // the retained-bytes estimate does not undercount.
+                let lb = load_retained_bytes(&load) + obs.current_file_len;
                 if obs.retained_bytes.saturating_add(lb) <= MAX_OBSERVE_RETAINED_BYTES {
                     obs.retained_bytes += lb;
                     obs.loads.push(load);
@@ -804,11 +817,50 @@ struct PendingCall {
 struct CodexScan {
     session_id: String,
     pending: Vec<PendingCall>,
+    /// Total `(path, access)` pairs retained across `pending` — bounded
+    /// separately from the per-call MAX_CODEX_ACCESSES because the call
+    /// count itself is unbounded and each retained path is an owned
+    /// String copied out of the input (multi-MB amplification on a
+    /// hostile rollout).
+    pending_accesses: usize,
+    /// Compact records for accesses beyond the pending cap: the SKILL.md
+    /// path is dropped but everything needed to emit the same
+    /// skill_load event (minus skill_path) is kept, so runtimes /
+    /// skill_loads counters and the funnel stay exact.
+    overflow: Vec<OverflowAccess>,
+    /// Accesses dropped beyond BOTH caps — finish() reports the
+    /// residual count rather than silently losing the loads.
+    overflow_dropped: usize,
     outputs: HashMap<String, String>,
     /// (session, timestamp, text)
     prompts: Vec<(String, String, String)>,
     injected: Vec<SkillUsageEvent>,
 }
+
+/// A retained skill-load access without its SKILL.md path. `first_read`
+/// marks the call's first Read — the only access allowed to claim the
+/// captured output's frontmatter, mirroring the pending path's
+/// `frontmatter_available` rule.
+struct OverflowAccess {
+    session_id: String,
+    timestamp: String,
+    call_id: String,
+    access: events::Access,
+    first_read: bool,
+    /// Path-derived skill name; None means unattributable unless a
+    /// first-read frontmatter upgrade supplies one (record_event drops
+    /// nameless loads either way).
+    name_hint: Option<String>,
+}
+
+/// Aggregate cap on retained pending accesses per rollout file.
+/// ~64K paths of ≤4 KiB each stays well under the observe retained
+/// budget's intent while covering any realistic session.
+const MAX_PENDING_ACCESSES_TOTAL: usize = 65_536;
+/// Second-tier cap for compact overflow records (no path Strings —
+/// ~150 B/access worst case), keeping counters exact for corpora that
+/// exceed the detailed pending budget.
+const MAX_OVERFLOW_ACCESSES: usize = 65_536;
 
 impl CodexScan {
     fn feed(&mut self, value: &Value) {
@@ -914,15 +966,45 @@ impl CodexScan {
                         }
                     }
                     deduped.sort_by_key(|&(_, _, seq)| seq);
-                    let deduped: Vec<(String, events::Access)> =
+                    let mut deduped: Vec<(String, events::Access)> =
                         deduped.into_iter().map(|(p, a, _)| (p, a)).collect();
                     if !deduped.is_empty() {
-                        self.pending.push(PendingCall {
-                            call_id,
-                            session_id: self.session_id.clone(),
-                            timestamp: timestamp.clone(),
-                            accesses: deduped,
-                        });
+                        // Split at the remaining pending budget: the
+                        // prefix keeps full path detail; the suffix is
+                        // retained compactly so runtimes/skill_loads
+                        // counters and the funnel still see every load.
+                        let first_read_pos =
+                            deduped.iter().position(|(_, a)| *a == events::Access::Read);
+                        let room = MAX_PENDING_ACCESSES_TOTAL.saturating_sub(self.pending_accesses);
+                        let fit = deduped.len().min(room);
+                        let rest = if fit < deduped.len() {
+                            deduped.split_off(fit)
+                        } else {
+                            Vec::new()
+                        };
+                        if !deduped.is_empty() {
+                            self.pending_accesses += deduped.len();
+                            self.pending.push(PendingCall {
+                                call_id: call_id.clone(),
+                                session_id: self.session_id.clone(),
+                                timestamp: timestamp.clone(),
+                                accesses: deduped,
+                            });
+                        }
+                        for (k, (path, access)) in rest.iter().enumerate() {
+                            if self.overflow.len() >= MAX_OVERFLOW_ACCESSES {
+                                self.overflow_dropped += 1;
+                                continue;
+                            }
+                            self.overflow.push(OverflowAccess {
+                                session_id: self.session_id.clone(),
+                                timestamp: timestamp.clone(),
+                                call_id: call_id.clone(),
+                                access: *access,
+                                first_read: Some(fit + k) == first_read_pos,
+                                name_hint: events::skill_name_from_path(path),
+                            });
+                        }
                     }
                 }
                 Some("custom_tool_call_output") => {
@@ -1033,6 +1115,56 @@ impl CodexScan {
                 ));
             }
         }
+        // Overflow accesses lost their path detail but not their load:
+        // emit the same event shape minus skill_path so counters, the
+        // funnel, and the retained-events budget treat them identically.
+        for ov in &self.overflow {
+            // Only the call's first Read may claim the captured output's
+            // frontmatter — same rule as the pending path.
+            let output = if ov.first_read {
+                self.outputs
+                    .get(&ov.call_id)
+                    .map(String::as_str)
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let (name, detection, confidence) = match ov.access {
+                events::Access::Read if ov.first_read => match events::frontmatter_name(output) {
+                    Some(n) => (Some(n), Detection::FileRead, Confidence::High),
+                    None => (
+                        ov.name_hint.clone(),
+                        Detection::PathReference,
+                        Confidence::Medium,
+                    ),
+                },
+                events::Access::Read => (
+                    ov.name_hint.clone(),
+                    Detection::PathReference,
+                    Confidence::Medium,
+                ),
+                events::Access::Reference => {
+                    (ov.name_hint.clone(), Detection::Mention, Confidence::Low)
+                }
+            };
+            events.push(SkillUsageEvent::skill_load(
+                Runtime::Codex,
+                ObservedVia::Transcript,
+                &ov.session_id,
+                &ov.timestamp,
+                Some("exec".to_string()),
+                name,
+                None,
+                detection,
+                confidence,
+            ));
+        }
+        if self.overflow_dropped > 0 && obs.errors.len() < MAX_OBSERVE_ERRORS {
+            obs.errors.push(format!(
+                "codex rollout accesses truncated: {} beyond retention caps",
+                self.overflow_dropped
+            ));
+        }
         events.sort_by_cached_key(|e| rfc3339_ms(&e.timestamp).unwrap_or(i64::MAX));
         for event in events {
             record_event(event, obs);
@@ -1104,10 +1236,14 @@ fn parse_injected_recommendation(
     // Names sit between the last " — " and the first "." after it.
     let after_dash = body.rsplit(" — ").next().unwrap_or(body);
     let names_str = after_dash.split('.').next().unwrap_or("");
+    // Take the cap during iteration: `names_str` is untrusted transcript
+    // text and a huge comma list would otherwise materialize a Vec far
+    // beyond MAX_RECOMMENDED before the constructor truncates it.
     let names: Vec<RecommendedSkill> = names_str
         .split(',')
         .map(|n| n.trim())
         .filter(|n| !n.is_empty() && crate::parser::valid_skill_name(n))
+        .take(events::MAX_RECOMMENDED)
         .map(|n| RecommendedSkill {
             name: n.to_string(),
             digest: None,
@@ -1298,7 +1434,8 @@ fn is_meaningful_prompt(text: &str) -> bool {
 /// `observe --summary`.
 pub fn summary(obs: &Observation) -> Value {
     let all: Vec<&crate::events::SkillUsageEvent> = obs.events.iter().collect();
-    let mut out = funnel_for(&all).into_json();
+    let mut funnel_checks = MAX_FUNNEL_PAIR_CHECKS;
+    let mut out = funnel_for(&all, &mut funnel_checks).into_json();
     let mut by_runtime = serde_json::Map::new();
     for runtime in ["claude-code", "codex", "opencode"] {
         let subset: Vec<&crate::events::SkillUsageEvent> = all
@@ -1307,7 +1444,10 @@ pub fn summary(obs: &Observation) -> Value {
             .filter(|e| e.runtime.as_str() == runtime)
             .collect();
         if !subset.is_empty() {
-            by_runtime.insert(runtime.to_string(), funnel_for(&subset).into_json());
+            by_runtime.insert(
+                runtime.to_string(),
+                funnel_for(&subset, &mut funnel_checks).into_json(),
+            );
         }
     }
     out["by_runtime"] = Value::Object(by_runtime);
@@ -1330,7 +1470,10 @@ pub fn summary(obs: &Observation) -> Value {
     }
     let total_sessions = session_events.len();
     for (session_id, events) in session_events.into_iter().take(MAX_SUMMARY_SESSIONS) {
-        by_session_map.insert(session_id, funnel_for(&events).into_json());
+        by_session_map.insert(
+            session_id,
+            funnel_for(&events, &mut funnel_checks).into_json(),
+        );
     }
     out["by_session"] = Value::Object(by_session_map);
     if total_sessions > MAX_SUMMARY_SESSIONS {
@@ -1480,8 +1623,13 @@ struct Funnel {
     emitted_per_session: BTreeMap<String, usize>,
 }
 
+/// Global bound on timestamp-fallback pair examinations across ALL
+/// funnel passes in one summary() — the budget is shared so per-runtime
+/// and per-session recomputation cannot multiply it.
+const MAX_FUNNEL_PAIR_CHECKS: usize = 8_000_000;
+
 /// Compute funnel metrics over a set of events (overall or one runtime).
-fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
+fn funnel_for(events: &[&crate::events::SkillUsageEvent], checks_left: &mut usize) -> Funnel {
     use crate::events::EventKind;
     let mut f = Funnel::default();
     // Stable per-session ordering: (timestamp, input order).
@@ -1537,14 +1685,19 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
             .push(i);
     }
     for idxs in by_session.values() {
-        session_funnel(&mut f, events, idxs);
+        session_funnel(&mut f, events, idxs, checks_left);
     }
     f
 }
 
 /// conversion / unnecessary-load / timeliness for one session's
 /// timestamp-ordered event indexes.
-fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], idxs: &[usize]) {
+fn session_funnel(
+    f: &mut Funnel,
+    events: &[&crate::events::SkillUsageEvent],
+    idxs: &[usize],
+    checks_left: &mut usize,
+) {
     use crate::events::EventKind;
     let recs: Vec<usize> = idxs
         .iter()
@@ -1608,7 +1761,6 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
     // force quadratic scans. A global examination budget bounds that:
     // past it, remaining recs simply do not convert (deterministic —
     // rec order is fixed).
-    const MAX_FUNNEL_PAIR_CHECKS: usize = 8_000_000;
     #[derive(Default)]
     struct NameLoads {
         list: Vec<usize>,
@@ -1623,7 +1775,6 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
             .push(li);
     }
     let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let mut checks_left = MAX_FUNNEL_PAIR_CHECKS;
     'recs: for &ri in &recs {
         if consumed.len() == loads.len() {
             break;
@@ -1664,8 +1815,8 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
             while j < nl.list.len() {
                 let li = nl.list[j];
                 j += 1;
-                checks_left = checks_left.saturating_sub(1);
-                if checks_left == 0 {
+                *checks_left = checks_left.saturating_sub(1);
+                if *checks_left == 0 {
                     break 'recs;
                 }
                 if consumed.contains(&li) {
@@ -1767,7 +1918,18 @@ impl Funnel {
 
 #[cfg(test)]
 mod tests {
-    use super::under_cap;
+    use super::{parse_injected_recommendation, under_cap};
+
+    /// #144 round-12: a hostile transcript line with a huge comma list
+    /// must not materialize an unbounded Vec — the cap is applied during
+    /// iteration, before collection.
+    #[test]
+    fn injected_recommendation_names_are_capped_during_parse() {
+        let names: Vec<String> = (0..10_000).map(|i| format!("skill-{i:05}")).collect();
+        let text = format!("skill-graph: 'q' — {}.", names.join(","));
+        let ev = parse_injected_recommendation("s", "2026-01-01T00:00:00Z", &text).expect("event");
+        assert_eq!(ev.recommended.len(), crate::events::MAX_RECOMMENDED);
+    }
 
     #[test]
     fn under_cap_latches_single_notice() {

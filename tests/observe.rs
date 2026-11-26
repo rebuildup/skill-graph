@@ -747,3 +747,21 @@ fn passthrough_skill_name_charset_is_validated() {
     assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&1));
     assert_eq!(obs.skill_loads.len(), 1);
 }
+
+/// Round-12: non-regular files must not become observables — a FIFO
+/// named `*.jsonl` would block `read_to_string` forever.
+#[cfg(unix)]
+#[test]
+fn fifo_is_not_an_observable() {
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("evil.jsonl");
+    let st = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // Returns promptly; the FIFO is skipped rather than opened.
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 0);
+    assert!(obs.loads.is_empty());
+}

@@ -260,27 +260,25 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
             let (roots, diagnostics) =
                 tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
             let built = build_graph(&roots);
+            // skills is capped; errors need the same bound — and take()
+            // avoids cloning the whole discovery error vector before
+            // truncation (a hostile corpus can produce ~1k entries).
+            const MAX_DISCOVER_ERRORS: usize = 256;
+            let mut errors: Vec<String> = diagnostics;
+            let room = MAX_DISCOVER_ERRORS.saturating_sub(errors.len());
+            errors.extend(built.errors.iter().take(room).cloned());
+            if built.errors.len() > room {
+                errors.push(format!("errors truncated at {MAX_DISCOVER_ERRORS}"));
+            }
             let mut output = DiscoveryOutput {
                 skills: built.graph.skills.iter().map(Skill::summary).collect(),
-                errors: diagnostics
-                    .into_iter()
-                    .chain(built.errors.iter().cloned())
-                    .collect(),
+                errors,
             };
             if output.skills.len() > MAX_DISCOVER_SKILLS {
                 output.skills.truncate(MAX_DISCOVER_SKILLS);
                 output.errors.push(format!(
                     "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
                 ));
-            }
-            // skills is capped; errors need the same bound — a hostile
-            // corpus can otherwise produce ~10k parse-error entries.
-            const MAX_DISCOVER_ERRORS: usize = 256;
-            if output.errors.len() > MAX_DISCOVER_ERRORS {
-                output.errors.truncate(MAX_DISCOVER_ERRORS);
-                output
-                    .errors
-                    .push(format!("errors truncated at {MAX_DISCOVER_ERRORS}"));
             }
             tool_result(&json!(output))
         }

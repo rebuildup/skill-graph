@@ -63,7 +63,9 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   共に `ab`）— これは sanitize の定義済み動作。`recommended[].name` は
   schema の `minLength: 1` より厳しく valid skill name を要求する —
   schema 適合でも観測側の join キーにならない名前は `lines_skipped`
-  に計上される。
+  に計上される。`recommend_ms` は schema 上 `integer` だが観測側は
+  `u64` のみ受理し、負値・`u64` 超過は `lines_skipped` に計上される
+  （schema より厳しい reject はこの項の定義済み動作）。
 - `detect` は 1 payload あたり最大 64 event を emit する
   （`MAX_EVENTS_PER_PAYLOAD`）。超過分は打ち切られ、通知はない。
 - dedup event の記録は adapter 固有: Rust hook は repeat を
@@ -92,12 +94,20 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   （`.db` は `-wal` 込み）、retained events/loads 各 1,000,000、
   retained detail 合計 64 MiB（イベント/ロードの推定バイト数 —
   count 上限だけでは contract 適合の巨大イベントでメモリを
-  尽くしうるため）。超過時は `errors` に打ち切り通知が入り、
+  尽くしうるため。`skill_load.file` は走査後に backfill されるため、
+  走査中のファイルパス長を事前に課金して過小計上を防ぐ）。
+  observables として受理するのは regular file のみで、FIFO・
+  device・socket は拡張子に関わらず走査対象外（FIFO の
+  `read_to_string` による永久ブロックを防ぐ）。Codex rollout の
+  pending access 集約はファイル毎 65,536 件まで。
+  超過時は `errors` に打ち切り通知が入り、
   `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を
-  最大 8,000,000 回で打ち切る（超過後の rec は convert しない。
+  最大 8,000,000 回で打ち切る。この予算は `summary()` の全
+  funnel pass（全体・runtime 別・session 別）で共有され、pass 毎に
+  リセットされない（超過後の rec は convert しない。
   rec 順序は固定なので結果は決定的）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
@@ -195,3 +205,45 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
 `SKILL_GRAPH_BIN` → PATH の順で解決する。enable 後に
 `SKILL_GRAPH_BIN` を変更しても hook command の埋め込みパスは
 変わらない（plugin のみ追従する）。
+
+## adapter/plugin の信頼できない入力境界
+
+- adapter が読む config（`settings.json` / `opencode.json` /
+  `hooks.json`）は regular file のみ受理し、`O_NONBLOCK` open +
+  open 後 fstat で型を再検証、読み取りは 4 MiB 上限
+  （`MAX_CONFIG_BYTES`）。FIFO・`/dev/zero` 等の symlink 先・
+  巨大ファイルは `status`/`disable` 経路でも hang/OOM しない。
+- adapter の env 由来パス（`HOME`、`CODEX_HOME`、`XDG_CONFIG_HOME`、
+  `XDG_DATA_HOME`）は絶対パスのみ有効。相対値・非 UTF-8 は未設定
+  として既定解決に縮退し、`file://` spec には絶対パスのみを使う。
+- legacy hook 検出の shell 解析は quote/escape を考慮する:
+  `'FOO=bar'` や `FOO\=bar` のように quote・escape された `NAME=`
+  は env assignment ではなく command word であり、foreign hook と
+  誤認して削除しない。
+- plugin specifier の境界判定で、marker 直後の `%` は follower と
+  みなさない（`file_url_encode` は marker 直後に raw `%` を出力
+  せず、`%2F` 等の percent-encoding で path が継続しうるため）。
+- project scope の enable/disable は write 直前に
+  `check_project_symlink` を再検査するが、検査と rename の間の
+  symlink 差し替え（TOCTOU）は完全には閉じない。影響は project
+  ディレクトリ内 config の置換に限定される設計（dirfd pin や
+  `openat2(RESOLVE_BENEATH)` は採用しない）。この残余 race は
+  既知の制限として記録する。
+- plugin の `detect` spawn 予算（session 毎 512 回）は
+  SKILL.md prefilter を通過した呼出しにのみ課金する —
+  無関係な tool 実行が budget を消費して検出を無効化することはない。
+  plugin が spawn する子プロセスの stdout は 4 MiB 上限で打ち切り、
+  20 秒 timeout + drain 後 SIGKILL で回収する。
+
+## discovery の保持量境界
+
+- `discover` の byte 会計は pre-read の `metadata().len()` ではなく、
+  parse 後の retained フィールド量（body/name/description/keywords/
+  links/path + 固定 overhead）と file bytes の大きい方を課金する。
+  `from_utf8_lossy` の UTF-8 置換拡大（最大 ~3x）と metadata〜read 間の
+  file 成長による過小計上を防ぐ。
+- discovery の `errors` は収集時点で 1024 件（`MAX_DISCOVER_ERRORS`）に
+  制限され、打ち切りは latched notice で通知される。parse 失敗は
+  skill/byte cap を消費しないが、error エントリ自体は bounded。
+  MCP `discover` は全 error を collect してから truncate せず、
+  残り枠分のみを保持する。

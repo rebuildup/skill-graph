@@ -152,11 +152,40 @@ const PROC_TIMEOUT_MS = 20_000
 // collectProc pending forever.
 const PROC_DRAIN_MS = 2_000
 const MAX_LOAD_RECOMMENDS = 8
+// Cap collected stdout: a runaway child must not buffer unbounded
+// output into plugin memory before the timeout fires.
+const MAX_PROC_OUTPUT_BYTES = 4 * 1024 * 1024
 
 async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
-  // Attach a catch immediately: a stream error before `return readAll`
+  // Attach a catch immediately: a stream error before the read resolves
   // would otherwise be an unhandled rejection.
-  const readAll = new Response(proc.stdout).text().catch(() => "")
+  const readAll = (async () => {
+    const reader = proc.stdout.getReader()
+    const chunks: Uint8Array[] = []
+    let total = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (!value) continue
+        const remaining = MAX_PROC_OUTPUT_BYTES - total
+        if (remaining <= 0) break
+        chunks.push(value.length > remaining ? value.subarray(0, remaining) : value)
+        total += Math.min(value.length, remaining)
+        if (total >= MAX_PROC_OUTPUT_BYTES) break
+      }
+    } catch {}
+    try { proc.kill() } catch {}
+    const merged = new Uint8Array(total)
+    let off = 0
+    for (const c of chunks) {
+      const take = Math.min(c.length, merged.length - off)
+      if (take <= 0) break
+      merged.set(c.subarray(0, take), off)
+      off += take
+    }
+    return new TextDecoder().decode(merged)
+  })().catch(() => "")
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     await Promise.race([
@@ -250,11 +279,24 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
     if (!isSkillTool && !touches) return []
 
+    // Bound actual `detect` subprocess spawns per session. Counting
+    // happens HERE, after the prefilter — charging every tool call
+    // would let 512 unrelated executions silently disable detection
+    // for the rest of a long session.
+    const sid = safeSessionID(event.sessionID)
+    const detects = detectCounts.get(sid) ?? 0
+    if (detects >= MAX_DETECT_PER_SESSION) return []
+    if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
+      const oldest = detectCounts.keys().next().value
+      if (oldest !== undefined) detectCounts.delete(oldest)
+    }
+    detectCounts.set(sid, detects + 1)
+
     const payload = {
       tool_name: tool,
       tool_input: input,
       tool_response: resultText(event.result),
-      session_id: safeSessionID(event.sessionID),
+      session_id: sid,
       // Forwarded defensively so the Rust-side error-status guard also
       // applies to plugin-originated payloads (the field name is
       // UNVERIFIED against the OpenCode event API).
@@ -412,13 +454,6 @@ export default Plugin.define({
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
       const sessionID = safeSessionID(event.sessionID)
-      const detects = detectCounts.get(sessionID) ?? 0
-      if (detects >= MAX_DETECT_PER_SESSION) return
-      if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sessionID)) {
-        const oldest = detectCounts.keys().next().value
-        if (oldest !== undefined) detectCounts.delete(oldest)
-      }
-      detectCounts.set(sessionID, detects + 1)
       const detected = await detectLoad(event)
       if (!detected.length) return
       // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call

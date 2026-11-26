@@ -162,10 +162,22 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         // index order, same degrade direction as the body budget.
         let scan_terms = query_terms.len() + context_terms.len();
         let link_bytes: usize = skill.links.iter().map(|l| l.target.len()).sum();
+        // Whole-query matches are O(query) needle work per call and are
+        // NOT covered by the per-term charge: matches_query runs once
+        // per link target, and field_score's whitespace-free bonus runs
+        // once per scored field (the query twice — name and description
+        // — plus the context once).
+        let whole_query_work = skill
+            .links
+            .len()
+            .saturating_mul(query.len())
+            .saturating_add(query.len().saturating_mul(2))
+            .saturating_add(context.len());
         let skill_work = scan_terms
             .saturating_mul(2)
             .saturating_mul(skill_names[index].len() + skill_descriptions[index].len())
-            .saturating_add(link_bytes);
+            .saturating_add(link_bytes)
+            .saturating_add(whole_query_work);
         match_work = match_work.saturating_add(skill_work);
         if match_work > MAX_MATCH_TERM_WORK {
             // An exact name match is the strongest possible signal and
@@ -553,14 +565,17 @@ fn document_frequency<'a>(
     // Deterministic degradation order under budget exhaustion.
     let mut unique: Vec<&str> = unique.into_iter().collect();
     unique.sort_unstable();
-    // Per-term cost is bounded by scanning every candidate's
-    // name+description; charge the full field bytes (any() short-
-    // circuits on a match, so this overestimates — acceptable for a
-    // heuristic budget). Uncomputed terms stay absent from the map and
-    // read as non-rare via the df() fallback.
-    let field_bytes: usize = candidates
+    // df counts distinct skill NAMES but the scan walks every installed
+    // COPY of each candidate name — charge the bytes actually scanned
+    // (all parse-ok skills) or a duplicate-heavy corpus makes the
+    // budget meaningless: per-name charging under-counts by the copy
+    // factor and the term loop would never trip (#144 round-12).
+    let field_bytes: usize = graph
+        .skills
         .iter()
-        .map(|&i| skill_names[i].len() + skill_descriptions[i].len())
+        .enumerate()
+        .filter(|(_, s)| s.parse_error.is_none())
+        .map(|(i, _)| skill_names[i].len() + skill_descriptions[i].len())
         .sum();
     let mut frequencies = HashMap::new();
     for term in unique {
@@ -875,12 +890,20 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // remain independent (#144).
         let run: String = cjk.chars().collect();
         let gloss = gloss_terms(&run);
-        let keys: Vec<&str> = gloss.iter().map(|(_, key)| key.as_str()).collect();
+        // Coverage keys come from GLOSS membership, NOT from gloss_terms
+        // output: term-level dedup can hide a key whose expansions were
+        // all already emitted by another key, leaving its chars
+        // "uncovered" and minting spurious gap provenance (#144 r12).
+        let keys: Vec<&'static str> = gloss_keys(&run);
         let chars: Vec<char> = run.chars().collect();
-        // Mark characters covered by a recognized dictionary key so
-        // uncovered bigrams can be attributed to their gap segment.
-        // Work is bounded by total key-match length, not run length.
-        let mut covered = vec![false; chars.len()];
+        // cover_key[i] = index into `keys` owning char i, or -1. Longer
+        // keys claim shared chars first so プルリクエスト wins over
+        // プルリク on the overlap. Work is bounded by total key-match
+        // length, not run length.
+        let mut cover_key = vec![-1i32; chars.len()];
+        // effective_key[ki] = index of the key whose source gloss
+        // expansions of keys[ki] should carry. Computed below.
+        let mut effective_key: Vec<usize> = Vec::new();
         if !keys.is_empty() {
             // Byte offset -> char index; match_indices only yields
             // char-boundary starts, so interior bytes are never read.
@@ -888,14 +911,44 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
             for (ci, (b, _)) in run.char_indices().enumerate() {
                 byte_to_char[b] = ci;
             }
-            for key in &keys {
+            let mut order: Vec<usize> = (0..keys.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(keys[i].chars().count()));
+            for &ki in &order {
+                let key = keys[ki];
                 for (b, _) in run.match_indices(key) {
                     let start = byte_to_char[b];
                     let end = (start + key.chars().count()).min(chars.len());
-                    for slot in covered.iter_mut().take(end).skip(start) {
-                        *slot = true;
+                    for slot in cover_key.iter_mut().take(end).skip(start) {
+                        if *slot < 0 {
+                            *slot = ki as i32;
+                        }
                     }
                 }
+            }
+            // A key whose EVERY occurrence is subsumed by longer keys
+            // has no independent literal evidence: its gloss expansions
+            // must inherit the covering key's source, or the literal
+            // bigrams and the expansions of ONE dictionary word mint two
+            // "independent" sources (`根本原因` containing `原因` would
+            // self-admit a skill describing just `原因`). A key with at
+            // least one self-covered occurrence keeps its own source.
+            effective_key = vec![0usize; keys.len()];
+            for (ki, key) in keys.iter().enumerate() {
+                let klen = key.chars().count();
+                let mut self_covered = false;
+                let mut covering = ki;
+                for (b, _) in run.match_indices(key) {
+                    let start = byte_to_char[b];
+                    let end = (start + klen).min(chars.len());
+                    if cover_key[start..end].iter().all(|&c| c == ki as i32) {
+                        self_covered = true;
+                        break;
+                    }
+                    if covering == ki && cover_key[start] >= 0 {
+                        covering = cover_key[start] as usize;
+                    }
+                }
+                effective_key[ki] = if self_covered { ki } else { covering };
             }
         }
         // Gap segments: maximal runs of uncovered chars. A gap is
@@ -911,14 +964,14 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         {
             let mut i = 0;
             while i < chars.len() {
-                if covered[i] {
+                if cover_key[i] >= 0 {
                     i += 1;
                     continue;
                 }
                 let start = i;
                 let mut contentful = false;
                 let mut text = String::new();
-                while i < chars.len() && !covered[i] {
+                while i < chars.len() && cover_key[i] < 0 {
                     text.push(chars[i]);
                     if !is_hiragana(chars[i]) {
                         contentful = true;
@@ -935,18 +988,22 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         }
         for (w, window) in chars.windows(2).enumerate() {
             let bigram: String = window.iter().collect();
-            if let Some(key) = keys
-                .iter()
-                .filter(|key| key.contains(bigram.as_str()))
-                .min_by_key(|key| key.len())
+            // A bigram gets key provenance only when BOTH chars belong
+            // to the same key occurrence — positional coverage also fixes
+            // the substring check's cross-position misattribution (a
+            // bigram merely *equal* to key text elsewhere in the run no
+            // longer inherits that key's source).
+            if cover_key[w] >= 0
+                && cover_key[w] == cover_key[w + 1]
+                && keys[cover_key[w] as usize].contains(bigram.as_str())
             {
-                out.push((bigram, (*key).to_string()));
+                out.push((bigram, keys[cover_key[w] as usize].to_string()));
             } else if keys.is_empty() {
                 // Only a run with NO recognized dictionary word falls
                 // back to run-level provenance.
                 out.push((bigram, run.clone()));
-            } else if !covered[w]
-                && !covered[w + 1]
+            } else if cover_key[w] < 0
+                && cover_key[w + 1] < 0
                 && gap_of[w] == gap_of[w + 1]
                 && gap_contentful[gap_of[w]]
             {
@@ -958,9 +1015,19 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
             // key/gap boundary, or sits in a pure-hiragana gap —
             // dropped so it cannot mint an independent source.
         }
+        // Gloss expansions carry the EFFECTIVE source of their key: a
+        // key fully subsumed by a longer dictionary word inherits that
+        // word's provenance so literal+expansion of one word cannot
+        // count as two independent sources.
+        let key_index: HashMap<&str, usize> =
+            keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
         for (gloss, key) in gloss {
             if !STOPWORDS.contains(&gloss.as_str()) {
-                out.push((gloss, key));
+                let source = key_index
+                    .get(key.as_str())
+                    .map(|&ki| keys[effective_key[ki]])
+                    .unwrap_or(key.as_str());
+                out.push((gloss, source.to_string()));
             }
         }
         cjk.clear();
@@ -1342,6 +1409,21 @@ const GLOSS: &[(&str, &str)] = &[
     ("ログ", "log logging"),
 ];
 
+/// Every glossary key present in `text`, independent of term-level
+/// dedup: `gloss_terms` dedups by emitted term, so a key whose gloss
+/// was fully claimed by an earlier key would otherwise be invisible to
+/// provenance coverage even though its chars are a recognized word.
+fn gloss_keys(text: &str) -> Vec<&'static str> {
+    if text.is_ascii() {
+        return Vec::new();
+    }
+    GLOSS
+        .iter()
+        .filter(|(key, gloss)| !gloss.is_empty() && text.contains(key))
+        .map(|(key, _)| *key)
+        .collect()
+}
+
 // Returns (English term, CJK key) pairs for every glossary key present in
 // `text`, deduplicated by term. Used in both directions: query terms emit
 // these into the term list, and skill match text gets the terms appended.
@@ -1432,6 +1514,29 @@ mod tests {
         assert_eq!(gap_sources.get("不具").map(String::as_str), Some("不具合"));
         assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
+    }
+
+    /// #144 round-12 (CodeRabbit): a dictionary key fully contained in a
+    /// longer key must not keep an independent source for its gloss
+    /// expansions — `原因` inside `根本原因` is ONE evidence unit, so a
+    /// skill whose description is just `原因` (literal + `root cause`
+    /// expansion) cannot self-admit on query `根本原因`.
+    #[test]
+    fn contained_key_gloss_inherits_covering_source() {
+        let tagged = terms_tagged("根本原因");
+        let sources = term_sources(&tagged);
+        // The bigram 原因 is covered by 根本原因; the gloss terms that
+        // 原因 would emit (root, cause) must carry the SAME source.
+        assert_eq!(sources.get("原因").map(String::as_str), Some("根本原因"));
+        assert_eq!(sources.get("root").map(String::as_str), Some("根本原因"));
+        assert_eq!(sources.get("cause").map(String::as_str), Some("根本原因"));
+        // A standalone 原因 elsewhere in the run is a genuinely
+        // independent dictionary word and keeps its own source.
+        let tagged = terms_tagged("根本原因と原因");
+        let sources = term_sources(&tagged);
+        assert_eq!(sources.get("原因").map(String::as_str), Some("原因"));
+        assert_eq!(sources.get("root").map(String::as_str), Some("原因"));
+        assert_eq!(sources.get("根本").map(String::as_str), Some("根本原因"));
     }
 
     #[test]

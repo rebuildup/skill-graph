@@ -1047,3 +1047,175 @@ fn disable_preserves_foreign_sibling_keys() {
     assert!(text.contains("\"matcher\": \"X\""), "{text}");
     assert!(!text.contains("hook claude-code prompt"), "{text}");
 }
+
+/// Round-12: a quoted or escaped `NAME=` is a command word, not an env
+/// assignment — `'FOO=bar' /x/.../skill-graph-recommend-hook` runs
+/// `FOO=bar` as the command in a real shell, so the hook path is merely
+/// an argument and must not be claimed as ours (enable/disable would
+/// otherwise delete a foreign hook entry).
+#[test]
+fn quoted_env_assignment_is_not_ours() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    for cmd in [
+        "'FOO=bar' /x/0.3.0/bin/skill-graph-recommend-hook prompt",
+        "FOO\\=bar /x/0.3.0/bin/skill-graph-recommend-hook prompt",
+    ] {
+        let body = format!(
+            r#"{{"hooks":{{"UserPromptSubmit":[{{"hooks":[{{"type":"command","command":{}}}]}}]}}}}"#,
+            serde_json::to_string(cmd).unwrap()
+        );
+        std::fs::write(&path, &body).unwrap();
+        let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+        assert_eq!(rc, 0, "{cmd}");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("skill-graph-recommend-hook"),
+            "{cmd}: foreign hook was stripped: {text}"
+        );
+    }
+}
+
+/// Round-12: `%` is not a valid follower after the plugin marker — our
+/// own file_url_encode percent-encodes `%`, so
+/// `opencode-plugin%2F..%2Fevil` is a foreign specifier whose path
+/// continues past the marker and must survive disable.
+#[test]
+fn percent_encoded_plugin_marker_is_foreign() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"plugins":["file:///x/skill-graph/opencode-plugin%2F..%2Fevil","other-plugin"]}"#,
+    )
+    .unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let cfg = f.config("opencode", "--user").unwrap();
+    let plugins = cfg["plugins"].as_array().unwrap();
+    assert!(
+        plugins
+            .iter()
+            .any(|p| p.as_str().unwrap().contains("opencode-plugin%2F")),
+        "{cfg}"
+    );
+    assert_eq!(plugins.len(), 2, "{cfg}");
+}
+
+/// Round-12: adapter config reads must not block on FIFOs or exhaust
+/// memory on huge/special files — project-scope trees are untrusted.
+#[cfg(unix)]
+#[test]
+fn status_rejects_fifo_and_oversized_config() {
+    let f = Fixture::new();
+    let dir = f.proj.path().join(".claude");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("settings.json");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // Must return promptly — a blocking read would hang the test.
+    let (_, err, rc) = f.run_full(&["adapter", "status", "claude-code", "--project"]);
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("not a regular file"), "{err}");
+
+    // Oversized regular file: capped read, clean error, no OOM.
+    std::fs::remove_file(&fifo).unwrap();
+    let big = dir.join("settings.json");
+    let chunk = vec![b' '; 1024 * 1024];
+    {
+        use std::io::Write;
+        let mut w = std::fs::File::create(&big).unwrap();
+        for _ in 0..5 {
+            w.write_all(&chunk).unwrap();
+        }
+    }
+    let (_, err, rc) = f.run_full(&["adapter", "status", "claude-code", "--project"]);
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("too large"), "{err}");
+}
+
+/// Round-12: env-derived paths must be absolute. A relative HOME is
+/// treated as unusable and surfaces a clean error, not a bogus
+/// cwd-relative config path.
+#[test]
+fn relative_home_is_rejected() {
+    let f = Fixture::new();
+    let (_, err, rc) = f.run_full_env(
+        &["adapter", "status", "claude-code", "--user"],
+        &[("HOME", "relative-home")],
+    );
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("HOME"), "{err}");
+}
+
+/// #144 r12 CodeRabbit: `env` consumes its own `name=value` operands
+/// after quote removal — `env 'FOO=bar' <legacy-bin>` is a real legacy
+/// invocation and must be claimed, not mistaken for a foreign command.
+#[test]
+fn env_operand_legacy_invocation_is_ours() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"env 'FOO=bar' '/x/0.3.0/bin/skill-graph-recommend-hook' prompt"}]}]}}"#;
+    std::fs::write(&path, body).unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    if path.exists() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("skill-graph-recommend-hook"), "{text}");
+    }
+}
+
+/// #144 r12 CodeRabbit: an unreadable project-scope opencode config must
+/// not collapse to "unreferenced" — disable keeps the shared plugin
+/// payload rather than breaking the scope that still references it.
+#[test]
+fn disable_keeps_payload_when_project_config_unreadable() {
+    let f = Fixture::new();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let payload = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin");
+    assert!(payload.exists());
+    // Corrupt the PROJECT-scope config after enable: disable --user
+    // succeeds on the user config, but the shared-payload reference
+    // check can no longer prove the project scope is clean.
+    let proj_cfg = f.proj.path().join("opencode.json");
+    std::fs::write(&proj_cfg, "{ not json").unwrap();
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(payload.exists(), "payload must be kept: {out}");
+    assert!(
+        out.contains("keeping the materialized plugin payload"),
+        "{out}"
+    );
+}
+
+/// #144 r12 CodeRabbit: config reads are strict UTF-8 — invalid bytes
+/// must error out instead of being lossy-rewritten and persisted.
+#[test]
+fn invalid_utf8_config_is_rejected_not_rewritten() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut bytes =
+        br#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo "#.to_vec();
+    bytes.push(0xff);
+    bytes.extend_from_slice(br#""}]}]}}"#);
+    std::fs::write(&path, &bytes).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let (out, rc) = f.run(&["adapter", "enable", "claude-code", "--user"]);
+    assert_ne!(rc, 0, "{out}");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "config must be untouched"
+    );
+}
