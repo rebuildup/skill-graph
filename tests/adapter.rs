@@ -336,6 +336,95 @@ fn malformed_config_returns_error_not_panic() {
 }
 
 #[test]
+fn legacy_status_and_malformed_bin_name() {
+    let f = Fixture::new();
+    // seed a v0.3.x config and check status reports legacy BEFORE enable
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"SKILL_GRAPH_BIN='/x/shims/skill-graph' '/x/.local/share/skill-graph/0.3.0/adapters/claude-code/skill-graph/bin/skill-graph-recommend-hook' prompt"}]}]}}"#,
+    )
+    .unwrap();
+    let (out, _) = f.run(&["adapter", "status", "claude-code", "--user"]);
+    assert!(out.contains("legacy v0.3.x entries present: 1"), "{out}");
+
+    // enable with a --bin that is NOT named skill-graph: enable/disable
+    // must still recognize and remove our entries (invocation-shape match)
+    let odd_bin = f.home.path().join("bin/sg");
+    std::fs::copy(bin(), &odd_bin).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&odd_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let odd = odd_bin.to_string_lossy().into_owned();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &odd, "--user"]);
+    assert_eq!(rc, 0);
+    // second enable must be idempotent (no duplicate groups)
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &odd, "--user"]);
+    assert_eq!(rc, 0);
+    let count_v040 = |v: &Value| -> usize {
+        v.get("hooks")
+            .and_then(Value::as_object)
+            .map(|ev| {
+                ev.values()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .filter_map(|g| g.get("hooks").and_then(Value::as_array))
+                    .flatten()
+                    .filter(|h| {
+                        h.get("command")
+                            .and_then(Value::as_str)
+                            .map(|c| c.contains(" hook claude-code "))
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let cfg = f.config("claude-code", "--user").unwrap();
+    assert_eq!(count_v040(&cfg), 2, "{cfg}");
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    // config carried only our entries, so disable removes the file entirely
+    assert!(f.config("claude-code", "--user").is_none());
+}
+
+#[test]
+fn foreign_hook_group_without_hooks_array_survives_enable() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // legacy flat shape: hook objects directly in the event array (no
+    // "hooks" wrapper) — must not be pruned by enable
+    std::fs::write(
+        &path,
+        r#"{"hooks":{"PostToolUse":[{"type":"command","command":"echo foreign-flat"},{"matcher":"Skill","hooks":[{"type":"command","command":"echo keep"}]}]}}"#,
+    )
+    .unwrap();
+    let bin = f.bin_arg();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("echo foreign-flat"), "{text}");
+    assert!(text.contains("echo keep"), "{text}");
+}
+
+#[test]
+fn status_reports_broken_when_bin_missing() {
+    let f = Fixture::new();
+    let bin = f.bin_arg();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    // remove the embedded binary -> status must report broken
+    std::fs::remove_file(&f.fake_bin).unwrap();
+    let (out, _) = f.run(&["adapter", "status", "claude-code", "--user"]);
+    assert!(out.contains("broken"), "{out}");
+    assert!(out.contains("embedded binary not found"), "{out}");
+}
+
+#[test]
 fn project_scope_uses_cwd() {
     let f = Fixture::new();
     let bin = f.bin_arg();

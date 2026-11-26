@@ -92,7 +92,9 @@ impl HookEnv {
         if let Ok(meta) = std::fs::metadata(&self.event_log)
             && meta.len() > self.event_log_max
         {
-            let _ = std::fs::rename(&self.event_log, self.event_log.with_extension("jsonl.1"));
+            // v0.3.x convention: append ".1" to the full log path.
+            let rotated = PathBuf::from(format!("{}.1", self.event_log.display()));
+            let _ = std::fs::rename(&self.event_log, rotated);
         }
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -120,12 +122,48 @@ impl HookEnv {
     }
 
     fn marker_path(&self, dedup_key: &str) -> PathBuf {
-        // Marker names mirror the shell hook: <session>.<hash of dedup_key>.
-        // The hash is internal-only (no cross-version compat requirement).
-        let key_hash = events::sha256_hex(dedup_key.as_bytes());
+        // Marker names: <session>.<cksum(dedup_key)>, identical to the
+        // v0.3.x shell hook so dedup state survives migration.
+        let key_hash = cksum_decimal(dedup_key.as_bytes());
         self.state_dir
             .join(format!("{}.{key_hash}", self.session_id))
     }
+}
+
+/// POSIX cksum (the algorithm the `cksum` command implements): MSB-first
+/// CRC, polynomial 0x04C11DB7, init 0; the input length is appended
+/// least-significant-byte first; the result is XORed with 0xFFFFFFFF and
+/// printed as decimal. Verified byte-for-byte against `cksum(1)`.
+fn cksum_decimal(data: &[u8]) -> String {
+    const TABLE: [u32; 256] = {
+        let mut t = [0u32; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut crc = (i as u32) << 24;
+            let mut j = 0;
+            while j < 8 {
+                crc = if crc & 0x8000_0000 != 0 {
+                    (crc << 1) ^ 0x04C1_1DB7
+                } else {
+                    crc << 1
+                };
+                j += 1;
+            }
+            t[i] = crc;
+            i += 1;
+        }
+        t
+    };
+    let mut crc = 0u32;
+    for &b in data {
+        crc = TABLE[(((crc >> 24) as u8) ^ b) as usize] ^ (crc << 8);
+    }
+    let mut n = data.len() as u64;
+    while n > 0 {
+        crc = TABLE[(((crc >> 24) as u8) ^ (n & 0xff) as u8) as usize] ^ (crc << 8);
+        n >>= 8;
+    }
+    (crc ^ 0xffff_ffff).to_string()
 }
 
 fn hook_roots(runtime: Runtime) -> Vec<PathBuf> {
@@ -230,7 +268,9 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     if !skill_load_prefilter(payload) {
         return None;
     }
-    let event = events::detect_from_payload(env.runtime, ObservedVia::Hook, payload)?;
+    let mut event = events::detect_from_payload(env.runtime, ObservedVia::Hook, payload)?;
+    // Normalize to the sanitized session id so all events of this run agree.
+    event.session_id = env.session_id.clone();
     env.log_event(&event);
     let detection = event.detection?;
     if !LOAD_GRADE.contains(&detection) {
@@ -349,7 +389,8 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
         return None;
     }
 
-    let dedup_key = format!("prompt:{}", events::sha256_hex(query.as_bytes()));
+    // Same dedup key as the v0.3.x shell hook: prompt:<cksum(query)>.
+    let dedup_key = format!("prompt:{}", cksum_decimal(query.as_bytes()));
     if env.marker_exists(&dedup_key) {
         emit_recommendation(
             env,
@@ -423,7 +464,13 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
     std::io::stdin()
         .read_to_string(&mut input)
         .map_err(|e| format!("stdin: {e}"))?;
-    let payload: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    // Empty or unparseable stdin is not a hook payload: exit before
+    // touching state dirs or the event log (matches the v0.3.x shell
+    // hook, which exited early when jq could not parse the payload).
+    let payload: Value = match serde_json::from_str::<Value>(input.trim()) {
+        Ok(v) if !v.is_null() => v,
+        _ => return Ok(()),
+    };
     let env = HookEnv::from_payload(runtime, &payload);
 
     if env.nostate {
@@ -440,4 +487,19 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         println!("{out}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cksum_decimal;
+
+    // Expected values produced by `printf '%s' "$s" | cksum | cut -d' ' -f1`.
+    #[test]
+    fn cksum_matches_posix_cksum() {
+        assert_eq!(cksum_decimal(b""), "4294967295");
+        assert_eq!(cksum_decimal(b"a"), "1220704766");
+        assert_eq!(cksum_decimal(b"skill:alpha-skill"), "1146759242");
+        assert_eq!(cksum_decimal(b"prompt:abc"), "1161943104");
+        assert_eq!(cksum_decimal(&vec![b'x'; 70000]), "4215398528");
+    }
 }

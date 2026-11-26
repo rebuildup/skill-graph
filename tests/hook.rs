@@ -180,18 +180,6 @@ fn invalid_json_fails_open() {
     let dir = tempfile::tempdir().unwrap();
     let envs = fixture_env(&dir);
     let bin = env!("CARGO_BIN_EXE_skill-graph");
-    let out = Command::new(bin)
-        .args(["hook", "claude-code", "prompt"])
-        .envs(env_pairs(&envs))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap()
-        .wait_with_output()
-        .unwrap();
-    let _ = out;
-    // feed invalid json via a second run
     let mut child = Command::new(bin)
         .args(["hook", "claude-code", "prompt"])
         .envs(env_pairs(&envs))
@@ -208,4 +196,47 @@ fn invalid_json_fails_open() {
         .unwrap();
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(0));
+    // malformed payload produces no events and no output
+    assert!(out.stdout.is_empty());
+    assert!(!dir.path().join("events.jsonl").exists());
+}
+
+#[test]
+fn event_log_rotates_above_max() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envs = fixture_env(&dir);
+    // tiny limit: the first run's events exceed it, so the second run
+    // must rotate events.jsonl -> events.jsonl.1 before appending.
+    envs.push(("SKILL_GRAPH_EVENT_LOG_MAX".to_string(), "10".to_string()));
+    let payload = json!({"session_id":"r1","prompt":"alpha task"});
+    let args = &["hook", "claude-code", "prompt"];
+    run_hook(args, &payload, &env_pairs(&envs));
+    run_hook(args, &payload, &env_pairs(&envs));
+    let rotated = dir.path().join("events.jsonl.1");
+    assert!(rotated.exists(), "rotated log missing: {:?}", dir.path());
+    let rotated_events = event_lines(&rotated);
+    assert!(!rotated_events.is_empty());
+    // live log still receives the post-rotation events
+    assert!(!event_lines(&dir.path().join("events.jsonl")).is_empty());
+}
+
+#[test]
+fn unknown_runtime_and_mode_fail_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let payload = json!({"session_id":"u1","prompt":"alpha"});
+    let (out, rc) = run_hook(
+        &["hook", "not-a-runtime", "prompt"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    assert!(out.trim().is_empty());
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "skill_load"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    assert!(out.trim().is_empty());
 }

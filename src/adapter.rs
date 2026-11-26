@@ -97,12 +97,15 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
     if let Some(p) = override_path {
         let path = PathBuf::from(p);
         if is_executable(&path) {
-            return Ok(path);
+            // Hooks run with an arbitrary cwd; embed an absolute path.
+            // std::path::absolute does not resolve symlinks, so stable
+            // shim/symlink paths (mise, npm bin) are preserved.
+            return Ok(std::path::absolute(&path).unwrap_or(path));
         }
         return Err(format!("--bin is not executable: {p}"));
     }
     if let Some(path) = path_lookup("skill-graph") {
-        return Ok(path);
+        return Ok(std::path::absolute(&path).unwrap_or(path));
     }
     if let Ok(exe) = std::env::current_exe() {
         return Ok(exe);
@@ -148,24 +151,27 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// v0.4.x hook command shape: first token is the embedded `skill-graph`
-/// binary path (optionally single-quoted), followed by `hook <rt> <mode>`.
-/// Structural match avoids false positives on foreign commands that merely
-/// contain the substring "skill-graph hook".
+/// v0.4.x hook command shape: `<bin> hook <claude-code|codex|opencode>
+/// <prompt|skill-load>`. Matching the stable invocation tail — not the
+/// binary name — keeps enable/disable correct for any `--bin` override.
 fn is_v040_hook_command(command: &str) -> bool {
     let cmd = command.trim_start();
-    let (bin, rest) = if let Some(r) = cmd.strip_prefix('\'') {
+    let rest = if let Some(r) = cmd.strip_prefix('\'') {
         match r.split_once('\'') {
-            Some((b, tail)) => (b, tail.trim_start()),
+            Some((_, tail)) => tail.trim_start(),
             None => return false,
         }
     } else {
         match cmd.split_once(char::is_whitespace) {
-            Some((b, tail)) => (b, tail.trim_start()),
+            Some((_, tail)) => tail.trim_start(),
             None => return false,
         }
     };
-    (bin == "skill-graph" || bin.ends_with("/skill-graph")) && rest.starts_with("hook ")
+    let t: Vec<&str> = rest.split_whitespace().collect();
+    t.len() == 3
+        && t[0] == "hook"
+        && matches!(t[1], "claude-code" | "codex" | "opencode")
+        && matches!(t[2], "prompt" | "skill-load")
 }
 
 fn is_our_hook_command(command: &str) -> bool {
@@ -239,6 +245,18 @@ fn read_config(path: &Path) -> Result<Value, String> {
     }
 }
 
+/// Write JSON without the delete-on-empty behavior of `write_config` —
+/// used for files we do not own (e.g. the dotfiles overlay).
+fn write_json(path: &Path, value: &Value) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    let text = serde_json::to_string_pretty(value).map_err(|e| e.to_string())? + "\n";
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))
+}
+
 fn write_config(path: &Path, value: &Value) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
@@ -287,11 +305,13 @@ fn strip_our_hooks(config: &mut Value) {
                         .unwrap_or(true)
                 });
             }
+            // Keep groups that never had a `hooks` array (foreign shapes);
+            // only prune groups emptied by removing our entries.
             group
                 .get("hooks")
                 .and_then(Value::as_array)
                 .map(|l| !l.is_empty())
-                .unwrap_or(false)
+                .unwrap_or(true)
         });
         if groups.is_empty() {
             hooks.remove(&event);
@@ -304,28 +324,32 @@ fn strip_our_hooks(config: &mut Value) {
     }
 }
 
-/// Count entries (across both hook configs' worth of shapes) that match our
-/// markers in a settings/hooks config.
-fn count_hook_entries(config: &Value) -> usize {
-    let mut n = 0;
+/// All hook command strings in a settings/hooks config, regardless of
+/// matcher/event grouping.
+fn hook_commands(config: &Value) -> Vec<String> {
+    let mut out = Vec::new();
     if let Some(events) = config.get("hooks").and_then(Value::as_object) {
         for groups in events.values().filter_map(Value::as_array) {
             for group in groups {
                 if let Some(list) = group.get("hooks").and_then(Value::as_array) {
-                    n += list
-                        .iter()
-                        .filter(|h| {
-                            h.get("command")
-                                .and_then(Value::as_str)
-                                .map(is_our_hook_command)
-                                .unwrap_or(false)
-                        })
-                        .count();
+                    out.extend(
+                        list.iter()
+                            .filter_map(|h| h.get("command").and_then(Value::as_str))
+                            .map(str::to_string),
+                    );
                 }
             }
         }
     }
-    n
+    out
+}
+
+/// Count hook entries matching our markers.
+fn count_hook_entries(config: &Value) -> usize {
+    hook_commands(config)
+        .iter()
+        .filter(|c| is_our_hook_command(c))
+        .count()
 }
 
 fn strip_our_plugins(config: &mut Value) {
@@ -388,10 +412,14 @@ pub fn run_adapter(args: &AdapterArgs) -> Result<(), String> {
 }
 
 fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
-    if args.runtime == Runtime::Opencode {
-        materialize_opencode_plugin()?;
-    }
-    let bin = resolve_bin(args.bin.as_deref())?;
+    // Resolve before touching anything: a resolution failure must not leave
+    // a half-written install. OpenCode uses a file:// plugin specifier and
+    // never embeds the binary path.
+    let bin = if args.runtime == Runtime::Opencode {
+        PathBuf::new()
+    } else {
+        resolve_bin(args.bin.as_deref())?
+    };
     let mut config = read_config(path)?;
     if !config.is_object() {
         return Err(format!(
@@ -401,24 +429,23 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
 
     if args.runtime == Runtime::Opencode {
+        materialize_opencode_plugin()?;
         // Drop any prior skill-graph specifier (any generation), then append ours.
         strip_our_plugins(&mut config);
-        let plugins = config
+        let obj = config
             .as_object_mut()
-            .expect("config object")
-            .entry("plugins")
-            .or_insert_with(|| json!([]));
+            .ok_or_else(|| format!("{}: top-level JSON must be an object", path.display()))?;
+        let plugins = obj.entry("plugins").or_insert_with(|| json!([]));
         let arr = plugins
             .as_array_mut()
             .ok_or_else(|| format!("{}: \"plugins\" must be an array", path.display()))?;
         arr.push(json!(opencode_plugin_spec()));
     } else {
         strip_our_hooks(&mut config);
-        let hooks = config
+        let obj = config
             .as_object_mut()
-            .expect("config object")
-            .entry("hooks")
-            .or_insert_with(|| json!({}));
+            .ok_or_else(|| format!("{}: top-level JSON must be an object", path.display()))?;
+        let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
         let hooks = hooks
             .as_object_mut()
             .ok_or_else(|| format!("{}: \"hooks\" must be an object", path.display()))?;
@@ -446,7 +473,9 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         args.scope.flag(),
         path.display()
     );
-    println!("binary: {}", bin.display());
+    if args.runtime != Runtime::Opencode {
+        println!("binary: {}", bin.display());
+    }
     if args.runtime == Runtime::Codex {
         println!(
             "note: trust the hooks via /hooks in Codex (hash-pinned; unchanged across updates)"
@@ -487,14 +516,25 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
 
     // dotfiles-managed machines compose ~/.claude/settings.json from a
     // machine-local overlay; hooks imported there would be regenerated on
-    // the next compose, so disable must clean it too.
+    // the next compose, so disable must clean it too. The overlay may be a
+    // symlink into a dotfiles repo: keep the file even when it reduces to
+    // {}, and tolerate an unreadable/missing overlay.
     if args.runtime == Runtime::ClaudeCode && args.scope == Scope::User {
         let overlay = dotfiles_overlay();
-        if overlay.exists() {
-            let mut config = read_config(&overlay)?;
-            strip_our_hooks(&mut config);
-            write_config(&overlay, &config)?;
-            println!("cleaned dotfiles overlay: {}", overlay.display());
+        if overlay.exists() || overlay.is_symlink() {
+            if let Ok(mut config) = read_config(&overlay) {
+                if config.is_object() {
+                    strip_our_hooks(&mut config);
+                    if let Err(e) = write_json(&overlay, &config) {
+                        eprintln!(
+                            "warning: could not clean dotfiles overlay {}: {e}",
+                            overlay.display()
+                        );
+                    } else {
+                        println!("cleaned dotfiles overlay: {}", overlay.display());
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -524,7 +564,46 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     } else {
         (count_hook_entries(&config), count_legacy_entries(&config))
     };
-    let state = if ours > 0 { "enabled" } else { "disabled" };
+
+    // Broken detection: the referenced binary/plugin file is gone while the
+    // config entry remains (e.g. package manager removed the payload).
+    let mut broken = false;
+    if ours > 0 {
+        if args.runtime == Runtime::Opencode {
+            // Only the v0.4.x materialized plugin has a verifiable payload;
+            // legacy file:// entries point into removed adapter bundles.
+            let v040_plugin = config
+                .get("plugins")
+                .and_then(Value::as_array)
+                .map(|p| {
+                    p.iter().any(|s| {
+                        s.as_str()
+                            .map(|x| x.contains(PLUGIN_MARKER))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            broken = v040_plugin && !opencode_plugin_dir().join("index.ts").is_file();
+            if broken {
+                println!(
+                    "  warning: materialized plugin missing: {}",
+                    opencode_plugin_dir().join("index.ts").display()
+                );
+            }
+        } else if let Some(cmd) = first_hook_command(&config)
+            && let Some(bin_path) = embedded_bin(&cmd)
+            && !Path::new(&bin_path).exists()
+        {
+            broken = true;
+            println!("  warning: embedded binary not found: {bin_path}");
+        }
+    }
+
+    let state = match (ours > 0, broken) {
+        (false, _) => "disabled",
+        (true, true) => "broken",
+        (true, false) => "enabled",
+    };
     println!(
         "{} ({}): {} — {} entr{} in {}",
         args.runtime.as_str(),
@@ -537,58 +616,25 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     if legacy > 0 {
         println!("  legacy v0.3.x entries present: {legacy} (run `adapter enable` to migrate)");
     }
-    // Broken-path detection: only v0.4.x commands (`<bin> hook <rt> <mode>`)
-    // start with the embedded binary path; legacy env-prefix commands are
-    // skipped to avoid false warnings.
-    if ours > 0
-        && args.runtime != Runtime::Opencode
-        && let Some(cmd) = first_hook_command(&config)
-        && let Some(bin_path) = embedded_bin(&cmd)
-        && !Path::new(&bin_path).exists()
-    {
-        println!("  warning: embedded binary not found: {bin_path}");
-    }
     Ok(())
 }
 
 fn count_legacy_entries(config: &Value) -> usize {
-    let mut n = 0;
-    if let Some(events) = config.get("hooks").and_then(Value::as_object) {
-        for groups in events.values().filter_map(Value::as_array) {
-            for group in groups {
-                if let Some(list) = group.get("hooks").and_then(Value::as_array) {
-                    n += list
-                        .iter()
-                        .filter(|h| {
-                            h.get("command")
-                                .and_then(Value::as_str)
-                                .map(|c| c.contains(LEGACY_HOOK_MARKER))
-                                .unwrap_or(false)
-                        })
-                        .count();
-                }
-            }
-        }
-    }
-    n
+    hook_commands(config)
+        .iter()
+        .filter(|c| c.contains(LEGACY_HOOK_MARKER))
+        .count()
 }
 
 fn first_hook_command(config: &Value) -> Option<String> {
-    config
-        .get("hooks")
-        .and_then(Value::as_object)?
-        .values()
-        .filter_map(Value::as_array)
-        .flatten()
-        .filter_map(|g| g.get("hooks").and_then(Value::as_array))
-        .flatten()
-        .filter_map(|h| h.get("command").and_then(Value::as_str))
+    hook_commands(config)
+        .into_iter()
         .find(|c| is_v040_hook_command(c))
-        .map(str::to_string)
 }
 
-/// First whitespace-separated token of a hook command, unquoted — the
-/// embedded binary path (commands look like `<bin> hook <rt> <mode>`).
+/// First whitespace-separated token of a v0.4.x hook command, unquoted —
+/// the embedded binary path. Only called on commands already validated by
+/// `is_v040_hook_command`, so the first token is always the binary.
 fn embedded_bin(command: &str) -> Option<String> {
     let cmd = command.trim();
     let token = if let Some(rest) = cmd.strip_prefix('\'') {
@@ -597,9 +643,9 @@ fn embedded_bin(command: &str) -> Option<String> {
         cmd.split_whitespace().next().map(str::to_string)
     }?;
     let token = token.trim_matches('\'');
-    if token.ends_with("skill-graph") || token.contains("skill-graph") {
-        Some(token.to_string())
-    } else {
+    if token.is_empty() {
         None
+    } else {
+        Some(token.to_string())
     }
 }
