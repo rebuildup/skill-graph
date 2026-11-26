@@ -117,9 +117,16 @@ function base(kind: string) {
 // pipe-buffer deadlock), but kill the child after PROC_TIMEOUT_MS — the
 // kill closes stdout so the read resolves with whatever arrived.
 const PROC_TIMEOUT_MS = 20_000
+// After the timeout kill, give the child a short drain window, then
+// escalate to SIGKILL: a process in uninterruptible sleep must not leave
+// collectProc pending forever.
+const PROC_DRAIN_MS = 2_000
+const MAX_LOAD_RECOMMENDS = 8
 
 async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
-  const readAll = new Response(proc.stdout).text()
+  // Attach a catch immediately: a stream error before `return readAll`
+  // would otherwise be an unhandled rejection.
+  const readAll = new Response(proc.stdout).text().catch(() => "")
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     await Promise.race([
@@ -136,7 +143,18 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
   } finally {
     if (timer) clearTimeout(timer)
   }
-  return readAll
+  // The kill closes stdout for well-behaved children; bound the drain so
+  // a stuck stream cannot hang the hook, then escalate to SIGKILL.
+  const drained = await Promise.race([
+    readAll,
+    new Promise<string>((resolve) =>
+      setTimeout(() => {
+        try { proc.kill("SIGKILL") } catch {}
+        resolve("")
+      }, PROC_DRAIN_MS),
+    ),
+  ])
+  return drained
 }
 
 async function recommendNames(
@@ -192,22 +210,28 @@ function resultText(result: unknown): string {
 }
 
 async function detectLoad(event: any): Promise<Record<string, any>[]> {
-  // Cheap pre-filter: only SKILL.md-touching tools reach the binary.
-  const tool = String(event.tool ?? "")
-  const input = event.input ?? {}
-  const inputJson = JSON.stringify(input ?? {})
-  const isSkillTool = tool.toLowerCase() === "skill"
-  const touches = inputJson.includes("SKILL.md") ||
-    (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
-  if (!isSkillTool && !touches) return []
-
-  const payload = {
-    tool_name: tool,
-    tool_input: input,
-    tool_response: resultText(event.result),
-    session_id: safeSessionID(event.sessionID),
-  }
   try {
+    // Cheap pre-filter: only SKILL.md-touching tools reach the binary.
+    const tool = String(event.tool ?? "")
+    const input = event.input ?? {}
+    const inputJson = JSON.stringify(input ?? {})
+    const isSkillTool = tool.toLowerCase() === "skill"
+    const touches = inputJson.includes("SKILL.md") ||
+      (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
+    if (!isSkillTool && !touches) return []
+
+    const payload = {
+      tool_name: tool,
+      tool_input: input,
+      tool_response: resultText(event.result),
+      session_id: safeSessionID(event.sessionID),
+      // Forwarded defensively so the Rust-side error-status guard also
+      // applies to plugin-originated payloads (the field name is
+      // UNVERIFIED against the OpenCode event API).
+      status: (event as any).status,
+      success: (event as any).success,
+      error: (event as any).error,
+    }
     const proc = Bun.spawn(
       [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
       { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
@@ -245,6 +269,10 @@ export default Plugin.define({
     // sessionID -> skills already dependency-recommended (parity with the
     // Rust hook's `skill:<name>` dedup markers).
     const loadDedup = new Map<string, Set<string>>()
+    // sessionID -> skills already reported via prompt.skills; the same
+    // skill re-listed on every prompt would otherwise emit a fresh
+    // load-grade event per prompt.
+    const promptSkillSeen = new Map<string, Set<string>>()
 
     const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
       if (!names.length) return
@@ -289,20 +317,33 @@ export default Plugin.define({
         })
       }
       // Native skill selection is a weaker signal than an actual load.
+      // Dedup per (session, skill): prompt.skills may reflect cumulative
+      // session state, and re-emitting per prompt would inflate
+      // load-grade counts.
       const skills = (event.prompt as any)?.skills
       if (Array.isArray(skills) && skills.length > 0) {
+        let seen = promptSkillSeen.get(sessionID)
+        if (!seen) {
+          if (promptSkillSeen.size >= MAX_PENDING_SESSIONS) {
+            const oldest = promptSkillSeen.keys().next().value
+            if (oldest !== undefined) promptSkillSeen.delete(oldest)
+          }
+          seen = new Set()
+          promptSkillSeen.set(sessionID, seen)
+        }
         for (const s of skills) {
           const name = typeof s === "string" ? s : s?.name ?? s?.id
-          if (typeof name === "string" && name && validSkillName(name)) {
-            emit({
-              ...base("skill_load"),
-              session_id: sessionID,
-              skill_name: name,
-              detection: "inferred",
-              confidence: "medium",
-              tool: "prompt.skills",
-            })
-          }
+          if (typeof name !== "string" || !name || !validSkillName(name)) continue
+          if (seen.has(name)) continue
+          seen.add(name)
+          emit({
+            ...base("skill_load"),
+            session_id: sessionID,
+            skill_name: name,
+            detection: "inferred",
+            confidence: "medium",
+            tool: "prompt.skills",
+          })
         }
       }
       // Empty prompts carry no signal — the Rust hook exits before
@@ -342,6 +383,10 @@ export default Plugin.define({
       const detected = await detectLoad(event)
       if (!detected.length) return
       const sessionID = safeSessionID(event.sessionID)
+      // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call
+      // touching many SKILL.md files must not spawn a recommend process
+      // per skill — each spawn is a full corpus scan.
+      let recommendBudget = MAX_LOAD_RECOMMENDS
       for (const det of detected) {
         emit(det)
         const detection = det.detection as string | undefined
@@ -363,7 +408,12 @@ export default Plugin.define({
           loadDedup.set(sessionID, done)
         }
         if (done.has(skillName)) continue
+        // Budget check before marking done: a skill skipped for budget
+        // was never recommended, so a later payload may still surface it
+        // (same ordering as the Rust hook).
+        if (recommendBudget <= 0) continue
         done.add(skillName)
+        recommendBudget -= 1
         const sessionNames = sessionCtx.get(sessionID) ?? []
         const deps = await recommendNames(
           skillName,

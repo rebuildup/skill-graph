@@ -394,6 +394,65 @@ fn observe_survives_symlink_cycle() {
     assert_eq!(obs.files_scanned, 1);
 }
 
+/// summary() must surface collection errors and by_session truncation
+/// rather than returning partial aggregates indistinguishable from clean
+/// ones.
+#[test]
+fn summary_reports_errors_and_session_cap() {
+    use skill_graph::observe::{Observation, summary};
+
+    let mut obs = Observation {
+        errors: (0..105).map(|i| format!("err-{i}")).collect(),
+        ..Default::default()
+    };
+    // 501 distinct sessions exceed MAX_SUMMARY_SESSIONS (500).
+    for i in 0..501 {
+        obs.events.push(load_event(
+            &format!("sess-{i}"),
+            "2026-01-01T00:00:00Z",
+            "alpha",
+        ));
+    }
+    let v = summary(&obs);
+    assert_eq!(v["collection_errors"], 105);
+    assert_eq!(v["errors"].as_array().unwrap().len(), 100);
+    assert_eq!(v["errors_omitted"], 5);
+    assert_eq!(v["by_session"].as_object().unwrap().len(), 500);
+    assert_eq!(v["by_session_omitted"], 1);
+}
+
+/// Passthrough events are untrusted log input: session_id is normalized
+/// to the constructor bounds, oversized fields are capped, and a
+/// skill_load with an empty skill_name is counted in lines_skipped
+/// rather than vanishing silently.
+#[test]
+fn passthrough_normalizes_fields_and_counts_empty_name() {
+    let dir = TempDir::new().unwrap();
+    let long_sid = "a".repeat(200);
+    let event = format!(
+        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{long_sid}","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
+    );
+    write_transcript(
+        &dir,
+        "events.jsonl",
+        &[
+            event.as_str(),
+            // empty skill_name: present but unattributable -> skipped
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"s1","timestamp":"2026-01-01T00:00:01Z","observed_via":"hook","skill_name":"","detection":"file_read","confidence":"high"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.events.len(), 1);
+    assert_eq!(obs.lines_skipped, 1);
+    assert_eq!(obs.events[0].session_id.len(), 128);
+    assert!(
+        obs.events[0]
+            .session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    );
+}
+
 /// Recommendation events with an empty `recommended` list must pass
 /// through (the hook emits `recommended: []` for dedup/no_recommendations
 /// outcomes), while explicit JSON nulls for required fields are rejected

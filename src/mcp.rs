@@ -5,7 +5,8 @@
 //! state, no config mutation — package install or MCP registration alone
 //! activates nothing; each client's config entry is the opt-in path.
 
-use crate::discovery::{Discovery, discover, output as discovery_output, resolve_roots};
+use crate::discovery::{discover, resolve_roots};
+use crate::model::{DiscoveryOutput, Skill};
 use crate::resolver::{Graph, build};
 use crate::search::recommend;
 use rmcp::model::{
@@ -28,11 +29,13 @@ const MAX_TOOL_ROOTS: usize = 32;
 /// the tool into an unbounded filesystem enumeration oracle.
 const MAX_DISCOVER_SKILLS: usize = 512;
 
-/// One memoized scan per roots signature: the raw discovery (for the
-/// `discover` tool) and the resolved graph (for `recommend`/`resolve`).
+/// One memoized scan per roots signature. The graph owns the skill
+/// list; `errors` is kept separately so the `discover` tool can render
+/// DiscoveryOutput without retaining a second full copy of every skill
+/// body (~2× corpus per entry otherwise).
 struct CacheEntry {
-    discovery: Arc<Discovery>,
     graph: Arc<Graph>,
+    errors: Vec<String>,
 }
 
 /// Bounded LRU of memoized scans keyed by roots signature. Alternating
@@ -70,14 +73,10 @@ impl SkillGraphMcp {
             guard.push((key, entry.clone()));
             return entry;
         }
-        let discovery = Arc::new(discover(roots));
-        // build() consumes the discovery; clone skills/errors (Skill is
-        // Clone) so both views stay available under one cache entry.
-        let graph = Arc::new(build(Discovery {
-            skills: discovery.skills.clone(),
-            errors: discovery.errors.clone(),
-        }));
-        let entry = Arc::new(CacheEntry { discovery, graph });
+        let discovery = discover(roots);
+        let errors = discovery.errors.clone();
+        let graph = Arc::new(build(discovery));
+        let entry = Arc::new(CacheEntry { graph, errors });
         guard.push((key, entry.clone()));
         if guard.len() > MAX_CACHE_ENTRIES {
             guard.remove(0);
@@ -92,19 +91,21 @@ fn tool_roots(arg_roots: Option<&Value>) -> Vec<PathBuf> {
     let explicit: Vec<PathBuf> = arg_roots
         .and_then(Value::as_array)
         .map(|arr| {
+            // Scan a generous window before filtering: non-directory
+            // entries must not consume the cap, and valid roots beyond
+            // position MAX_TOOL_ROOTS+1 are still honored up to the cap.
             arr.iter()
-                .take(MAX_TOOL_ROOTS + 1)
+                .take(8 * MAX_TOOL_ROOTS)
                 .filter_map(Value::as_str)
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir())
+                .take(MAX_TOOL_ROOTS)
                 .collect()
         })
         .unwrap_or_default();
-    if explicit.len() > MAX_TOOL_ROOTS {
-        // Oversized lists fall through to env/defaults rather than erroring:
-        // fail-open keeps the tool usable, and the cap still bounds work.
-        return crate::discovery::resolve_roots(Vec::new(), crate::discovery::default_roots);
-    }
+    // Truncation to MAX_TOOL_ROOTS is deliberate: silently falling back
+    // to env/defaults would return results for a corpus the caller did
+    // not ask about.
     resolve_roots(explicit, crate::discovery::default_roots)
 }
 
@@ -252,7 +253,10 @@ fn compute_tool(
         "discover" => {
             let roots = tool_roots(args.get("roots"));
             let entry = SkillGraphMcp::entry_for(cache, &roots);
-            let mut output = discovery_output(&entry.discovery);
+            let mut output = DiscoveryOutput {
+                skills: entry.graph.skills.iter().map(Skill::summary).collect(),
+                errors: entry.errors.clone(),
+            };
             if output.skills.len() > MAX_DISCOVER_SKILLS {
                 output.skills.truncate(MAX_DISCOVER_SKILLS);
                 output.errors.push(format!(

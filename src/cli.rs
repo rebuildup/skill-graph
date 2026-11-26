@@ -191,11 +191,9 @@ pub fn run() -> Result<(), String> {
         } => {
             let obs = observe::observe_path(&path)?;
             if summary {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&observe::summary(&obs))
-                        .map_err(|e| e.to_string())?
-                );
+                // Route through print_result so --format is validated
+                // (bogus values error) instead of being silently ignored.
+                print_result(observe::summary(&obs), &format)?;
                 return Ok(());
             }
             print_result(json!(obs), &format)

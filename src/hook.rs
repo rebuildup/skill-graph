@@ -173,7 +173,7 @@ impl HookEnv {
         let Ok(meta) = std::fs::symlink_metadata(self.recommended_path()) else {
             return Vec::new();
         };
-        if meta.file_type().is_symlink() || meta.len() > MAX_STATE_BYTES {
+        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_STATE_BYTES {
             return Vec::new();
         }
         let mut opts = std::fs::OpenOptions::new();
@@ -251,11 +251,13 @@ fn restrict_dir_perms(_path: &std::path::Path) {}
 
 /// Refuse to follow a symlink at the final path component. State lives
 /// under a shared TMPDIR where another local user could pre-plant links;
-/// O_NOFOLLOW makes open(2) fail instead of writing through them.
+/// O_NOFOLLOW makes open(2) fail instead of reading/writing through
+/// symlinks; O_NONBLOCK keeps a planted FIFO or socket at a state path
+/// from hanging the hook — for regular files both flags are no-ops.
 #[cfg(unix)]
 fn no_follow(opts: &mut std::fs::OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
-    opts.custom_flags(libc::O_NOFOLLOW);
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
 }
 
 #[cfg(not(unix))]

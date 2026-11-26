@@ -874,12 +874,16 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             if !bin.exists() {
                 broken = true;
                 println!("  warning: embedded binary not found: {bin_path}");
-            } else if !supports_hook_subcommand(bin) {
+            } else if !is_executable(bin) {
                 broken = true;
-                println!(
-                    "  warning: embedded binary does not support `hook` (need >= 0.4.0): {bin_path}"
-                );
+                println!("  warning: embedded binary is not executable: {bin_path}");
             }
+            // Deliberately no execution probe here: the embedded path comes
+            // from a config file that --project scope takes from the
+            // repository, so running it would let a crafted config execute
+            // an arbitrary binary during `adapter status`. Version
+            // staleness is only checked on candidate bins in resolve_bin,
+            // where the path came from PATH/the operator, not a repo file.
         }
     }
 

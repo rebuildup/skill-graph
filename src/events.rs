@@ -142,7 +142,7 @@ pub struct SkillUsageEvent {
 /// bound them like `tool`/`skill_path` so a hostile payload cannot write
 /// unbounded strings into every event line. Charset matches the hook's
 /// sanitizer so hook- and detect-emitted events agree.
-fn sanitize_session_id(session_id: &str) -> String {
+pub(crate) fn sanitize_session_id(session_id: &str) -> String {
     let safe: String = session_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
@@ -320,7 +320,10 @@ pub fn frontmatter_name(text: &str) -> Option<String> {
     let head: String = text.chars().take(MAX_SCAN).collect();
     let mut in_fence = false;
     for line in head.lines() {
-        if line.trim_end() == "---" {
+        // Fence must be exactly `---` on its line — `lines()` already
+        // strips \n/\r, so a trailing space (`--- `) must not open a
+        // fence the canonical parser (split_frontmatter) would reject.
+        if line == "---" {
             if in_fence {
                 return None;
             }
@@ -395,6 +398,17 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
             continue;
         }
         let end = pos + NEEDLE.len();
+        // Forward boundary: `SKILL.mdx`, `SKILL.md.bak`, `SKILL.md-old`,
+        // and `SKILL.md/…` are not the SKILL.md file. Delimiters that
+        // legitimately follow a filename in prose (`,`, `)`, `"`, space)
+        // are not in this set.
+        if end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric()
+                || matches!(bytes[end], b'.' | b'_' | b'-' | b'/'))
+        {
+            pos = end;
+            continue;
+        }
         let mut start = pos;
         while start > 0 && is_path_byte(bytes[start - 1]) {
             start -= 1;
@@ -940,6 +954,10 @@ mod tests {
             None // escaped JSON is not raw frontmatter
         );
         assert_eq!(frontmatter_name("no frontmatter"), None);
+        // A fence with a trailing space is not a fence — the canonical
+        // parser (split_frontmatter) rejects it, so detection must too.
+        assert_eq!(frontmatter_name("--- \nname: alpha\n---\n"), None);
+        assert_eq!(frontmatter_name("---\t\nname: alpha\n---\n"), None);
     }
 
     #[test]
@@ -950,6 +968,18 @@ mod tests {
         assert!(is_skill_md_path("a/b/SKILL.md"));
         assert!(!is_skill_md_path("a/b/MYSKILL.md"));
         assert!(!is_skill_md_path("a/b/SKILL.mdx"));
+        // Forward boundary: SKILL.md followed by name/path characters is
+        // a different file, not a SKILL.md access.
+        assert!(skill_md_paths("cat x/SKILL.mdx").is_empty());
+        assert!(skill_md_paths("cat x/SKILL.md.bak").is_empty());
+        assert!(skill_md_paths("cat x/SKILL.md-old").is_empty());
+        assert!(skill_md_paths("cat x/SKILL.md/y").is_empty());
+        // Legitimate trailing delimiters still classify; a trailing `.`
+        // is ambiguous with name continuation (`.bak`) and stays rejected.
+        assert_eq!(
+            skill_md_paths("cat x/SKILL.md, then cat y/SKILL.md"),
+            vec!["x/SKILL.md".to_string(), "y/SKILL.md".to_string()]
+        );
     }
 
     #[test]

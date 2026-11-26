@@ -113,8 +113,14 @@ jobs:
                 exit 1
               }
             else
-              # cross-compiled binaries cannot exec on this runner
-              file "$pkg/bin/skill-graph" | grep -q .
+              # cross-compiled binaries cannot exec on this runner;
+              # verify the object format matches the target rather than
+              # trusting any non-empty `file` output.
+              case "$target" in
+                linux-*) file "$pkg/bin/skill-graph" | grep -q 'ELF' ;;
+                darwin-*) file "$pkg/bin/skill-graph" | grep -q 'Mach-O' ;;
+                *) echo "unknown npm target: $target" >&2; exit 1 ;;
+              esac
             fi
           done <<< "$TARGETS"
       - name: Bundle portable plugin into metapackage

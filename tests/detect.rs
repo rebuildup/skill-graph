@@ -148,6 +148,35 @@ fn detect_emits_one_line_per_skill_md_access() {
     assert!(names.contains(&"beta-skill"), "{names:?}");
 }
 
+/// A payload touching more SKILL.md files than MAX_EVENTS_PER_PAYLOAD
+/// (64) must emit exactly 64 NDJSON lines — the cap bounds per-payload
+/// work for both the hook and the OpenCode plugin.
+#[test]
+fn detect_truncates_events_per_payload() {
+    let cmd = (0..70)
+        .map(|i| format!("cat /repo/skills/skill-{i:03}/SKILL.md"))
+        .collect::<Vec<_>>()
+        .join(";");
+    let payload = json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": cmd},
+        "tool_response": {"stdout": "..."},
+        "session_id": "s-cap"
+    });
+    let (out, rc) = run_detect(
+        &["detect", "--runtime", "claude-code", "--via", "hook"],
+        &payload.to_string(),
+    );
+    assert_eq!(rc, 0, "{out}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        64,
+        "expected capped 64 events, got {}",
+        lines.len()
+    );
+}
+
 /// Codex `exec` tool carries JS source, not a shell command; the
 /// exec_command({cmd: ...}) extraction path must classify SKILL.md
 /// accesses inside it.
