@@ -198,7 +198,10 @@ pub fn run() -> Result<(), String> {
                 print_result(observe::summary(&obs), &format)?;
                 return Ok(());
             }
-            print_result(json!(obs), &format)
+            // Serialize Observation directly: routing through json!(obs)
+            // first would materialize a second ~64MiB-budgeted tree as a
+            // Value before pretty-printing (#144 r14).
+            print_result(obs, &format)
         }
         Command::Hook { runtime, mode } => {
             use crate::events::Runtime;
@@ -274,7 +277,25 @@ pub fn run() -> Result<(), String> {
             std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024 + 1)
                 .read_to_string(&mut input)
                 .map_err(|e| format!("stdin: {e}"))?;
+            // Drain any unread remainder (bounded) so a caller writing a
+            // large payload does not hit EPIPE against an exited process
+            // — same contract as the hook's oversized-stdin path.
             if input.len() as u64 > 16 * 1024 * 1024 {
+                let mut sink = Vec::new();
+                let _ = std::io::stdin()
+                    .take(16 * 1024 * 1024)
+                    .read_to_end(&mut sink);
+                return Err("stdin payload too large".to_string());
+            }
+            // serde_json::Value retains ~16-30x its input; refuse to
+            // materialize a tree for payloads far beyond any legitimate
+            // hook/plugin message (the plugin sends KB-scale events).
+            const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+            if input.len() > MAX_PARSE_BYTES {
+                let mut sink = Vec::new();
+                let _ = std::io::stdin()
+                    .take(16 * 1024 * 1024)
+                    .read_to_end(&mut sink);
                 return Err("stdin payload too large".to_string());
             }
             let payload: serde_json::Value =

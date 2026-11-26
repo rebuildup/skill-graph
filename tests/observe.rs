@@ -803,3 +803,50 @@ fn funnel_mixed_timestamps_convert_via_encounter_order() {
     let v = summary(&obs);
     assert_eq!(v["converted_recommendations"], 1);
 }
+
+/// Round-14 M1: a symlinked .jsonl whose target also appears in the
+/// scan must still be read — observables store the canonical path so
+/// O_NOFOLLOW guards only the final component and read_dir order can
+/// no longer decide whether the file is seen.
+#[cfg(unix)]
+#[test]
+fn symlinked_jsonl_observable_is_scanned_once() {
+    let dir = TempDir::new().unwrap();
+    let real = write_transcript(
+        &dir,
+        "real.jsonl",
+        &[
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hi"}}"#,
+        ],
+    );
+    std::os::unix::fs::symlink(&real, dir.path().join("link.jsonl")).unwrap();
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 1);
+    assert_eq!(obs.sessions, 1);
+    assert!(obs.errors.is_empty(), "{:?}", obs.errors);
+}
+
+/// Round-14 H1/H2: a rollout carrying a huge session_id plus many
+/// exec calls must stay bounded — session/timestamp/call_id are
+/// sanitized+interned at ingest instead of cloned per access.
+#[test]
+fn codex_rollout_with_oversized_session_id_stays_bounded() {
+    let dir = TempDir::new().unwrap();
+    let big_sid = "s".repeat(200 * 1024);
+    let mut lines = vec![format!(
+        r#"{{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{{"session_id":"{big_sid}"}}}}"#
+    )];
+    for i in 0..50 {
+        lines.push(format!(
+            r#"{{"type":"response_item","timestamp":"2026-01-01T00:00:{i:02}Z","payload":{{"type":"custom_tool_call","name":"exec","call_id":"c{i}","input":"cat /x/skills/alpha-skill/SKILL.md"}}}}"#
+        ));
+    }
+    write_transcript(
+        &dir,
+        "rollout.jsonl",
+        &lines.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&50));
+    assert_eq!(obs.sessions, 1);
+}

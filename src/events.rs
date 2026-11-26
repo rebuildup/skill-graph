@@ -80,7 +80,8 @@ pub enum Detection {
     /// Weaker heuristic signal (e.g. runtime skill-selection list).
     Inferred,
     /// Name/path mentioned without read evidence. Emitted by `observe`
-    /// only; hooks do not produce this.
+    /// transcript scanning and by hook/plugin detection for
+    /// reference-only accesses; never load-grade.
     Mention,
     /// Reserved: explicit confirmation that the skill was applied.
     /// No emitter produces this yet.

@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { dirname, join } from "node:path"
+import { dirname, isAbsolute, join } from "node:path"
 import { createHash } from "node:crypto"
 
 // skill-graph adapter for OpenCode.
@@ -17,8 +17,14 @@ import { createHash } from "node:crypto"
 // fails open on any error.
 
 const SKILL_GRAPH_BIN = process.env.SKILL_GRAPH_BIN ?? "skill-graph"
+// Parity with the Rust hook's env_absolute_path: env-supplied paths
+// must be absolute — a relative value resolves against the OpenCode
+// server process cwd (an arbitrary project tree) (#144 r13/r14).
+const absPath = (v: string | undefined): string | undefined =>
+  v !== undefined && v !== "" && isAbsolute(v) ? v : undefined
 const EVENT_LOG =
-  process.env.SKILL_GRAPH_EVENT_LOG ?? join(tmpdir(), "skill-graph-events.jsonl")
+  absPath(process.env.SKILL_GRAPH_EVENT_LOG) ??
+  join(absPath(tmpdir()) ?? "/tmp", "skill-graph-events.jsonl")
 // Parity with the Rust hook: SKILL_GRAPH_HOOK_NOSTATE=1 suppresses all
 // event writes; SKILL_GRAPH_EVENT_LOG_MAX bounds the log (rotate to .1).
 const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
@@ -45,6 +51,10 @@ const EVENT_LOG_MAX = envUint("SKILL_GRAPH_EVENT_LOG_MAX", 64 * 1024 * 1024)
 // process, so unbounded maps would grow forever.
 const MAX_EMITTED = 10_000
 const MAX_PENDING_SESSIONS = 200
+// prompt.skills bounds: entries scanned per prompt event and distinct
+// names retained per session for dedup (#144 r14).
+const MAX_PROMPT_SKILLS = 1_024
+const MAX_SEEN_SKILLS = 4_096
 const MAX_SESSION_CTX = 200
 const MAX_SESSION_NAMES = 32
 // detectLoad spawns one `skill-graph detect` subprocess per
@@ -403,10 +413,13 @@ export default Plugin.define({
           seen = new Set()
           promptSkillSeen.set(sessionID, seen)
         }
-        for (const s of skills) {
+        // Bound both the scan and the retained dedup set: prompt.skills
+        // is runtime-supplied and unbounded (#144 r14).
+        for (const s of skills.slice(0, MAX_PROMPT_SKILLS)) {
           const name = typeof s === "string" ? s : s?.name ?? s?.id
           if (typeof name !== "string" || !name || !validSkillName(name)) continue
           if (seen.has(name)) continue
+          if (seen.size >= MAX_SEEN_SKILLS) continue
           // Register the dedup key only when the event was actually
           // written — a transient log failure must not suppress retries.
           if (emit({

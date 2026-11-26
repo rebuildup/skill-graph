@@ -232,6 +232,12 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                             .iter()
                             .map(|l| l.target.len() + 64)
                             .sum::<usize>()
+                        // digest (64 B), parse_error text, root path and
+                        // HashMap overhead are small but retained;
+                        // charge a flat allowance plus their real lens.
+                        + skill.digest.len()
+                        + skill.parse_error.as_deref().map_or(0, str::len)
+                        + skill.root.as_os_str().len()
                         + skill.path.as_os_str().len()
                         + 256) as u64;
                     total_bytes = total_bytes.saturating_add(retained.max(file_bytes));

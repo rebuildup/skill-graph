@@ -211,18 +211,31 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
     const MAX_METADATA_ENTRIES: usize = 128;
     const MAX_METADATA_VALUE_CHARS: usize = 1024;
     const MAX_METADATA_TOTAL_CHARS: usize = 8 * 1024;
+    let is_requires = |k: &str| k == "requires-skills" || k == "requires_skills";
+    // Sort key references rather than collecting pairs: the frontmatter
+    // map itself is already parsed, so only survivor keys+values are
+    // materialized into `metadata`.
+    let mut keys: Vec<&String> = meta.metadata.keys().collect();
+    // HashMap iteration order is random per process: which keys survive
+    // the budget must be deterministic or identical SKILL.md files
+    // would admit different requires-links across runs (#144 r14).
+    // requires-* keys sort first and are exempt from eviction — they
+    // build Requires links and must never be truncated away.
+    keys.sort_by(|a, b| is_requires(b).cmp(&is_requires(a)).then_with(|| a.cmp(b)));
     let mut metadata: HashMap<String, String> = HashMap::new();
     let mut metadata_budget = MAX_METADATA_TOTAL_CHARS;
-    for (k, v) in meta.metadata.into_iter() {
-        if metadata.len() >= MAX_METADATA_ENTRIES || metadata_budget == 0 {
+    for k in keys {
+        if !is_requires(k) && (metadata.len() >= MAX_METADATA_ENTRIES || metadata_budget == 0) {
+            // Sorted order guarantees every remaining key is also
+            // non-required, so stopping here is deterministic.
             break;
         }
-        let Some(t) = yaml_text(&v) else {
+        let Some(t) = yaml_text(&meta.metadata[k]) else {
             continue;
         };
         let t: String = t.chars().take(MAX_METADATA_VALUE_CHARS).collect();
         metadata_budget = metadata_budget.saturating_sub(k.len() + t.len());
-        metadata.insert(k, t);
+        metadata.insert(k.clone(), t);
     }
 
     // Bound link-derived strings: targets flow verbatim into
@@ -440,6 +453,35 @@ mod tests {
         );
         let skill = parse_skill(&path, dir.path()).unwrap();
         assert!(skill.metadata.len() <= 128, "{}", skill.metadata.len());
+    }
+
+    #[test]
+    fn metadata_truncation_is_deterministic_and_keeps_requires() {
+        let dir = tempfile::tempdir().unwrap();
+        // >128 entries: `requires-skills` sorts last alphabetically and
+        // would be evicted under HashMap's random iteration order;
+        // the r14 fix sorts survivors deterministically and exempts
+        // requires-* keys from eviction entirely.
+        let entries: String = (0..200).map(|i| format!("  zzz{i}: v{i}\n")).collect();
+        let frontmatter = format!(
+            "name: meta-det\ndescription: d\nmetadata:\n  requires-skills: dep-a\n{entries}"
+        );
+        let path = write_skill(&dir.path().join("meta-det"), &frontmatter);
+        let s1 = parse_skill(&path, dir.path()).unwrap();
+        let s2 = parse_skill(&path, dir.path()).unwrap();
+        assert!(s1.metadata.contains_key("requires-skills"));
+        assert!(
+            s1.links
+                .iter()
+                .any(|l| l.kind == crate::model::LinkKind::Requires && l.target == "dep-a")
+        );
+        let keys = |s: &crate::model::Skill| {
+            let mut v: Vec<String> = s.metadata.keys().cloned().collect();
+            v.sort();
+            v
+        };
+        assert_eq!(keys(&s1), keys(&s2));
+        assert_eq!(s1.metadata.len(), s2.metadata.len());
     }
 
     #[test]
