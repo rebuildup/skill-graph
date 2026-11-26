@@ -258,11 +258,7 @@ pub fn run() -> Result<(), String> {
 }
 
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    if roots.is_empty() {
-        crate::discovery::default_roots()
-    } else {
-        roots
-    }
+    crate::discovery::resolve_roots(roots, crate::discovery::default_roots)
 }
 
 fn graph_for(roots: Vec<PathBuf>) -> Result<crate::resolver::Graph, String> {

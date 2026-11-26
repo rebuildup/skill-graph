@@ -5,8 +5,8 @@
 //! state, no config mutation — package install or MCP registration alone
 //! activates nothing; each client's config entry is the opt-in path.
 
-use crate::discovery::{default_roots, discover, output as discovery_output};
-use crate::resolver::build;
+use crate::discovery::{Discovery, discover, output as discovery_output, resolve_roots};
+use crate::resolver::{Graph, build};
 use crate::search::recommend;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -19,10 +19,23 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Process-internal memoization (v1.0.0 spec §6): the built graph is
-/// cached per roots signature for the lifetime of this server process.
-/// No persistent cache — a client restart or new roots signature rebuilds.
-type GraphCache = Arc<std::sync::Mutex<Option<(String, Arc<crate::resolver::Graph>)>>>;
+/// Upper bound on roots a single tool call may request. The env var and
+/// defaults are operator-controlled; this only caps agent-supplied lists.
+const MAX_TOOL_ROOTS: usize = 32;
+
+/// Cap on skills returned by `discover`; larger corpora are truncated and
+/// noted in `errors` so a hostile or accidental `roots: ["/"]` cannot turn
+/// the tool into an unbounded filesystem enumeration oracle.
+const MAX_DISCOVER_SKILLS: usize = 512;
+
+/// One memoized scan per roots signature: the raw discovery (for the
+/// `discover` tool) and the resolved graph (for `recommend`/`resolve`).
+struct CacheEntry {
+    discovery: Arc<Discovery>,
+    graph: Arc<Graph>,
+}
+
+type GraphCache = Arc<std::sync::Mutex<Option<(String, Arc<CacheEntry>)>>>;
 
 struct SkillGraphMcp {
     graph_cache: GraphCache,
@@ -35,50 +48,54 @@ impl SkillGraphMcp {
         }
     }
 
-    fn graph_for(&self, roots: &[PathBuf]) -> Arc<crate::resolver::Graph> {
-        let key = roots
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\u{1f}");
+    fn entry_for(&self, roots: &[PathBuf]) -> Arc<CacheEntry> {
+        // JSON array encoding is injective — no separator collision.
+        let key = serde_json::to_string(
+            &roots
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
         let mut guard = self.graph_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((k, g)) = guard.as_ref()
+        if let Some((k, entry)) = guard.as_ref()
             && *k == key
         {
-            return g.clone();
+            return entry.clone();
         }
-        let g = Arc::new(build(discover(roots)));
-        *guard = Some((key, g.clone()));
-        g
+        let discovery = Arc::new(discover(roots));
+        // build() consumes the discovery; clone skills/errors (Skill is
+        // Clone) so both views stay available under one cache entry.
+        let graph = Arc::new(build(Discovery {
+            skills: discovery.skills.clone(),
+            errors: discovery.errors.clone(),
+        }));
+        let entry = Arc::new(CacheEntry { discovery, graph });
+        *guard = Some((key, entry.clone()));
+        entry
     }
 }
 
-/// Roots resolution shared with hook/CLI semantics: SKILL_GRAPH_ROOTS
-/// (colon-separated) wins, then explicit tool `roots`, then defaults.
-fn resolve_roots(arg_roots: Option<&Value>) -> Vec<PathBuf> {
-    if let Ok(spec) = std::env::var("SKILL_GRAPH_ROOTS") {
-        let roots: Vec<PathBuf> = spec
-            .split(':')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect();
-        if !roots.is_empty() {
-            return roots;
-        }
+/// Roots resolution shared by every entry point: SKILL_GRAPH_ROOTS wins,
+/// then explicit tool `roots` (capped at MAX_TOOL_ROOTS), then defaults.
+fn tool_roots(arg_roots: Option<&Value>) -> Vec<PathBuf> {
+    let explicit: Vec<PathBuf> = arg_roots
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .take(MAX_TOOL_ROOTS + 1)
+                .filter_map(Value::as_str)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    if explicit.len() > MAX_TOOL_ROOTS {
+        // Oversized lists fall through to env/defaults rather than erroring:
+        // fail-open keeps the tool usable, and the cap still bounds work.
+        return crate::discovery::resolve_roots(Vec::new(), crate::discovery::default_roots);
     }
-    if let Some(arr) = arg_roots.and_then(Value::as_array) {
-        let roots: Vec<PathBuf> = arr
-            .iter()
-            .filter_map(Value::as_str)
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect();
-        if !roots.is_empty() {
-            return roots;
-        }
-    }
-    default_roots().into_iter().filter(|p| p.is_dir()).collect()
+    resolve_roots(explicit, crate::discovery::default_roots)
 }
 
 fn arg_str<'a>(args: &'a JsonObject, key: &str) -> Option<&'a str> {
@@ -119,7 +136,7 @@ fn tools() -> Vec<Tool> {
     let roots_prop = json!({
         "type": "array",
         "items": {"type": "string"},
-        "description": "Skill roots to search. Default: SKILL_GRAPH_ROOTS or the standard user/project roots."
+        "description": "Skill roots to search. SKILL_GRAPH_ROOTS (when set) overrides this; otherwise these roots are used instead of the standard user/project roots."
     });
     vec![
         Tool::new(
@@ -196,10 +213,10 @@ impl ServerHandler for SkillGraphMcp {
                 let Some(query) = arg_str(&args, "query") else {
                     return Ok(tool_error("missing required argument: query"));
                 };
-                let roots = resolve_roots(args.get("roots"));
-                let graph = self.graph_for(&roots);
+                let roots = tool_roots(args.get("roots"));
+                let entry = self.entry_for(&roots);
                 let recs = recommend(
-                    &graph,
+                    &entry.graph,
                     query,
                     arg_str(&args, "context").unwrap_or(""),
                     arg_usize(&args, "max", 3),
@@ -207,16 +224,24 @@ impl ServerHandler for SkillGraphMcp {
                 tool_result(&json!(recs))
             }
             "discover" => {
-                let roots = resolve_roots(args.get("roots"));
-                tool_result(&json!(discovery_output(&discover(&roots))))
+                let roots = tool_roots(args.get("roots"));
+                let entry = self.entry_for(&roots);
+                let mut output = discovery_output(&entry.discovery);
+                if output.skills.len() > MAX_DISCOVER_SKILLS {
+                    output.skills.truncate(MAX_DISCOVER_SKILLS);
+                    output.errors.push(format!(
+                        "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
+                    ));
+                }
+                tool_result(&json!(output))
             }
             "resolve" => {
                 let Some(target) = arg_str(&args, "target") else {
                     return Ok(tool_error("missing required argument: target"));
                 };
-                let roots = resolve_roots(args.get("roots"));
-                let graph = self.graph_for(&roots);
-                tool_result(&json!(crate::cli::resolve_target(&graph, target)))
+                let roots = tool_roots(args.get("roots"));
+                let entry = self.entry_for(&roots);
+                tool_result(&json!(crate::cli::resolve_target(&entry.graph, target)))
             }
             other => {
                 return Err(McpError::invalid_params(

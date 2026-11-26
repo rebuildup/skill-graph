@@ -208,15 +208,9 @@ fn cksum_decimal(data: &[u8]) -> String {
     (crc ^ 0xffff_ffff).to_string()
 }
 
-fn hook_roots(runtime: Runtime) -> Vec<PathBuf> {
-    if let Ok(spec) = std::env::var("SKILL_GRAPH_ROOTS") {
-        return spec
-            .split(':')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect();
-    }
+/// Runtime-specific fallback roots. `SKILL_GRAPH_ROOTS` is handled by
+/// `discovery::resolve_roots` and takes precedence over these.
+fn hook_fallback_roots(runtime: Runtime) -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dot_dir = match runtime {
@@ -336,7 +330,7 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     }
     env.touch_marker(&dedup_key);
 
-    let roots = hook_roots(env.runtime);
+    let roots = crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime));
     if roots.is_empty() {
         emit_recommendation(
             env,
@@ -421,7 +415,7 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
         ));
     }
     let phash = events::prompt_hash(&query);
-    let roots = hook_roots(env.runtime);
+    let roots = crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime));
     if query.is_empty() || roots.is_empty() {
         emit_recommendation(
             env,
