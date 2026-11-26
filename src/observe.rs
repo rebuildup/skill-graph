@@ -126,11 +126,20 @@ fn collect_observables(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String
     Ok(())
 }
 
+/// Transcript/DB inputs are user data and can be huge; refuse to slurp
+/// anything beyond this into memory.
+const MAX_OBSERVE_FILE_BYTES: u64 = 256 * 1024 * 1024;
+
 fn observe_jsonl(
     file: &Path,
     obs: &mut Observation,
     sessions: &mut BTreeSet<String>,
 ) -> Result<(), String> {
+    if let Ok(meta) = fs::metadata(file)
+        && meta.len() > MAX_OBSERVE_FILE_BYTES
+    {
+        return Err(format!("{}: file too large", file.display()));
+    }
     let content = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let mut claude = ClaudeScan::default();
     let mut codex = CodexScan::default();
@@ -338,7 +347,7 @@ impl ClaudeScan {
         }
         for (id, session, ts, tool, input) in &self.uses {
             let output = self.results.get(id).map(String::as_str).unwrap_or("");
-            if let Some(c) = events::classify_tool_access(tool, input, output) {
+            for c in events::classify_tool_access_all(tool, input, output) {
                 record_event(
                     SkillUsageEvent::skill_load(
                         Runtime::ClaudeCode,
@@ -421,17 +430,12 @@ impl CodexScan {
                     let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
                     let mut accesses: Vec<(String, events::Access)> = Vec::new();
                     for cmd in events::extract_exec_commands(input) {
-                        if let Some((path, access)) = events::classify_command(&cmd) {
-                            accesses.push((path, access));
-                        }
+                        accesses.extend(events::classify_command(&cmd));
                     }
                     // Fallback: unparsed JS may still reference SKILL.md in
                     // the raw input text.
-                    if accesses.is_empty()
-                        && input.contains("SKILL.md")
-                        && let Some((path, access)) = events::classify_command(input)
-                    {
-                        accesses.push((path, access));
+                    if accesses.is_empty() && input.contains("SKILL.md") {
+                        accesses.extend(events::classify_command(input));
                     }
                     if !accesses.is_empty() {
                         self.pending.push(PendingCall {
@@ -710,7 +714,7 @@ fn observe_db(
                             .and_then(|s| s.get("content"))
                             .unwrap_or(&Value::Null),
                     );
-                    if let Some(c) = events::classify_tool_access(tool, &input, &output) {
+                    for c in events::classify_tool_access_all(tool, &input, &output) {
                         record_event(
                             SkillUsageEvent::skill_load(
                                 Runtime::Opencode,

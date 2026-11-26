@@ -154,7 +154,7 @@ impl HookEnv {
         std::fs::read_to_string(self.recommended_path())
             .map(|s| {
                 s.lines()
-                    .filter(|l| !l.is_empty())
+                    .filter(|l| !l.is_empty() && crate::parser::valid_skill_name(l))
                     .map(str::to_string)
                     .collect()
             })
@@ -168,7 +168,7 @@ impl HookEnv {
         const CAP: usize = 32;
         let mut all = self.session_recommended();
         for n in names {
-            if !all.contains(n) {
+            if crate::parser::valid_skill_name(n) && !all.contains(n) {
                 all.push(n.clone());
             }
         }
@@ -314,6 +314,7 @@ fn skill_load_prefilter(payload: &Value) -> bool {
     let tool = payload
         .get("tool_name")
         .or_else(|| payload.get("tool"))
+        .or_else(|| payload.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
     if tool == "Skill" {
@@ -338,16 +339,42 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     if !skill_load_prefilter(payload) {
         return None;
     }
-    let mut event = events::detect_from_payload(env.runtime, ObservedVia::Hook, payload)?;
-    // Normalize to the sanitized session id so all events of this run agree.
-    event.session_id = env.session_id.clone();
-    env.log_event(&event);
-    let detection = event.detection?;
-    if !LOAD_GRADE.contains(&detection) {
+    let detected = events::detect_all_from_payload(env.runtime, ObservedVia::Hook, payload);
+    if detected.is_empty() {
         return None;
     }
-    let skill_name = event.skill_name.clone()?;
+    // One payload may load several SKILL.md files; every access is logged
+    // and each load-grade skill gets its own dependency recommendation.
+    let mut contexts = Vec::new();
+    let mut roots_cache: Option<Vec<PathBuf>> = None;
+    for mut event in detected {
+        // Normalize to the sanitized session id so all events agree.
+        event.session_id = env.session_id.clone();
+        env.log_event(&event);
+        let Some(detection) = event.detection else {
+            continue;
+        };
+        if !LOAD_GRADE.contains(&detection) {
+            continue;
+        }
+        let Some(skill_name) = event.skill_name.clone() else {
+            continue;
+        };
+        let roots = roots_cache.get_or_insert_with(|| hook_roots(env.runtime));
+        if let Some(ctx) = skill_load_context(env, &skill_name, roots) {
+            contexts.push(ctx);
+        }
+    }
+    if contexts.is_empty() {
+        return None;
+    }
+    Some(hook_response("PostToolUse", &contexts.join("\n")))
+}
 
+/// Dependency-recommendation flow for one loaded skill. Emits the
+/// `recommendation` event for every outcome and returns the injection
+/// text only when there is something to surface.
+fn skill_load_context(env: &HookEnv, skill_name: &str, roots: &[PathBuf]) -> Option<String> {
     let dedup_key = format!("skill:{skill_name}");
     if env.marker_exists(&dedup_key) {
         emit_recommendation(
@@ -381,7 +408,7 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     // already surfaced become recommendation context.
     let session_ctx = env.session_recommended().join(" ");
     let start = Instant::now();
-    let recs = match recommend_names(&skill_name, &session_ctx, 5, &roots) {
+    let recs = match recommend_names(skill_name, &session_ctx, 5, roots) {
         Ok(r) => r,
         Err(_) => {
             emit_recommendation(
@@ -432,7 +459,7 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
         "skill-graph: '{skill_name}' declares dependencies — {}. Read the matching SKILL.md files if the task needs them.",
         names.join(", ")
     );
-    Some(hook_response("PostToolUse", &context))
+    Some(context)
 }
 
 fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
@@ -539,16 +566,24 @@ pub fn run_hook(runtime: Runtime, mode: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Hook payloads are small control messages; anything near this size is
+/// not a legitimate hook call and is dropped fail-open.
+const MAX_STDIN_BYTES: u64 = 16 * 1024 * 1024;
+
 fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
     let mut input = String::new();
     std::io::stdin()
+        .take(MAX_STDIN_BYTES + 1)
         .read_to_string(&mut input)
         .map_err(|e| format!("stdin: {e}"))?;
-    // Empty or unparseable stdin is not a hook payload: exit before
-    // touching state dirs or the event log (matches the v0.3.x shell
-    // hook, which exited early when jq could not parse the payload).
+    if input.len() as u64 > MAX_STDIN_BYTES {
+        return Ok(());
+    }
+    // Empty, non-object, or unparseable stdin is not a hook payload:
+    // exit before touching state dirs or the event log (matches the
+    // v0.3.x shell hook, which exited early when jq could not parse).
     let payload: Value = match serde_json::from_str::<Value>(input.trim()) {
-        Ok(v) if !v.is_null() => v,
+        Ok(v) if v.is_object() => v,
         _ => return Ok(()),
     };
     let env = HookEnv::from_payload(runtime, &payload);

@@ -18,6 +18,12 @@ pub fn run(sizes: &[usize], iterations: usize) -> Result<Value, String> {
     if iterations == 0 {
         return Err("perf iterations must be > 0".to_string());
     }
+    if sizes.len() > 16 || sizes.iter().any(|&s| s > 10_000) {
+        return Err("perf sizes are capped at 16 entries of <= 10000".to_string());
+    }
+    if iterations > 10_000 {
+        return Err("perf iterations are capped at 10000".to_string());
+    }
     let mut results = Vec::new();
     for &size in sizes {
         if size == 0 {
