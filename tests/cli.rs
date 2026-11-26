@@ -24,11 +24,7 @@ fn run_recommend(args: &[&str], stdin: Option<&str>) -> (String, String, i32) {
     if let Some(input) = stdin {
         // The child may exit before reading (arg validation errors);
         // a broken pipe here is not a test failure.
-        let _ = child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(input.as_bytes());
+        let _ = child.stdin.as_mut().unwrap().write_all(input.as_bytes());
     }
     let out = child.wait_with_output().expect("wait");
     (
