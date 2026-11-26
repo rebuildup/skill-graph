@@ -154,7 +154,7 @@ fn resolve_by_unnormalized_absolute_path_matches() {
 
 const SKILL_SUMMARY_URI: &str = "https://skill-graph.local/contracts/v1/skill-summary.schema.json";
 
-fn assert_schema_valid(schema_src: &str, instance: &Value, label: &str) {
+fn validator_for(schema_src: &str, label: &str) -> jsonschema::Validator {
     let schema: Value = serde_json::from_str(schema_src).unwrap();
     let summary: Value =
         serde_json::from_str(include_str!("../contracts/v1/skill-summary.schema.json")).unwrap();
@@ -163,13 +163,25 @@ fn assert_schema_valid(schema_src: &str, instance: &Value, label: &str) {
         .expect("registry add")
         .prepare()
         .expect("registry prepare");
-    let validator = jsonschema::options()
+    jsonschema::options()
         .with_registry(&registry)
         .build(&schema)
-        .unwrap_or_else(|e| panic!("{label}: schema compile failed: {e}"));
+        .unwrap_or_else(|e| panic!("{label}: schema compile failed: {e}"))
+}
+
+fn assert_schema_valid(schema_src: &str, instance: &Value, label: &str) {
+    let validator = validator_for(schema_src, label);
     if let Err(errors) = validator.validate(instance) {
         panic!("{label}: instance violates schema: {errors}");
     }
+}
+
+fn assert_schema_invalid(schema_src: &str, instance: &Value, label: &str) {
+    let validator = validator_for(schema_src, label);
+    assert!(
+        validator.validate(instance).is_err(),
+        "{label}: invalid instance unexpectedly passed schema"
+    );
 }
 
 #[test]
@@ -242,4 +254,65 @@ fn skill_usage_events_validate_against_event_schema() {
         let v = serde_json::to_value(e).unwrap();
         assert_schema_valid(schema, &v, "skill-usage-event");
     }
+}
+
+#[test]
+fn contract_schemas_reject_invalid_instances() {
+    use serde_json::json;
+    let event_schema = include_str!("../contracts/v1/skill-usage-event.schema.json");
+
+    // Missing a required field.
+    assert_schema_invalid(
+        event_schema,
+        &json!({"schema_version": 1, "kind": "skill_load", "runtime": "codex"}),
+        "event-missing-observed_via",
+    );
+    // Enum violation.
+    assert_schema_invalid(
+        event_schema,
+        &json!({
+            "schema_version": 1, "kind": "bogus", "runtime": "codex",
+            "observed_via": "hook"
+        }),
+        "event-bad-kind",
+    );
+    // Conditional requirement: prompt_submit must carry prompt_hash.
+    assert_schema_invalid(
+        event_schema,
+        &json!({
+            "schema_version": 1, "kind": "prompt_submit", "runtime": "codex",
+            "observed_via": "hook"
+        }),
+        "event-prompt-submit-without-hash",
+    );
+    // recommendation must carry recommended/emitted/reason/trigger.
+    assert_schema_invalid(
+        event_schema,
+        &json!({
+            "schema_version": 1, "kind": "recommendation", "runtime": "codex",
+            "observed_via": "hook"
+        }),
+        "event-recommendation-missing-fields",
+    );
+
+    // recommendation item missing required members.
+    assert_schema_invalid(
+        include_str!("../contracts/v1/recommendation.schema.json"),
+        &json!([{"skill": {"name": "x"}}]),
+        "recommendation-missing-score",
+    );
+
+    // discovery output must be an object with skills+errors arrays.
+    assert_schema_invalid(
+        include_str!("../contracts/v1/discovery-output.schema.json"),
+        &json!({"skills": "not-an-array", "errors": []}),
+        "discovery-skills-not-array",
+    );
+
+    // resolve-result: name kind requires ambiguous+skills.
+    assert_schema_invalid(
+        include_str!("../contracts/v1/resolve-result.schema.json"),
+        &json!({"kind": "name", "skills": []}),
+        "resolve-name-missing-ambiguous",
+    );
 }
