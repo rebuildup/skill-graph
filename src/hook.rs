@@ -94,7 +94,11 @@ impl HookEnv {
         if let Some(parent) = self.event_log.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(meta) = std::fs::metadata(&self.event_log)
+        // Rotation must not follow symlinks: symlink_metadata reports the
+        // link itself, so a planted symlink (or FIFO) at the log path is
+        // never renamed — parity with the OpenCode plugin's lstatSync.
+        if let Ok(meta) = std::fs::symlink_metadata(&self.event_log)
+            && meta.is_file()
             && meta.len() > self.event_log_max
         {
             // v0.3.x convention: append ".1" to the full log path.
@@ -110,22 +114,33 @@ impl HookEnv {
             opts.mode(0o600);
         }
         no_follow(&mut opts);
-        if let Ok(mut f) = opts.open(&self.event_log) {
-            // mode(0o600) only applies at creation; tighten pre-existing logs.
-            restrict_perms(&self.event_log);
-            let _ = writeln!(f, "{line}");
+        let Ok(f) = opts.open(&self.event_log) else {
+            return;
+        };
+        // Shared-TMPDIR contract (docs/specs/contracts.md): the opened fd —
+        // never the path — decides writability. A foreign-owned, non-regular,
+        // or multiply-linked file is skipped fail-open, and permissions are
+        // tightened via fchmod on the fd so a path swap cannot redirect the
+        // chmod (issue #169, audit D-01).
+        if !fd_writeable(&f) {
+            return;
         }
+        let mut f = f;
+        restrict_perms_fd(&f);
+        let _ = writeln!(f, "{line}");
     }
 
     fn marker_exists(&self, dedup_key: &str) -> bool {
-        // symlink_metadata: a planted symlink must not satisfy dedup.
-        !self.nostate
-            && !self.state_disabled
-            && self
-                .marker_path(dedup_key)
-                .symlink_metadata()
-                .map(|m| m.is_file())
-                .unwrap_or(false)
+        // symlink_metadata: a planted symlink must not satisfy dedup, and a
+        // foreign-owned marker must not suppress recommendations either —
+        // shared-TMPDIR writers verify ownership before trusting state.
+        if self.nostate || self.state_disabled {
+            return false;
+        }
+        self.marker_path(dedup_key)
+            .symlink_metadata()
+            .map(|m| m.is_file() && meta_owned_by_euid(&m))
+            .unwrap_or(false)
     }
 
     fn touch_marker(&self, dedup_key: &str) {
@@ -144,7 +159,15 @@ impl HookEnv {
             opts.mode(0o600);
         }
         no_follow(&mut opts);
-        let _ = opts.open(path);
+        let Ok(f) = opts.open(path) else {
+            return;
+        };
+        // Same shared-TMPDIR contract as log_event: refuse foreign-owned,
+        // non-regular, or multiply-linked targets; chmod via the fd only.
+        if !fd_writeable(&f) {
+            return;
+        }
+        restrict_perms_fd(&f);
     }
 
     fn marker_path(&self, dedup_key: &str) -> PathBuf {
@@ -182,6 +205,12 @@ impl HookEnv {
         let Ok(f) = opts.open(self.recommended_path()) else {
             return Vec::new();
         };
+        // Read side of the same contract: only trust a regular file owned
+        // by our euid; anything else under the shared TMPDIR reads as
+        // empty (fail-open).
+        if !fd_is_ours(&f) {
+            return Vec::new();
+        }
         let mut buf = String::new();
         use std::io::Read;
         if f.take(MAX_STATE_BYTES + 1)
@@ -214,40 +243,117 @@ impl HookEnv {
             let _ = std::fs::create_dir_all(parent);
         }
         let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true).truncate(true);
+        // No O_TRUNC here: truncation at open time would destroy a
+        // foreign-owned or multiply-linked file before fd_writeable can
+        // refuse it. set_len(0) below does the truncate only after the
+        // opened fd passed the shared-TMPDIR contract.
+        opts.create(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
         no_follow(&mut opts);
-        if let Ok(mut f) = opts.open(self.recommended_path()) {
-            use std::io::Write;
-            let _ = f.write_all((all.join("\n") + "\n").as_bytes());
+        let Ok(f) = opts.open(self.recommended_path()) else {
+            return;
+        };
+        if !fd_writeable(&f) {
+            return;
         }
+        let mut f = f;
+        restrict_perms_fd(&f);
+        use std::io::Write;
+        if f.set_len(0).is_err() {
+            return;
+        }
+        let _ = f.write_all((all.join("\n") + "\n").as_bytes());
     }
 }
 
-/// Best-effort 0600 on files we create (event log, markers, session
-/// state). State lives under a shared TMPDIR, so it must not be
+/// fd-based permission tightening for files we write (event log, markers,
+/// session state). fchmod on the already-open File means a path swap
+/// between open and chmod cannot redirect the mode change — the old
+/// path-based chmod had exactly that TOCTOU (issue #169, audit D-01).
+/// Best-effort: state lives under a shared TMPDIR, so files must not be
 /// world-readable even though contents are already minimized.
 #[cfg(unix)]
-fn restrict_perms(path: &std::path::Path) {
+fn restrict_perms_fd(f: &std::fs::File) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
 }
 
 #[cfg(not(unix))]
-fn restrict_perms(_path: &std::path::Path) {}
+fn restrict_perms_fd(_f: &std::fs::File) {}
 
+/// 0700 on the state dir, applied through an open fd: the fd's metadata
+/// must show a directory owned by our euid before fchmod, so a symlink
+/// swapped in after the earlier lstat check cannot redirect the chmod
+/// into an arbitrary directory (fail-open otherwise).
 #[cfg(unix)]
 fn restrict_dir_perms(path: &std::path::Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(f) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(m) = f.metadata() else {
+        return;
+    };
+    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
+        return;
+    }
+    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o700));
 }
 
 #[cfg(not(unix))]
 fn restrict_dir_perms(_path: &std::path::Path) {}
+
+/// Post-open check for files we only read: must be a regular file owned
+/// by our euid. Foreign-owned state planted in a shared TMPDIR is ignored
+/// (fail-open) rather than trusted.
+#[cfg(unix)]
+fn fd_is_ours(f: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata()
+        .map(|m| m.is_file() && m.uid() == unsafe { libc::geteuid() })
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn fd_is_ours(_f: &std::fs::File) -> bool {
+    true
+}
+
+/// Post-open check for every file we write: regular file, owned by our
+/// euid, single link. `nlink > 1` means the inode is reachable through
+/// another path whose lifecycle we do not control — appending would
+/// modify every link, so fail open instead. This is the Rust-side
+/// counterpart of the OpenCode plugin's `st.uid !== getuid()` refusal,
+/// extended to non-regular files and hardlinks (issue #169).
+#[cfg(unix)]
+fn fd_writeable(f: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    f.metadata()
+        .map(|m| m.is_file() && m.uid() == unsafe { libc::geteuid() } && m.nlink() == 1)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn fd_writeable(_f: &std::fs::File) -> bool {
+    true
+}
+
+/// Ownership check on already-fetched metadata (marker dedup reads via
+/// symlink_metadata, which never follows links).
+#[cfg(unix)]
+fn meta_owned_by_euid(m: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    m.uid() == unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn meta_owned_by_euid(_m: &std::fs::Metadata) -> bool {
+    true
+}
 
 /// Refuse to follow a symlink at the final path component. State lives
 /// under a shared TMPDIR where another local user could pre-plant links;

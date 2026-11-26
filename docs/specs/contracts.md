@@ -89,6 +89,26 @@ JSONL で追記し、`observe <path>` が contract 形式の行を deserialize
 （`${TMPDIR}` 配下の揮発領域のみで永続データなし。移行: 新しい
 `SKILL_GRAPH_EVENT_LOG` を参照）。
 
+## hook/plugin の共有 TMPDIR 書き込み安全契約
+
+イベントログ・dedup marker・session state は共有 TMPDIR 配下に置かれうるため、
+Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts`）は
+同一の安全契約に従う（issue #169、監査 D-01/D-02）:
+
+- open は `O_NOFOLLOW | O_NONBLOCK`（TS は `O_NOFOLLOW`）+ 作成時 mode `0600`。
+  symlink・FIFO・socket は open 段階で拒否され、FIFO による hook 停止を防ぐ。
+- ローテーション前のサイズ判定は symlink を辿らない
+  （Rust: `symlink_metadata`、TS: `lstatSync`）。symlink は rename しない。
+- open 済み fd の metadata で `uid == euid`・regular file を検証し、
+  書き込み対象はさらに `nlink == 1` を要求する。不一致・非 regular・
+  hardlink は fail-open で書き込まない（plugin は uid 検査のみ）。
+- 権限 tightening は fd ベース（`fchmod` / `File::set_permissions`）のみ。
+  path ベースの chmod は TOCTOU で symlink 先を変更しうるため禁止。
+- 読み取り側も同じ fd 検査を通し、信用できない state は空として扱う。
+- `SKILL_GRAPH_HOOK_NOSTATE=1` は event log・marker・session state・
+  debug 出力を含む一切の書き込みを抑止する。debug 出力は stderr
+  （`console.error`）のみで、ファイルへは書かない。
+
 ## 状態区分
 
 - `availability` は discovery 時点の `available` / `parse_error` のみを表す。
