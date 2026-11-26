@@ -1,0 +1,62 @@
+name: npm publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)publish npm packages for"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p dist
+          gh release download "$tag" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber
+      - name: Assemble platform packages
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            pkg="npm/skill-graph-${target}"
+            mkdir -p "$pkg/bin" /tmp/sg-pkg
+            case "$target" in
+              linux-x64)    triple=x86_64-unknown-linux-gnu ;;
+              linux-arm64)  triple=aarch64-unknown-linux-gnu ;;
+              darwin-x64)   triple=x86_64-apple-darwin ;;
+              darwin-arm64) triple=aarch64-apple-darwin ;;
+            esac
+            tar -xzf "dist/skill-graph-${triple}.tar.gz" -C /tmp/sg-pkg
+            cp /tmp/sg-pkg/skill-graph "$pkg/bin/skill-graph"
+            chmod +x "$pkg/bin/skill-graph"
+            rm -rf /tmp/sg-pkg
+            "$pkg/bin/skill-graph" --version
+          done
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+            npm publish "npm/skill-graph-${target}" --access public
+          done
+      - name: Publish metapackage
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish npm/skill-graph --access public

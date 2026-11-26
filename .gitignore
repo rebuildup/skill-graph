@@ -4,3 +4,6 @@
 /.env.*
 *.log
 .DS_Store
+
+# assembled at publish time by npm-publish workflow
+npm/skill-graph-*/bin/skill-graph
