@@ -481,3 +481,97 @@ fn passthrough_accepts_empty_recommended_rejects_null_required() {
     );
     assert_eq!(obs.events[0].emitted, Some(false));
 }
+
+/// RFC 3339 boundary timestamps must parse: leap-year-aware February,
+/// hour 23, leap second 60, fractional seconds, and bounded `±hh:mm`
+/// offsets (with or without the colon).
+#[test]
+fn summary_accepts_rfc3339_boundary_timestamps() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // s1: leap day 2024-02-29 -> next day = 1s.
+            rec_event("s1", "2024-02-29T23:59:59Z", &["alpha"], true),
+            load_event("s1", "2024-03-01T00:00:00Z", "alpha"),
+            // s2: same instants expressed with -05:00 / +05:00 offsets = 2s.
+            rec_event("s2", "2024-02-29T18:59:59-05:00", &["beta"], true),
+            load_event("s2", "2024-03-01T05:00:01+05:00", "beta"),
+            // s3: leap second 23:59:60 == next midnight; +1s load = 1s.
+            rec_event("s3", "2024-06-30T23:59:60Z", &["gamma"], true),
+            load_event("s3", "2024-07-01T00:00:01Z", "gamma"),
+            // s4: fractional seconds and a colon-less offset = 2s.
+            rec_event("s4", "2026-01-01T09:00:00.250+09:00", &["delta"], true),
+            load_event("s4", "2026-01-01T00:00:02+0000", "delta"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // deltas: 1000, 2000, 1000, 2000 -> sorted [1000,1000,2000,2000];
+    // p50 index = round((4-1)*0.5) = 2.
+    assert_eq!(v["timeliness_ms"]["count"], 4);
+    assert_eq!(v["timeliness_ms"]["p50"], 2000);
+    assert_eq!(v["timeliness_ms"]["max"], 2000);
+    assert_eq!(v["converted_recommendations"], 4);
+}
+
+/// Out-of-range or non-calendar timestamps (Feb 30, Apr 31, month 13,
+/// hour 25, minute/second overflow, non-leap Feb 29, bad offsets,
+/// trailing garbage) are rejected by the strict RFC 3339 parser. The
+/// events remain valid contract events — they still count toward
+/// conversions via input-order fallback — but contribute no timeliness
+/// delta, so `timeliness_ms` cannot be distorted by bogus timestamps.
+#[test]
+fn summary_rejects_invalid_rfc3339_timestamps() {
+    use skill_graph::observe::{Observation, summary};
+
+    let invalid_load_ts = [
+        "2026-02-30T00:01:00Z",      // February has no 30th
+        "2026-04-31T00:01:00Z",      // April has 30 days
+        "2026-13-01T00:01:00Z",      // month 13
+        "2026-01-01T25:00:00Z",      // hour 25
+        "2026-01-01T00:60:00Z",      // minute 60
+        "2026-01-01T00:00:61Z",      // second 61
+        "2023-02-29T00:01:00Z",      // 2023 is not a leap year
+        "2026-01-01T00:01:00+24:00", // offset hour 24
+        "2026-01-01T00:01:00+05:60", // offset minute 60
+        "2026-01-01T00:01:00Zjunk",  // trailing garbage after Z
+        "2026-01-01T00:01:00.Z",     // decimal point with no digits
+        "2026/01/01T00:01:00Z",      // wrong date separators
+    ];
+    let mut events = Vec::new();
+    for (i, ts) in invalid_load_ts.iter().enumerate() {
+        let session = format!("bad-{i}");
+        events.push(rec_event(
+            &session,
+            "2026-01-01T00:00:00Z",
+            &["alpha"],
+            true,
+        ));
+        events.push(load_event(&session, ts, "alpha"));
+    }
+    // Both endpoints invalid: still ordered by input position.
+    events.push(rec_event(
+        "bad-both",
+        "2026-02-30T00:00:00Z",
+        &["beta"],
+        true,
+    ));
+    events.push(load_event("bad-both", "2026-04-31T00:01:00Z", "beta"));
+
+    let obs = Observation {
+        events,
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // Every pair still converts via input-order fallback...
+    assert_eq!(
+        v["converted_recommendations"],
+        invalid_load_ts.len() + 1,
+        "invalid timestamps fall back to position ordering"
+    );
+    // ...but none contributes a timeliness delta.
+    assert_eq!(v["timeliness_ms"]["count"], 0);
+    assert_eq!(v["timeliness_ms"]["p50"], serde_json::Value::Null);
+    assert_eq!(v["timeliness_ms"]["max"], serde_json::Value::Null);
+}
