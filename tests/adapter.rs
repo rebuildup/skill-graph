@@ -39,6 +39,29 @@ impl Fixture {
         (out, rc)
     }
 
+    /// Like `run`, plus extra environment variables for this invocation.
+    fn run_env(&self, args: &[&str], envs: &[(&str, &str)]) -> (String, i32) {
+        let mut cmd = Command::new(bin());
+        cmd.args(args)
+            .current_dir(self.proj.path())
+            .env("HOME", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
+            .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
+            .env_remove("CODEX_HOME")
+            .env_remove("SKILL_GRAPH_EXTRA_OVERLAY")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().expect("spawn");
+        (
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            out.status.code().unwrap_or(-1),
+        )
+    }
+
     fn run_full(&self, args: &[&str]) -> (String, String, i32) {
         let out = Command::new(bin())
             .args(args)
@@ -47,6 +70,7 @@ impl Fixture {
             .env("XDG_CONFIG_HOME", self.home.path().join(".config"))
             .env("XDG_DATA_HOME", self.home.path().join(".local/share"))
             .env_remove("CODEX_HOME")
+            .env_remove("SKILL_GRAPH_EXTRA_OVERLAY")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -542,4 +566,135 @@ fn opencode_disable_keeps_plugin_dir_while_other_scope_references_it() {
         !plugin.exists(),
         "plugin dir should be removed after last ref"
     );
+}
+
+#[test]
+fn opencode_disable_note_has_no_double_space() {
+    let f = Fixture::new();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!out.contains("  "), "double space in output: {out:?}");
+}
+
+/// Seed a claude settings.local.json-shaped file at `rel` under the
+/// fixture's fake dotfiles dir and return its path plus raw contents.
+fn seed_dotfiles_overlay(f: &Fixture) -> (PathBuf, String) {
+    let overlay = f
+        .home
+        .path()
+        .join(".config/dotfiles/claude/settings.local.json");
+    std::fs::create_dir_all(overlay.parent().unwrap()).unwrap();
+    let seeded = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/old/bin/skill-graph hook claude-code prompt # skill-graph-managed"},{"type":"command","command":"echo keep"}]}]}}"#;
+    std::fs::write(&overlay, seeded).unwrap();
+    (overlay, seeded.to_string())
+}
+
+#[test]
+fn default_runs_never_touch_dotfiles_overlay() {
+    let f = Fixture::new();
+    let (overlay, seeded) = seed_dotfiles_overlay(&f);
+    let bin = f.bin_arg();
+    for args in [
+        vec!["adapter", "enable", "claude-code", "--bin", &bin, "--user"],
+        vec!["adapter", "status", "claude-code", "--user"],
+        vec!["adapter", "disable", "claude-code", "--user"],
+    ] {
+        let (out, rc) = f.run(&args);
+        assert_eq!(rc, 0, "{args:?}: {out}");
+    }
+    // The personal dotfiles path must be byte-identical: no implicit
+    // read-modify-write of files outside the managed config.
+    assert_eq!(std::fs::read_to_string(&overlay).unwrap(), seeded);
+}
+
+#[test]
+fn extra_overlay_env_opts_into_compose_cleanup() {
+    let f = Fixture::new();
+    let (overlay, _) = seed_dotfiles_overlay(&f);
+    let overlay_str = overlay.to_string_lossy().into_owned();
+    let bin = f.bin_arg();
+
+    // Install without the env var: the overlay keeps its stale entry.
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    assert!(
+        std::fs::read_to_string(&overlay)
+            .unwrap()
+            .contains("skill-graph-managed")
+    );
+
+    // status surfaces pending overlay entries when opted in
+    let (out, rc) = f.run_env(
+        &["adapter", "status", "claude-code", "--user"],
+        &[("SKILL_GRAPH_EXTRA_OVERLAY", &overlay_str)],
+    );
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("also in overlay"), "{out}");
+
+    // re-enable migrates stale overlay entries the same way disable does
+    let (out, rc) = f.run_env(
+        &["adapter", "enable", "claude-code", "--bin", &bin, "--user"],
+        &[("SKILL_GRAPH_EXTRA_OVERLAY", &overlay_str)],
+    );
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("cleaned overlay"), "{out}");
+    let text = std::fs::read_to_string(&overlay).unwrap();
+    assert!(!text.contains("skill-graph-managed"), "{text}");
+    assert!(text.contains("echo keep"), "{text}");
+}
+
+#[test]
+fn status_broken_when_any_owned_hook_bin_missing() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let good = f.fake_bin.to_string_lossy().into_owned();
+    let missing = f
+        .home
+        .path()
+        .join("gone/bin/skill-graph")
+        .to_string_lossy()
+        .into_owned();
+
+    // First hook valid, second broken -> still broken (order must not
+    // matter: ANY owned hook's missing bin reports broken).
+    for (first, second) in [(&good, &missing), (&missing, &good)] {
+        let body = format!(
+            r#"{{"hooks":{{"UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{first} hook claude-code prompt # skill-graph-managed"}}]}}],"PostToolUse":[{{"matcher":"Skill","hooks":[{{"type":"command","command":"{second} hook claude-code skill-load # skill-graph-managed"}}]}}]}}}}"#
+        );
+        std::fs::write(&path, &body).unwrap();
+        let (out, rc) = f.run(&["adapter", "status", "claude-code", "--user"]);
+        assert_eq!(rc, 0, "{out}");
+        assert!(out.contains("broken"), "{out}");
+        assert!(out.contains("embedded binary not found"), "{out}");
+    }
+}
+
+#[test]
+fn spawn_failure_is_not_hook_capable() {
+    let f = Fixture::new();
+    // Executable file whose shebang interpreter does not exist: the
+    // kernel cannot exec it (ENOENT at spawn), so it must be rejected
+    // rather than treated as an inconclusive/transient probe.
+    let bad = f.home.path().join("bin/bad-shebang");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, "#!/nonexistent/skill-graph-test-interp\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (_, err, rc) = f.run_full(&[
+        "adapter",
+        "enable",
+        "claude-code",
+        "--bin",
+        &bad.to_string_lossy(),
+        "--user",
+    ]);
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("does not support"), "{err}");
+    assert!(!f.home.path().join(".claude/settings.json").exists());
 }
