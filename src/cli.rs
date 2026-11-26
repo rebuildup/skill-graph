@@ -174,16 +174,25 @@ pub fn run() -> Result<(), String> {
         }
         Command::Hook { runtime, mode } => {
             use crate::events::Runtime;
+            use std::io::Read;
             // Hooks must fail open: unusable arguments still exit 0.
-            let Some(runtime) = Runtime::parse(&runtime) else {
-                eprintln!("skill-graph: unknown runtime: {runtime}");
-                return Ok(());
-            };
-            if !matches!(mode.as_str(), "prompt" | "skill-load") {
-                eprintln!("skill-graph: unknown hook mode: {mode}");
-                return Ok(());
+            // Drain stdin first so the caller never hits EPIPE writing a
+            // payload to a process that already exited.
+            let parsed = Runtime::parse(&runtime);
+            let valid_mode = matches!(mode.as_str(), "prompt" | "skill-load");
+            match parsed {
+                Some(runtime) if valid_mode => crate::hook::run_hook(runtime, &mode),
+                _ => {
+                    let mut sink = Vec::new();
+                    let _ = std::io::stdin().read_to_end(&mut sink);
+                    if parsed.is_none() {
+                        eprintln!("skill-graph: unknown runtime: {runtime}");
+                    } else {
+                        eprintln!("skill-graph: unknown hook mode: {mode}");
+                    }
+                    Ok(())
+                }
             }
-            crate::hook::run_hook(runtime, &mode)
         }
         Command::Mcp => crate::mcp::run(),
         Command::Adapter {
