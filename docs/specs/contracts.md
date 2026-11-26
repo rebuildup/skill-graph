@@ -47,7 +47,9 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 - passthrough event の `session_id` / `skill_path` / `tool` /
   `skill_name` は emit 側 constructor と同じ上限に正規化される
   （`session_id` は `[A-Za-z0-9._-]`・128 文字、`skill_path` 1024、
-  `tool`/`skill_name` 256 文字）。`recommended[].name` は schema の
+  `tool`/`skill_name` 256 文字）。charset 違反のみで構成される
+  `session_id` は `unknown-<hash>` に正規化され、互いに異なる不正 id が
+  同一 funnel session に merge されない。`recommended[].name` は schema の
   `minLength: 1` より厳しく valid skill name を要求する — schema 適合でも
   観測側の join キーにならない名前は `lines_skipped` に計上される。
 - `detect` は 1 payload あたり最大 64 event を emit する
@@ -63,6 +65,18 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 - `observe --summary` の `by_session` は `(runtime, session_id)` キーの
   辞書順先頭 500 session まで。`collection_errors` / `errors` /
   `errors_omitted` / `by_session_omitted` で打ち切り・収集失敗を通知する。
+- 集計の分母規則: `unnecessary_load_rate_pct` は session 帰属 load
+  （`session_attributed_loads`）のみを分母・分子の対象とし、session id を
+  持たない unattributable load は率から除外される（`load_grade_loads` との差が
+  帰属不能分）。`loads_per_session` は全 load-grade load を session 数で
+  割る top-level 指標であり、帰属不能 load を含む。
+- `observe` の保持量には集約上限がある: 入力ファイル数 4096、ファイル毎
+  256 MiB（`.db` は `-wal` 込み）、retained events/loads 各 1,000,000。
+  超過時は `errors` に打ち切り通知が入り、`runtimes`/`skill_loads` の
+  集計カウンタは正確なまま維持される。
+- `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
+  丸め）で rec→load の差分を取る。不正 timestamp は "unknown time"
+  扱いで timeliness から除外される。
 
 ## Skill Usage Event（v1）
 

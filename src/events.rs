@@ -149,7 +149,14 @@ pub(crate) fn sanitize_session_id(session_id: &str) -> String {
         .take(128)
         .collect();
     if safe.is_empty() && !session_id.is_empty() {
-        "unknown".to_string()
+        // Distinct invalid ids must not collapse into one "unknown"
+        // funnel session: derive a deterministic suffix from the
+        // original bytes so different ids stay distinct while the same
+        // id remains joinable.
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        session_id.hash(&mut h);
+        format!("unknown-{:016x}", h.finish())
     } else {
         safe
     }
@@ -310,28 +317,37 @@ fn unix_secs_to_rfc3339(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-/// Extract the `name:` field from a YAML frontmatter block, wherever it
-/// appears in `text` (tool output may carry a prefix such as `Output:`).
-/// Only a bounded head is scanned and fences must be `---` alone on their
-/// line — mirroring `parser.rs` — so prose containing `--- foo` or a
-/// later frontmatter-looking block cannot spoof the skill name.
+/// Extract the `name:` field from a YAML frontmatter block. Mirrors
+/// `parser::split_frontmatter`: a BOM and leading blank lines are
+/// tolerated, then the opening `---` fence must be the first content —
+/// a `---/name:/---` block appearing later in the body is prose, not
+/// frontmatter, and must not spoof the skill name. Only a bounded head
+/// is scanned and fences must be `---` alone on their line.
 pub fn frontmatter_name(text: &str) -> Option<String> {
     const MAX_SCAN: usize = 8 * 1024;
     let head: String = text.chars().take(MAX_SCAN).collect();
-    let mut in_fence = false;
-    for line in head.lines() {
-        // Fence must be exactly `---` on its line — `lines()` already
-        // strips \n/\r, so a trailing space (`--- `) must not open a
-        // fence the canonical parser (split_frontmatter) would reject.
-        if line == "---" {
-            if in_fence {
-                return None;
-            }
-            in_fence = true;
+    let head = head.strip_prefix('\u{feff}').unwrap_or(head.as_str());
+    let mut lines = head.lines();
+    // Skip leading blank lines, then require the opening fence.
+    let mut opened = false;
+    for line in lines.by_ref() {
+        if line.is_empty() {
             continue;
         }
-        if !in_fence {
-            continue;
+        if line == "---" {
+            opened = true;
+        }
+        break;
+    }
+    if !opened {
+        return None;
+    }
+    for line in lines {
+        // Fence must be exactly `---` on its line — `lines()` already
+        // strips \n/\r, so a trailing space (`--- `) must not close a
+        // fence the canonical parser (split_frontmatter) would reject.
+        if line == "---" {
+            return None;
         }
         if let Some(value) = line.trim_end().strip_prefix("name:") {
             let value = value.trim().trim_matches('"').trim_matches('\'');
@@ -958,6 +974,34 @@ mod tests {
         // parser (split_frontmatter) rejects it, so detection must too.
         assert_eq!(frontmatter_name("--- \nname: alpha\n---\n"), None);
         assert_eq!(frontmatter_name("---\t\nname: alpha\n---\n"), None);
+        // A `---` block embedded in the body is not frontmatter: the
+        // opening fence must be the first non-blank line, matching
+        // split_frontmatter.
+        assert_eq!(frontmatter_name("intro\n---\nname: late\n---\n"), None);
+        assert_eq!(frontmatter_name("```\n---\nname: code\n---\n```"), None);
+        // Leading blank lines are still allowed.
+        assert_eq!(
+            frontmatter_name("\n\n---\nname: lead\n---\n"),
+            Some("lead".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_session_id_distinguishes_invalid_ids() {
+        // Charset-valid ids pass through unchanged.
+        assert_eq!(sanitize_session_id("s-1.ok_2"), "s-1.ok_2");
+        // Distinct all-invalid ids must not collapse into one funnel
+        // session, while the same id stays deterministic for joins.
+        let a = sanitize_session_id("!!!");
+        let b = sanitize_session_id("???");
+        assert!(a.starts_with("unknown-"));
+        assert!(b.starts_with("unknown-"));
+        assert_ne!(a, b);
+        assert_eq!(a, sanitize_session_id("!!!"));
+        // Empty stays empty — it marks unattributable events.
+        assert_eq!(sanitize_session_id(""), "");
+        // Overlong ids are truncated at 128 chars.
+        assert_eq!(sanitize_session_id(&"x".repeat(200)).len(), 128);
     }
 
     #[test]

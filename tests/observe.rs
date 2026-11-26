@@ -507,10 +507,10 @@ fn summary_accepts_rfc3339_boundary_timestamps() {
         ..Default::default()
     };
     let v = summary(&obs);
-    // deltas: 1000, 2000, 1000, 2000 -> sorted [1000,1000,2000,2000];
-    // p50 index = round((4-1)*0.5) = 2.
+    // deltas: 1000, 2000, 1000, 1750 (s4 keeps its .250 fraction) ->
+    // sorted [1000,1000,1750,2000]; p50 index = round((4-1)*0.5) = 2.
     assert_eq!(v["timeliness_ms"]["count"], 4);
-    assert_eq!(v["timeliness_ms"]["p50"], 2000);
+    assert_eq!(v["timeliness_ms"]["p50"], 1750);
     assert_eq!(v["timeliness_ms"]["max"], 2000);
     assert_eq!(v["converted_recommendations"], 4);
 }
@@ -574,4 +574,49 @@ fn summary_rejects_invalid_rfc3339_timestamps() {
     assert_eq!(v["timeliness_ms"]["count"], 0);
     assert_eq!(v["timeliness_ms"]["p50"], serde_json::Value::Null);
     assert_eq!(v["timeliness_ms"]["max"], serde_json::Value::Null);
+}
+
+/// Unattributable loads (empty session id) still count toward
+/// `load_grade_loads` and `loads_per_session`, but both sides of
+/// `unnecessary_load_rate_pct` are session-scoped: they are excluded
+/// from numerator AND denominator rather than deflating the rate.
+#[test]
+fn summary_scopes_unnecessary_rate_to_session_loads() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha"], true),
+            load_event("s1", "2026-01-01T00:01:00Z", "alpha"),
+            // Unattributable: no session id -> outside every funnel.
+            load_event("", "2026-01-01T00:02:00Z", "ghost"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["load_grade_loads"], 2);
+    assert_eq!(v["session_attributed_loads"], 1);
+    assert_eq!(v["unnecessary_loads"], 0);
+    assert_eq!(v["unnecessary_load_rate_pct"], 0.0);
+    // loads_per_session is a top-level metric over ALL loads.
+    assert_eq!(v["loads_per_session"], 2.0);
+}
+
+/// RFC 3339 fractional seconds keep millisecond precision — a 500ms
+/// rec→load delta must not quantize to zero or a full second.
+#[test]
+fn summary_timeliness_uses_millisecond_precision() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            rec_event("s", "2026-01-01T00:00:00.000Z", &["a"], true),
+            load_event("s", "2026-01-01T00:00:00.500Z", "a"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["timeliness_ms"]["count"], 1);
+    assert_eq!(v["timeliness_ms"]["p50"], 500);
+    assert_eq!(v["timeliness_ms"]["max"], 500);
 }

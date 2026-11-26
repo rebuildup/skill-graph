@@ -163,10 +163,22 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
         .filter_map(|(k, v)| yaml_text(&v).map(|t| (k, t)))
         .collect();
 
+    // Bound link-derived strings: targets flow verbatim into
+    // Recommendation.reasons, so an unbounded dest_url would let one
+    // hostile SKILL.md inflate every recommendation payload. Legitimate
+    // link targets (paths, URLs, skill names) are far below this.
+    const MAX_LINK_TARGET_CHARS: usize = 1024;
+    const MAX_LINKS: usize = 512;
     let mut links = Vec::new();
     for event in Parser::new(body) {
+        if links.len() >= MAX_LINKS {
+            break;
+        }
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
             let target = dest_url.to_string();
+            if target.chars().count() > MAX_LINK_TARGET_CHARS {
+                continue;
+            }
             let kind = if target.contains("://") || target.starts_with("mailto:") {
                 LinkKind::External
             } else {
@@ -184,8 +196,11 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
     for key in ["requires-skills", "requires_skills"] {
         if let Some(value) = metadata.get(key) {
             for item in value.split(|c: char| c == ',' || c.is_whitespace()) {
+                if links.len() >= MAX_LINKS {
+                    break;
+                }
                 let item = item.trim();
-                if !item.is_empty() {
+                if !item.is_empty() && item.chars().count() <= MAX_LINK_TARGET_CHARS {
                     links.push(SkillLink {
                         target: item.to_string(),
                         kind: LinkKind::Requires,

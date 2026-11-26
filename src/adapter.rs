@@ -35,6 +35,14 @@ const LEGACY_PLUGIN_MARKER: &str = "adapters/opencode/skill-graph";
 /// ownership is proven by this marker, not by the binary's filename.
 const HOOK_OWNER_MARKER: &str = "# skill-graph-managed";
 
+/// stdout line that tolerates EPIPE — `adapter status | head` must not
+/// panic the way `println!` would on a closed pipe.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        let _ = crate::cli::write_stdout_line(&format!($($arg)*));
+    }};
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     User,
@@ -726,18 +734,21 @@ fn clean_extra_overlay() {
                 return;
             }
             match write_json(&overlay, &config) {
-                Ok(()) => println!("cleaned overlay: {}", overlay.display()),
-                Err(e) => eprintln!(
+                Ok(()) => outln!("cleaned overlay: {}", overlay.display()),
+                Err(e) => crate::cli::write_stderr_line(&format!(
                     "warning: could not clean overlay {}: {e}",
                     overlay.display()
-                ),
+                )),
             }
         }
-        Ok(_) => eprintln!(
+        Ok(_) => crate::cli::write_stderr_line(&format!(
             "warning: overlay {} is not a JSON object; left untouched",
             overlay.display()
-        ),
-        Err(e) => eprintln!("warning: could not read overlay {}: {e}", overlay.display()),
+        )),
+        Err(e) => crate::cli::write_stderr_line(&format!(
+            "warning: could not read overlay {}: {e}",
+            overlay.display()
+        )),
     }
 }
 
@@ -763,9 +774,9 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             // Warn rather than fail: the runtime's PATH may differ from
             // this process's, and the plugin fails open until a binary
             // appears. `status` reports the same condition as broken.
-            eprintln!(
+            crate::cli::write_stderr_line(
                 "warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH; \
-                 the plugin will fail open until one is installed"
+                 the plugin will fail open until one is installed",
             );
         }
         // Drop any prior skill-graph specifier (any generation), then append ours.
@@ -808,19 +819,17 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
 
     write_config(path, &config)?;
-    println!(
+    outln!(
         "enabled skill-graph ({}, {}) -> {}",
         args.runtime.as_str(),
         args.scope.flag(),
         path.display()
     );
     if args.runtime != Runtime::Opencode {
-        println!("binary: {}", bin.display());
+        outln!("binary: {}", bin.display());
     }
     if args.runtime == Runtime::Codex {
-        println!(
-            "note: trust the hooks via /hooks in Codex (hash-pinned; unchanged across updates)"
-        );
+        outln!("note: trust the hooks via /hooks in Codex (hash-pinned; unchanged across updates)");
     }
     // On compose-overlay machines an older skill-graph entry in the
     // overlay would be re-imported alongside the new one at the next
@@ -834,7 +843,7 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
 
 fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     if !path.exists() {
-        println!("no config file: {}", path.display());
+        outln!("no config file: {}", path.display());
     } else {
         let mut config = read_config(path)?;
         if !config.is_object() {
@@ -849,7 +858,7 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             strip_our_hooks(&mut config);
         }
         write_config(path, &config)?;
-        println!(
+        outln!(
             "disabled skill-graph ({}, {}) from {}",
             args.runtime.as_str(),
             args.scope.flag(),
@@ -864,7 +873,7 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         // absence of references here is best-effort.
         if !opencode_plugin_referenced() {
             let _ = std::fs::remove_dir_all(opencode_plugin_dir());
-            println!(
+            outln!(
                 "note: checked user and current-project opencode configs only; \
                  project configs in other directories may still reference the plugin"
             );
@@ -890,7 +899,7 @@ fn opencode_plugin_referenced() -> bool {
 
 fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     if !path.exists() {
-        println!(
+        outln!(
             "{}: no config file ({})",
             args.runtime.as_str(),
             path.display()
@@ -936,13 +945,13 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             let bin_missing = v040_plugin && !opencode_bin_resolvable();
             broken = plugin_file_missing || bin_missing;
             if plugin_file_missing {
-                println!(
+                outln!(
                     "  warning: materialized plugin missing: {}",
                     opencode_plugin_dir().join("index.ts").display()
                 );
             }
             if bin_missing {
-                println!("  warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH");
+                outln!("  warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH");
             }
         } else {
             // Check the embedded binary of EVERY owned v0.4.x hook
@@ -957,10 +966,10 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 let bin = Path::new(&bin_path);
                 if !bin.exists() {
                     broken = true;
-                    println!("  warning: embedded binary not found: {bin_path}");
+                    outln!("  warning: embedded binary not found: {bin_path}");
                 } else if !is_executable(bin) {
                     broken = true;
-                    println!("  warning: embedded binary is not executable: {bin_path}");
+                    outln!("  warning: embedded binary is not executable: {bin_path}");
                 }
             }
         }
@@ -971,7 +980,7 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         (true, true) => "broken",
         (true, false) => "enabled",
     };
-    println!(
+    outln!(
         "{} ({}): {} — {} entr{} in {}",
         args.runtime.as_str(),
         args.scope.flag(),
@@ -981,7 +990,7 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         path.display()
     );
     if legacy > 0 {
-        println!("  legacy v0.3.x entries present: {legacy} (run `adapter enable` to migrate)");
+        outln!("  legacy v0.3.x entries present: {legacy} (run `adapter enable` to migrate)");
     }
     // Surface pending entries in the opt-in compose overlay so `status`
     // does not report a clean state while a compose would re-add hooks.
@@ -993,7 +1002,7 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     {
         let n = count_hook_entries(&overlay_config);
         if n > 0 {
-            println!(
+            outln!(
                 "  note: {n} entr{} also in overlay {}",
                 if n == 1 { "y" } else { "ies" },
                 overlay.display()
