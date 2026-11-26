@@ -272,7 +272,26 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // so expanding ~1 MiB bodies for non-admitted skills is wasted work.
     // Glossary expansion is appended, never rewritten, so original text
     // still matches verbatim.
-    for &index in admitted.keys() {
+    //
+    // The admitted set itself is unbounded, so scanning every admitted
+    // body is O(corpus) memory traffic per call. Bound the total body
+    // bytes scored per recommend() under a fixed budget, visited in
+    // deterministic (index) order. Body evidence can rank but never
+    // admit, so skills past the budget keep a slightly lower possible
+    // rank — the admitted set itself is unaffected.
+    const MAX_BODY_SCAN_BYTES: usize = 8 * 1024 * 1024;
+    let mut body_scanned = 0usize;
+    let mut body_order: Vec<usize> = admitted.keys().copied().collect();
+    body_order.sort_unstable();
+    for index in body_order {
+        if body_scanned >= MAX_BODY_SCAN_BYTES {
+            break;
+        }
+        let body_len = graph.skills[index].body_text.len();
+        if body_scanned + body_len > MAX_BODY_SCAN_BYTES {
+            continue;
+        }
+        body_scanned += body_len;
         let Some(info) = infos[index].as_mut() else {
             continue;
         };

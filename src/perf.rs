@@ -36,8 +36,20 @@ pub fn run(sizes: &[usize], iterations: usize) -> Result<Value, String> {
 
 fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
     let root = corpus_root(size)?;
+    // corpus_root keep()s the TempDir, so any error below would leak the
+    // corpus — remove it on the failure path explicitly.
+    match run_size_inner(&root, size, iterations) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let _ = fs::remove_dir_all(root);
+            Err(err)
+        }
+    }
+}
+
+fn run_size_inner(root: &PathBuf, size: usize, iterations: usize) -> Result<Value, String> {
     let cold_started = Instant::now();
-    let discovery = discover(std::slice::from_ref(&root));
+    let discovery = discover(std::slice::from_ref(root));
     let cold_discover = cold_started.elapsed();
     let build_started = Instant::now();
     let graph = build(discovery);
@@ -85,7 +97,7 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
         std::hint::black_box(&output.stdout);
     }
 
-    let cleanup_ok = fs::remove_dir_all(&root).is_ok();
+    let cleanup_ok = fs::remove_dir_all(root).is_ok();
     let recommended_count = recommend(&graph, QUERY, CONTEXT, 5).len();
 
     Ok(json!({

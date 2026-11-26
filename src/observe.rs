@@ -435,6 +435,27 @@ fn looks_like_claude_transcript(value: &Value) -> bool {
             .is_some()
 }
 
+/// Aggregate bound on retained events and per-session load records.
+/// Per-file caps alone allow a single max-size input to accumulate
+/// millions of events (~3M lines in a 256 MiB JSONL) — each retaining
+/// several heap strings — so the vecs themselves are bounded. Counter
+/// maps (`runtimes`, `skill_loads`) stay accurate; only the retained
+/// per-event detail is truncated, with a single notice in `errors`.
+const MAX_OBSERVE_EVENTS: usize = 1_000_000;
+const MAX_OBSERVE_LOADS: usize = 1_000_000;
+
+/// Returns true while `len` is below `max`; emits one truncation notice
+/// at the boundary.
+fn under_cap(len: usize, max: usize, what: &str, errors: &mut Vec<String>) -> bool {
+    if len < max {
+        return true;
+    }
+    if len == max {
+        errors.push(format!("{what} truncated at {max}"));
+    }
+    false
+}
+
 fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
     // The contract requires skill_name on skill_load; unattributable
     // observations are dropped rather than emitted schema-invalid. An
@@ -454,21 +475,30 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
             .or_default() += 1;
         if let Some(name) = &event.skill_name {
             *obs.skill_loads.entry(name.clone()).or_default() += 1;
-            obs.loads.push(SkillLoad {
-                session_id: event.session_id.clone(),
-                skill: name.clone(),
-                timestamp: event.timestamp.clone(),
-                file: String::new(),
-                runtime: event.runtime.as_str().to_string(),
-                detection: event
-                    .detection
-                    .map(detection_name)
-                    .unwrap_or_default()
-                    .to_string(),
-            });
+            if under_cap(obs.loads.len(), MAX_OBSERVE_LOADS, "loads", &mut obs.errors) {
+                obs.loads.push(SkillLoad {
+                    session_id: event.session_id.clone(),
+                    skill: name.clone(),
+                    timestamp: event.timestamp.clone(),
+                    file: String::new(),
+                    runtime: event.runtime.as_str().to_string(),
+                    detection: event
+                        .detection
+                        .map(detection_name)
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
         }
     }
-    obs.events.push(event);
+    if under_cap(
+        obs.events.len(),
+        MAX_OBSERVE_EVENTS,
+        "events",
+        &mut obs.errors,
+    ) {
+        obs.events.push(event);
+    }
 }
 
 fn detection_name(d: Detection) -> &'static str {
@@ -1114,14 +1144,15 @@ pub fn summary(obs: &Observation) -> Value {
     out
 }
 
-/// RFC 3339 (`YYYY-MM-DDTHH:MM:SS[.fff]Z` or `±hh:mm`) → epoch seconds.
-/// Strict calendar validation: real month lengths with leap-year-aware
-/// February, hour 0–23, minute 0–59, second 0–60 (leap second), and a
-/// bounded `±hh:mm` offset. None for unparseable or out-of-range input;
-/// callers treat that as "unknown time" so an invalid timestamp can never
-/// distort `timeliness_ms` (ordering/conversion fall back to input order,
-/// timeliness deltas require both endpoints).
-fn rfc3339_secs(s: &str) -> Option<i64> {
+/// RFC 3339 (`YYYY-MM-DDTHH:MM:SS[.fff]Z` or `±hh:mm`) → epoch
+/// milliseconds. Strict calendar validation: real month lengths with
+/// leap-year-aware February, hour 0–23, minute 0–59, second 0–60 (leap
+/// second), fractional seconds truncated to millisecond precision, and
+/// a bounded `±hh:mm` offset. None for unparseable or out-of-range
+/// input; callers treat that as "unknown time" so an invalid timestamp
+/// can never distort `timeliness_ms` (ordering/conversion fall back to
+/// input order, timeliness deltas require both endpoints).
+fn rfc3339_ms(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 {
         return None;
@@ -1171,20 +1202,33 @@ fn rfc3339_secs(s: &str) -> Option<i64> {
     let days = era * 146_097 + doe - 719_468;
     let secs = days * 86_400 + h * 3600 + mi * 60 + sec;
     let mut i = 19;
+    // Fractional seconds: keep millisecond precision so sub-second
+    // timeliness deltas are not quantized away.
+    let mut millis = 0i64;
     if b.get(i) == Some(&b'.') {
         i += 1;
         // RFC 3339 requires at least one digit after the decimal point.
         if !b.get(i).is_some_and(|c| c.is_ascii_digit()) {
             return None;
         }
+        let mut digits = 0;
         while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            if digits < 3 {
+                millis = millis * 10 + i64::from(b[i] - b'0');
+            }
+            digits += 1;
             i += 1;
         }
+        while digits < 3 {
+            millis *= 10;
+            digits += 1;
+        }
     }
+    let epoch_ms = secs * 1000 + millis;
     match b.get(i) {
         // 'Z' or absent offset must terminate the timestamp.
-        Some(b'Z') if i + 1 == b.len() => Some(secs),
-        None => Some(secs),
+        Some(b'Z') if i + 1 == b.len() => Some(epoch_ms),
+        None => Some(epoch_ms),
         Some(sign @ (b'+' | b'-')) => {
             let (off_h, off_m, end) = if b.get(i + 3) == Some(&b':') {
                 (num(i + 1, 2)?, num(i + 4, 2)?, i + 6)
@@ -1194,8 +1238,8 @@ fn rfc3339_secs(s: &str) -> Option<i64> {
             if end != b.len() || off_h > 23 || off_m > 59 {
                 return None;
             }
-            let off = off_h * 3600 + off_m * 60;
-            Some(secs + if *sign == b'+' { -off } else { off })
+            let off = (off_h * 3600 + off_m * 60) * 1000;
+            Some(epoch_ms + if *sign == b'+' { -off } else { off })
         }
         _ => None,
     }
@@ -1208,6 +1252,12 @@ struct Funnel {
     recommendations: usize,
     emitted: usize,
     load_grade_loads: usize,
+    /// Load-grade loads carrying a non-empty session id — the only ones
+    /// that can join a session funnel. Session-scoped rates use this as
+    /// their denominator so unattributable loads cannot silently deflate
+    /// them; the unattributable share stays visible via the difference
+    /// with `load_grade_loads`.
+    session_attributed_loads: usize,
     sessions_with_loads: BTreeSet<String>,
     converted: usize,
     unnecessary_loads: usize,
@@ -1221,7 +1271,7 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
     let mut f = Funnel::default();
     // Stable per-session ordering: (timestamp, input order).
     let mut order: Vec<usize> = (0..events.len()).collect();
-    order.sort_by_key(|&i| (rfc3339_secs(&events[i].timestamp).unwrap_or(i64::MAX), i));
+    order.sort_by_key(|&i| (rfc3339_ms(&events[i].timestamp).unwrap_or(i64::MAX), i));
 
     // Top-level counters cover every event, including unattributable
     // ones (empty session_id) — they just never join a session funnel.
@@ -1243,6 +1293,7 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
             EventKind::SkillLoad if e.counts_as_load() => {
                 f.load_grade_loads += 1;
                 if !e.session_id.is_empty() {
+                    f.session_attributed_loads += 1;
                     f.sessions_with_loads.insert(format!(
                         "{}:{}",
                         e.runtime.as_str(),
@@ -1326,7 +1377,7 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
         if names.is_empty() {
             continue;
         }
-        let rec_ts = rfc3339_secs(&rec.timestamp);
+        let rec_ts = rfc3339_ms(&rec.timestamp);
         for &li in &loads {
             if consumed.contains(&li) {
                 continue;
@@ -1335,7 +1386,7 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
             if !names.contains(load.skill_name.as_deref().unwrap_or("")) {
                 continue;
             }
-            let load_ts = rfc3339_secs(&load.timestamp);
+            let load_ts = rfc3339_ms(&load.timestamp);
             let after = match (rec_ts, load_ts) {
                 (Some(a), Some(b)) => b >= a,
                 _ => pos.get(&li).zip(pos.get(&ri)).is_some_and(|(l, r)| l > r),
@@ -1346,7 +1397,7 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
             consumed.insert(li);
             f.converted += 1;
             if let (Some(a), Some(b)) = (rec_ts, load_ts) {
-                f.deltas_ms.push((b - a) * 1000);
+                f.deltas_ms.push(b - a);
             }
             break;
         }
@@ -1389,6 +1440,7 @@ impl Funnel {
             "emitted_recommendations": self.emitted,
             "delivery_rate_pct": pct(self.emitted, self.recommendations),
             "load_grade_loads": self.load_grade_loads,
+            "session_attributed_loads": self.session_attributed_loads,
             "sessions_with_loads": self.sessions_with_loads.len(),
             "loads_per_session": if self.sessions.is_empty() { Value::Null } else {
                 json!((self.load_grade_loads as f64 / self.sessions.len() as f64 * 100.0).round() / 100.0)
@@ -1396,7 +1448,10 @@ impl Funnel {
             "converted_recommendations": self.converted,
             "conversion_rate_pct": pct(self.converted, self.emitted),
             "unnecessary_loads": self.unnecessary_loads,
-            "unnecessary_load_rate_pct": pct(self.unnecessary_loads, self.load_grade_loads),
+            // Session-scoped rate: numerator and denominator both cover
+            // only session-attributed loads — unattributable loads are
+            // excluded from BOTH sides rather than deflating the rate.
+            "unnecessary_load_rate_pct": pct(self.unnecessary_loads, self.session_attributed_loads),
             "timeliness_ms": {
                 "count": deltas.len(),
                 "p50": percentile(0.50),

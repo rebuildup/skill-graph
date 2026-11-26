@@ -182,10 +182,8 @@ pub fn run() -> Result<(), String> {
         }
         Command::Bench { dataset, max } => {
             let result = eval::run(&dataset, max)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
-            );
+            write_stdout_line(&serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
         Command::Observe {
@@ -219,9 +217,9 @@ pub fn run() -> Result<(), String> {
                     let _ = std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024)
                         .read_to_end(&mut sink);
                     if parsed.is_none() {
-                        eprintln!("skill-graph: unknown runtime: {runtime}");
+                        write_stderr_line(&format!("skill-graph: unknown runtime: {runtime}"));
                     } else {
-                        eprintln!("skill-graph: unknown hook mode: {mode}");
+                        write_stderr_line(&format!("skill-graph: unknown hook mode: {mode}"));
                     }
                     Ok(())
                 }
@@ -282,19 +280,15 @@ pub fn run() -> Result<(), String> {
             let payload: serde_json::Value =
                 serde_json::from_str(&input).map_err(|e| format!("payload json: {e}"))?;
             for event in events::detect_all_from_payload(runtime, via, &payload) {
-                println!(
-                    "{}",
-                    serde_json::to_string(&event).map_err(|e| e.to_string())?
-                );
+                write_stdout_line(&serde_json::to_string(&event).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         }
         Command::Perf { sizes, iterations } => {
             let result = perf::run(&sizes, iterations)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
-            );
+            write_stdout_line(&serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
     }
@@ -406,13 +400,39 @@ fn file_uri_to_path(target: &str) -> Option<PathBuf> {
     String::from_utf8(decoded).ok().map(PathBuf::from)
 }
 
+/// Write one line to stdout. `BrokenPipe` is success: consumers
+/// legitimately close the pipe early (`discover | head`), and Rust's
+/// `println!` panics on write errors — which would violate the hook's
+/// fail-open exit-0 contract and crash CLI output paths.
+pub fn write_stdout_line(s: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    match writeln!(std::io::stdout().lock(), "{s}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// stderr counterpart of `write_stdout_line` — `2>&1 | head` merges
+/// stderr into the same closed pipe, so `eprintln!` panics there too.
+pub fn write_stderr_line(s: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{s}").or_else(|e| {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    });
+}
+
 fn print_result(value: impl serde::Serialize, format: &str) -> Result<(), String> {
     match format {
-        "json" => println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
-        ),
-        "human" => println!("{}", human(value)),
+        "json" => {
+            write_stdout_line(&serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?
+        }
+        "human" => write_stdout_line(&human(value)).map_err(|e| e.to_string())?,
         _ => return Err(format!("unsupported format: {format}")),
     }
     Ok(())

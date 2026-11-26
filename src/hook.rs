@@ -793,7 +793,9 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         _ => run_prompt(&env, &payload),
     };
     if let Some(out) = response {
-        println!("{out}");
+        // EPIPE-tolerant: a consumer closing stdout early must not turn
+        // the fail-open hook into a panic (exit 101).
+        let _ = crate::cli::write_stdout_line(&out);
     }
     Ok(())
 }
