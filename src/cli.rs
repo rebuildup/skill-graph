@@ -320,10 +320,21 @@ pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveRe
             skills: indexes.iter().map(|i| graph.skills[*i].summary()).collect(),
         };
     }
+    // `file://` targets (RFC 8089) map to a local path; only the empty or
+    // `localhost` authority is local. Lookup still goes through by_path,
+    // so resolution stays bounded to discovered skills.
+    let raw = if let Some(path) = file_uri_to_path(target) {
+        path
+    } else if target.starts_with("file://") {
+        return ResolveResult::Unresolved {
+            target: target.to_string(),
+        };
+    } else {
+        std::path::PathBuf::from(target)
+    };
     // by_path keys are absolute (discovery canonicalizes roots); a
     // relative or non-normalized target must be absolutized first or it
     // can never match.
-    let raw = std::path::PathBuf::from(target);
     let abs = if raw.is_absolute() {
         raw
     } else {
@@ -338,6 +349,14 @@ pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveRe
             candidates.push(p);
         }
     }
+    // A directory target completes to <dir>/SKILL.md, mirroring the
+    // resolver's directory completion for Markdown links.
+    let skill_md: Vec<PathBuf> = candidates
+        .iter()
+        .map(|dir| dir.join("SKILL.md"))
+        .filter(|p| !candidates.contains(p))
+        .collect();
+    candidates.extend(skill_md);
     for path in candidates {
         if let Some(index) = graph.by_path.get(&path) {
             return ResolveResult::Path {
@@ -348,6 +367,39 @@ pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveRe
     ResolveResult::Unresolved {
         target: target.to_string(),
     }
+}
+
+/// Map a `file://` URI to a local path (RFC 8089). Only the empty or
+/// `localhost` authority denotes a local file; remote authorities,
+/// malformed percent-encoding, and non-UTF-8 paths yield `None`.
+fn file_uri_to_path(target: &str) -> Option<PathBuf> {
+    let rest = target.strip_prefix("file://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, "/"),
+    };
+    if !authority.is_empty() && authority != "localhost" {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            decoded.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(decoded).ok().map(PathBuf::from)
 }
 
 fn print_result(value: impl serde::Serialize, format: &str) -> Result<(), String> {

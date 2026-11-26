@@ -42,17 +42,39 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
         add_mentions(&mut skills, index, &by_name);
     }
 
-    let mut backlinks: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Backlinks attach to resolved target copies, not just the first one.
+    // A link with a resolved path identifies one concrete copy; a
+    // name-resolved link (Requires/Mention) references the skill *name*,
+    // so every installed copy of that name is a valid resolution and each
+    // carries the backlink. Sources are deduplicated per target: a skill
+    // referencing the same copy through several link kinds (e.g. a
+    // Markdown link plus Requires) counts once.
+    let mut backlinks: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (source, skill) in skills.iter().enumerate() {
         for link in &skill.links {
+            if let Some(path) = &link.resolved_path
+                && let Some(&target) = by_path.get(path)
+            {
+                backlinks.entry(target).or_default().insert(source);
+                continue;
+            }
             if let Some(name) = &link.resolved_name
                 && let Some(targets) = by_name.get(name)
-                && let Some(&target) = targets.first()
             {
-                backlinks.entry(target).or_default().push(source);
+                for &target in targets {
+                    backlinks.entry(target).or_default().insert(source);
+                }
             }
         }
     }
+    let backlinks = backlinks
+        .into_iter()
+        .map(|(target, sources)| {
+            let mut sources: Vec<usize> = sources.into_iter().collect();
+            sources.sort_unstable();
+            (target, sources)
+        })
+        .collect();
 
     let ambiguous_names = by_name
         .iter()

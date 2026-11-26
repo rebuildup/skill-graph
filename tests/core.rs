@@ -255,6 +255,43 @@ fn requires_to_ambiguous_name_admits_once_with_collision_note() {
 }
 
 #[test]
+fn backlinks_cover_all_name_copies_and_dedup_sources() {
+    // Regression for #171 (audit D-04): with two same-name copies, a
+    // path-resolved Markdown link attaches to its concrete copy while a
+    // name-resolved Requires link attaches to every copy; both links
+    // share one source skill, so each target counts it exactly once.
+    let temp = tempfile::tempdir().unwrap();
+    for copy in ["root-a", "root-b"] {
+        write_skill_md(
+            &temp.path().join(format!("{copy}/dep-skill")),
+            "dep-skill",
+            "Use for dep work.",
+        );
+    }
+    let referrer = temp.path().join("root-a/referrer-skill");
+    fs::create_dir_all(&referrer).unwrap();
+    fs::write(
+        referrer.join("SKILL.md"),
+        "---\nname: referrer-skill\ndescription: Use for referring work.\nmetadata:\n  requires-skills: dep-skill\n---\n\nSee [dep](../dep-skill).\n",
+    )
+    .unwrap();
+    let graph = build(discover(&[
+        temp.path().join("root-a"),
+        temp.path().join("root-b"),
+    ]));
+    let deps = &graph.by_name["dep-skill"];
+    assert_eq!(deps.len(), 2);
+    let referrer_index = graph.by_name["referrer-skill"][0];
+    for &target in deps {
+        assert_eq!(
+            graph.backlinks.get(&target),
+            Some(&vec![referrer_index]),
+            "target {target} must carry exactly one deduped backlink"
+        );
+    }
+}
+
+#[test]
 fn ambiguous_names_are_reported_not_uniquified() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("skills");
