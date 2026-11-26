@@ -69,6 +69,15 @@ MCP tool call は Skill Usage Event を発行しない。
 `adapter`/hook と同一の root 規則を共有する。MCP server が独自の
 発見規則を持たない。
 
+`SKILL_GRAPH_ROOTS` が非空で設定されている場合、その entry 群が探索
+範囲の全体を定義する（issue #177）。存在しない・非ディレクトリの
+entry は `discover` の `errors` で診断され、有効 entry のみ走査される。
+有効 entry が 0 件のときも tool 引数 `roots` や既定 root へは拡大せず、
+空の結果 + 診断に縮退する — operator の明示的制限が agent 入力や
+既定値によって暗黙に緩和されることを防ぐ。fail-open（hook が agent
+実行を継続する）と探索範囲の拡大は別の関心であり、前者は後者を
+意味しない。
+
 ## Consequences
 
 - `skill-graph mcp` は全配布チャネル（npm/brew/cargo/mise）で追加

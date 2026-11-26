@@ -29,35 +29,64 @@ pub fn default_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// Parse `SKILL_GRAPH_ROOTS` (colon-separated, existing dirs only).
-/// Returns `None` when unset or nothing usable remains.
-pub fn env_roots() -> Option<Vec<PathBuf>> {
-    let spec = std::env::var("SKILL_GRAPH_ROOTS").ok()?;
-    let roots: Vec<PathBuf> = spec
-        .split(':')
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .filter(|p| p.is_dir())
-        .collect();
-    (!roots.is_empty()).then_some(roots)
+/// Outcome of parsing `SKILL_GRAPH_ROOTS`.
+///
+/// The variable is an operator-controlled restriction: once set to a
+/// non-empty value, its entries — valid or not — define the ENTIRE
+/// search scope. Entries that do not resolve are diagnosed by
+/// `discover` ("root not found or unreadable") instead of being silently
+/// dropped, and when none resolve the result is an empty scan rather
+/// than a silent widening to explicit arguments or default roots.
+pub enum EnvRoots {
+    /// Variable unset or set to an empty value: no operator restriction.
+    Absent,
+    /// Variable present with at least one separator-delimited entry.
+    /// Entries are passed through verbatim (including non-UTF-8 paths);
+    /// validity is determined downstream by canonicalization.
+    Restricted(Vec<PathBuf>),
+}
+
+/// Parse `SKILL_GRAPH_ROOTS` using the platform path-list separator
+/// (`:` on Unix). Presence is detected via `var_os` so a non-UTF-8
+/// value still counts as an explicit restriction rather than falling
+/// back to wider defaults.
+pub fn env_roots() -> EnvRoots {
+    let Some(spec) = std::env::var_os("SKILL_GRAPH_ROOTS") else {
+        return EnvRoots::Absent;
+    };
+    if spec.is_empty() {
+        return EnvRoots::Absent;
+    }
+    let roots: Vec<PathBuf> = std::env::split_paths(&spec).collect();
+    if roots.is_empty() {
+        // Non-empty spec that yields no entries (e.g. only separators):
+        // still an explicit restriction — resolve to an empty scope.
+        return EnvRoots::Restricted(Vec::new());
+    }
+    EnvRoots::Restricted(roots)
 }
 
 /// Shared root resolution for every entry point (CLI, hook, MCP, plugin):
-/// `SKILL_GRAPH_ROOTS` wins over explicit arguments, which win over the
-/// caller-provided fallback (runtime- or CLI-specific defaults). The
-/// operator-controlled env var therefore cannot be overridden by an
-/// agent-supplied argument — see ADR-0005.
+/// a non-empty `SKILL_GRAPH_ROOTS` wins over explicit arguments, which
+/// win over the caller-provided fallback (runtime- or CLI-specific
+/// defaults). The operator-controlled env var therefore cannot be
+/// overridden by an agent-supplied argument — see ADR-0005 — and an
+/// invalid or empty restriction degrades to an empty/diagnosed scan,
+/// never to a wider scope — see issue #177.
 pub fn resolve_roots(
     explicit: Vec<PathBuf>,
     fallback: impl FnOnce() -> Vec<PathBuf>,
 ) -> Vec<PathBuf> {
-    if let Some(roots) = env_roots() {
-        return roots;
+    match env_roots() {
+        EnvRoots::Restricted(roots) => roots,
+        EnvRoots::Absent => {
+            if !explicit.is_empty() {
+                explicit
+            } else {
+                fallback()
+            }
+        }
     }
-    if !explicit.is_empty() {
-        return explicit;
-    }
-    fallback()
 }
 
 /// Upper bound on filesystem entries scanned per root. MCP callers can
@@ -90,7 +119,13 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             ));
             continue;
         };
-        if !root.is_dir() || !seen_roots.insert(root.clone()) {
+        if !root.is_dir() {
+            // An existing non-directory root (e.g. a file path) is an
+            // operator/agent error worth surfacing, not a silent skip.
+            errors.push(format!("root is not a directory: {}", requested.display()));
+            continue;
+        }
+        if !seen_roots.insert(root.clone()) {
             continue;
         }
         let mut entries = WalkDir::new(&root).follow_links(false).into_iter();
