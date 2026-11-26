@@ -78,6 +78,20 @@ enum Command {
         /// prompt | skill-load
         mode: String,
     },
+    /// Manage runtime adapter hooks/plugins in native configs.
+    /// enable|disable|status <claude-code|codex|opencode> [--user|--project]
+    Adapter {
+        action: String,
+        /// claude-code | codex | opencode
+        runtime: String,
+        #[arg(long)]
+        user: bool,
+        #[arg(long)]
+        project: bool,
+        /// Explicit skill-graph binary path to embed in hook commands
+        #[arg(long)]
+        bin: Option<String>,
+    },
     /// Normalize a single runtime hook/plugin payload (stdin JSON) into a
     /// Skill Usage Event. Prints the event JSON, or nothing when the
     /// payload carries no skill-load signal. Detection only — never runs
@@ -145,6 +159,33 @@ pub fn run() -> Result<(), String> {
             let runtime =
                 Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
             crate::hook::run_hook(runtime, &mode)
+        }
+        Command::Adapter {
+            action,
+            runtime,
+            user,
+            project,
+            bin,
+        } => {
+            use crate::adapter::{AdapterArgs, Scope};
+            use crate::events::Runtime;
+            let runtime =
+                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            let action = match action.as_str() {
+                "enable" => crate::adapter::Action::Enable,
+                "disable" => crate::adapter::Action::Disable,
+                "status" => crate::adapter::Action::Status,
+                other => return Err(format!("unknown adapter action: {other}")),
+            };
+            if user && project {
+                return Err("--user and --project are mutually exclusive".to_string());
+            }
+            crate::adapter::run_adapter(&AdapterArgs {
+                runtime,
+                scope: if project { Scope::Project } else { Scope::User },
+                action,
+                bin,
+            })
         }
         Command::Detect { runtime, via } => {
             use crate::events::{self, ObservedVia, Runtime};
