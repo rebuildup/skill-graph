@@ -62,6 +62,10 @@ enum Command {
     },
     Bench {
         dataset: PathBuf,
+        /// Recommendation cutoff scored as the primary metric. Defaults
+        /// to 3, matching the top-N the hook/plugin actually inject.
+        #[arg(long, default_value_t = 3)]
+        max: usize,
     },
     Perf {
         #[arg(long, value_delimiter = ',', default_value = "50,100,200,500")]
@@ -176,8 +180,8 @@ pub fn run() -> Result<(), String> {
             let result = resolve_target(&graph, &target);
             print_result(json!(result), &format)
         }
-        Command::Bench { dataset } => {
-            let result = eval::run(&dataset)?;
+        Command::Bench { dataset, max } => {
+            let result = eval::run(&dataset, max)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
