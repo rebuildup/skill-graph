@@ -329,3 +329,20 @@ fn summary_computes_funnel_metrics() {
     assert_eq!(v2["by_runtime"]["codex"]["load_grade_loads"], 1);
     assert!(v2["by_runtime"].get("claude-code").is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn observe_survives_symlink_cycle() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "a.jsonl",
+        &[
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hi"}}"#,
+        ],
+    );
+    // loop -> . creates a directory cycle; must not recurse forever
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 1);
+}
