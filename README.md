@@ -12,24 +12,20 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 パッケージマネージャから導入する。hook の有効化は install では行われず、
 後述の `skill-graph adapter enable` で明示的に opt-in する。
 
-### mise
+**現時点で利用可能なチャネルは mise（`github:` backend）と Homebrew。**
+npm と crates.io は配布 workflow とパッケージ定義は v0.4.0 に含まれるが、
+外部レジストリへの公開は未完了（`NPM_TOKEN` / crates.io token 未設定）
+のため **準備中** であり、現状は install できない。
+
+### mise（推奨・動作保証チャネル）
 
 ```bash
 mise use -g github:rebuildup/skill-graph          # 最新版
 mise use -g github:rebuildup/skill-graph@0.4.0   # バージョン固定
 ```
 
-### npm / Bun / pnpm
-
-```bash
-npm install -g @rebuildup/skill-graph
-bun add -g @rebuildup/skill-graph
-pnpm add -g @rebuildup/skill-graph
-```
-
-プラットフォーム別バイナリを optional dependency として同梱する
-（postinstall のダウンロード・ビルドなし）。pin は
-`npm install -g @rebuildup/skill-graph@0.4.0`。
+GitHub Release のバイナリ tarball を直接取得するため、外部レジストリの
+公開状態に依存しない。clean environment での導入はこの経路を保証する。
 
 ### Homebrew
 
@@ -37,11 +33,31 @@ pnpm add -g @rebuildup/skill-graph
 brew install rebuildup/tap/skill-graph
 ```
 
-### crates.io
+`rebuildup/homebrew-tap` の formula が v0.4.0 release asset を参照する
+（`on_macos`/`on_linux` × Intel/ARM）。
+
+### npm / Bun / pnpm（準備中・未公開）
+
+```bash
+npm install -g @rebuildup/skill-graph
+bun add -g @rebuildup/skill-graph
+pnpm add -g @rebuildup/skill-graph
+```
+
+パッケージ定義は `npm/` にあり、platform 別バイナリを optional
+dependency として同梱する設計（postinstall のダウンロード・ビルドなし）。
+ただし **npm registry への publish は未実施**（`NPM_TOKEN` 未設定）のため、
+現時点ではこのコマンドは失敗する。公開完了までは mise または Homebrew
+を使うこと。
+
+### crates.io（準備中・未公開）
 
 ```bash
 cargo install skill-graph
 ```
+
+crate 定義は `Cargo.toml` にあるが **crates.io への publish は未実施**
+（registry token 未設定）のため、現時点ではこのコマンドは失敗する。
 
 ソースからビルドする場合（Rust toolchain は `rust-toolchain.toml` 参照）:
 
@@ -64,6 +80,7 @@ skill-graph recommend <query> [--root ...]               # 推薦（--format jso
 skill-graph resolve <target> [--root ...]                # 名前/リンク解決
 skill-graph observe <path> [--summary]                     # transcript/DB/イベントログの観測集計（--summary で funnel 指標）
 skill-graph detect --runtime <rt> --via <via>            # hook/plugin 用イベント正規化（stdin）
+                                                         # --via 既定値は "hook"。有効値: hook|plugin|transcript|db
 skill-graph hook <claude-code|codex> <prompt|skill-load> # ランタイム hook 入口（stdin、fail-open）
 skill-graph mcp                                          # stdio MCP server（read-only tools）
 skill-graph adapter <enable|disable|status> <rt>         # adapter ライフサイクル管理
@@ -71,8 +88,11 @@ skill-graph bench <dataset> / perf                       # 評価・性能ハー
 ```
 
 既定の探索 root: `~/.claude/skills`、`~/.agents/skills`、`./skills`、
-`./.claude/skills`、`./.agents/skills` 等。`--root` / `SKILL_GRAPH_ROOTS`
-で上書き可能。永続キャッシュ・daemon・PATH 変更は行わない。
+`./.claude/skills`、`./.agents/skills` 等。CLI サブコマンドは `--root`
+で上書き可能。`SKILL_GRAPH_ROOTS`（colon 区切り）は hook / OpenCode
+plugin / MCP server が参照する root 上書きであり、CLI の
+`discover`/`search`/`recommend`/`resolve` は現状 `--root` のみを使う。
+永続キャッシュ・daemon・PATH 変更は行わない。
 
 ## MCP server
 
@@ -115,7 +135,7 @@ consumption、runtime 別内訳つき）を算出する。
 skill-graph adapter enable  claude-code
 skill-graph adapter enable  codex
 skill-graph adapter enable  opencode
-skill-graph adapter status  claude-code   # enabled/disabled/legacy/broken
+skill-graph adapter status  claude-code   # enabled/disabled/broken + legacy 検出通知
 skill-graph adapter disable claude-code   # 追加エントリのみ除去・完全復元
 ```
 
@@ -140,18 +160,26 @@ hook コマンドには enable 時に PATH 解決した `skill-graph` の絶対�
   パッケージ削除後に壊れた hook が残っても runtime の通常動作は妨げない。
 - イベントは `${TMPDIR}/skill-graph-events.jsonl`（JSONL）へ。
   prompt は SHA-256 hash のみで本文・コマンド・tool response は
-  **一切保存しない**。`SKILL_GRAPH_EVENT_LOG` で保存先変更、
-  `SKILL_GRAPH_HOOK_NOSTATE=1` で全書き込み無効化、
+  **一切保存しない**。
+- `skill-graph hook`（claude-code / codex）が参照する環境変数:
+  `SKILL_GRAPH_EVENT_LOG` で保存先変更、`SKILL_GRAPH_HOOK_NOSTATE=1`
+  で全書き込み無効化（state marker も生成しない no-save mode）、
   `SKILL_GRAPH_EVENT_LOG_MAX`（既定 64MiB）でローテーション。
+- **例外**: OpenCode plugin は `SKILL_GRAPH_EVENT_LOG`（保存先）と
+  `SKILL_GRAPH_ROOTS` のみを参照する。`SKILL_GRAPH_HOOK_NOSTATE` と
+  `SKILL_GRAPH_EVENT_LOG_MAX`（ローテーション）は **適用されない**
+  （plugin は無制限 append のまま。no-save が必要な場合は hook
+  経路を使うか `SKILL_GRAPH_EVENT_LOG` を使い捨てパスに向ける）。
 
 ## Update / Uninstall
 
 - **更新**: 各パッケージマネージャの通常手順（`mise upgrade`、
-  `npm install -g @rebuildup/skill-graph@latest`、`brew upgrade`、
+  `brew upgrade`、公開後は `npm install -g @rebuildup/skill-graph@latest`、
   `cargo install --force`）。hook コマンドのパスが変わらない限り
   adapter の再 enable は不要。パスが変わった場合は
   `adapter disable && adapter enable` で張り替える。
-- **無効化（一時）**: `SKILL_GRAPH_HOOK_NOSTATE=1` でイベント書き込み停止。
+- **無効化（一時）**: `SKILL_GRAPH_HOOK_NOSTATE=1` でイベント書き込み停止
+  （`skill-graph hook` 経路のみ。OpenCode plugin には適用されない）。
 - **adapter のみ無効化**: `skill-graph adapter disable <rt>`。
   追加したエントリのみ除去し、他の hook/plugin・設定は保持。
   `{}` まで減った設定ファイルは削除される。

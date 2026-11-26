@@ -13,7 +13,7 @@
 | URI Generic Syntax | 規範仕様 | RFC 3986 | https://www.rfc-editor.org/rfc/rfc3986 | link / file URI 解決。相対参照解決と正規化を利用 |
 | file URI | 規範仕様 | RFC 8089 | https://www.rfc-editor.org/rfc/rfc8089 | local file URI のみ対象。UNC 等の非標準は拒否または明示診断 |
 | JSON Schema | 公開仕様 | draft は実装時に固定 | https://json-schema.org/ | eval dataset / plugin manifest / output contract の検証に使う |
-| MCP | 公開仕様 | version は adapter 実装時に固定 | https://modelcontextprotocol.io/ | 将来の adapter 境界。初期実装では必須にしない |
+| MCP | 公開仕様 | ~~version は adapter 実装時に固定~~ → **superseded**: ADR-0005 で境界確定、`rmcp` 3.11.0（server + stdio transport）を採用 | https://modelcontextprotocol.io/ | `skill-graph mcp`（stdio・read-only 3 tools）として v0.4.0 で実装済み。仕様 version negotiation は rmcp に委譲 |
 | XDG Base Directory | 公開仕様 | 0.8 | https://specifications.freedesktop.org/basedir-spec/latest/ | user-level state / config の将来配置。project 内への書き込みは禁止のまま |
 | SemVer | 公開仕様 | 2.0.0 | https://semver.org/ | release / public API version 表記 |
 | RFC 8288 | 規範仕様 | — | https://www.rfc-editor.org/rfc/rfc8288 | typed link relation の設計参考。CommonMark link に意味が標準化されているとは扱わない |

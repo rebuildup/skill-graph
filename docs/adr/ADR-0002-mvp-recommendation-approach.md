@@ -28,3 +28,8 @@ E02–X03・C03 の実験結果を統合し、MVP に採用する推薦方式・
 - 実 corpus での latency・recall は synthetic/fixture より不確実。P01/P02 で実 skills 環境での再計測を行う。
 - Invocation recall・timeliness・成果物品質は未計測のまま残る。Claude Code 認証後に S02（#4）の観測項目を再検証し、必要なら follow-up Issue を起こす。
 - O01（永続キャッシュ）・O02（MCP）・I01（標準化）は発動条件未達として deferred を維持する。
+
+> 注記（2026-11-26 追記）: 本 ADR は MVP スコープの決定記録である。
+> その後 O02（MCP）は v1.0.0 spec §1 / ADR-0005 で採用・実装済み、
+> O01 / I01 は v1.0.0 spec §6 で不採用・対象外が確定した
+> （`docs/backlog.md` の最終判定を参照）。
