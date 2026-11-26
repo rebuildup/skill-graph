@@ -71,6 +71,12 @@ cargo build --release   # -> target/release/skill-graph
 Linux x86_64/ARM64 (glibc, WSL2 含む)、macOS x86_64/ARM64。
 Windows は WSL2 経由。musl・Windows native は対象外。
 
+Windows native で `npm install @rebuildup/skill-graph` を実行すると、
+win32 向け optional package が存在しないため os/cpu gating により
+インストールが失敗する。これは意図した診断であり、Windows では
+WSL2 内で導入・実行する。ソースからのビルドも Windows native は
+サポート対象外（動作未検証）である。
+
 ## CLI
 
 ```bash
