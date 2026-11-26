@@ -11,6 +11,13 @@
 //!   CODEX_HOME / XDG_CONFIG_HOME   runtime config dir overrides
 //!   XDG_DATA_HOME                  opencode plugin materialize dir
 //!                                  (default ~/.local/share)
+//!   SKILL_GRAPH_EXTRA_OVERLAY      opt-in path to an extra settings
+//!                                  file (e.g. a dotfiles-managed
+//!                                  settings.local.json) that enable/
+//!                                  disable/status also keep free of
+//!                                  stale skill-graph hooks. Unset by
+//!                                  default: no path outside the
+//!                                  managed config is touched.
 
 use crate::events::Runtime;
 use serde_json::{Map, Value, json};
@@ -88,11 +95,18 @@ fn config_path(runtime: Runtime, scope: Scope) -> PathBuf {
     }
 }
 
-fn dotfiles_overlay() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config"));
-    base.join("dotfiles/claude/settings.local.json")
+/// Opt-in compose overlay: an extra settings file the operator asks us
+/// to keep free of stale skill-graph hooks — e.g. a dotfiles-managed
+/// `settings.local.json` that re-imports `~/.claude/settings.json` at
+/// compose time. Returns None unless SKILL_GRAPH_EXTRA_OVERLAY names a
+/// path, so the default behavior never touches files outside the
+/// managed config (including the author's personal dotfiles layout).
+fn extra_overlay() -> Option<PathBuf> {
+    let p = std::env::var_os("SKILL_GRAPH_EXTRA_OVERLAY")?;
+    if p.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(p))
 }
 
 /// Absolute path to the skill-graph binary to embed in hook commands.
@@ -137,17 +151,20 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
 /// emitting anything, while older releases fail on the unknown
 /// subcommand or missing arguments.
 fn supports_hook_subcommand(path: &Path) -> bool {
-    let Ok(mut child) = std::process::Command::new(path)
+    let mut child = match std::process::Command::new(path)
         .args(["hook", "claude-code", "prompt"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-    else {
-        // A spawn failure (transient resource exhaustion, exec-format
-        // edge) is inconclusive: is_executable already screened the file,
-        // and failing enable on it would be flakier than the hook itself.
-        return true;
+    {
+        Ok(child) => child,
+        // #163: transient resource exhaustion stays inconclusive so a
+        // flaky probe cannot fail `adapter enable`. Any other spawn
+        // failure means the kernel refused to exec the file (ENOEXEC —
+        // foreign-arch/malformed payload, ENOENT — dead shebang
+        // interpreter, EACCES): it is not hook-capable (#168).
+        Err(e) => return spawn_failure_inconclusive(&e),
     };
     // Bounded wait: a FIFO or wedged binary must not hang `adapter`.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -164,6 +181,23 @@ fn supports_hook_subcommand(path: &Path) -> bool {
             }
             Err(_) => return true,
         }
+    }
+}
+
+/// #163 carve-out: only resource-exhaustion spawn errors are
+/// inconclusive. Every other spawn failure means the binary could not
+/// be exec'd and must not be treated as hook-capable (#168).
+fn spawn_failure_inconclusive(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::ETXTBSY))
+    }
+    #[cfg(not(unix))]
+    {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::ResourceBusy
+        )
     }
 }
 
@@ -209,7 +243,9 @@ fn first_shell_word(s: &str) -> Option<&str> {
                 in_quote = !in_quote;
                 i += 1;
             }
-            b'\\' if !in_quote => i += 2,
+            // A trailing unquoted backslash would skip past the end;
+            // clamp so `&s[..i]` never slices out of bounds.
+            b'\\' if !in_quote => i = usize::min(i + 2, b.len()),
             c if c.is_ascii_whitespace() && !in_quote => break,
             _ => i += 1,
         }
@@ -242,6 +278,21 @@ fn unquote_shell(word: &str) -> String {
         }
     }
     out
+}
+
+/// The materialized plugin resolves `skill-graph` via `SKILL_GRAPH_BIN`
+/// or PATH at spawn time. Mirror that lookup — existence + exec bit
+/// only, nothing is executed — so enable/status can diagnose a missing
+/// runtime binary. Hook runtimes embed a resolved path instead.
+fn opencode_bin_resolvable() -> bool {
+    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN") {
+        return is_executable(Path::new(&p));
+    }
+    std::env::var_os("PATH")
+        .map(|path_var| {
+            std::env::split_paths(&path_var).any(|dir| is_executable(&dir.join("skill-graph")))
+        })
+        .unwrap_or(false)
 }
 
 fn is_hook_runtime_mode(rt: &str, mode: &str) -> bool {
@@ -277,6 +328,13 @@ fn has_legacy_hook_bin(command: &str) -> bool {
         // A URL merely ending in the marker filename (e.g. a curl|sh
         // one-liner) must not be claimed for deletion.
         if tok.contains("://") {
+            return false;
+        }
+        // Legacy hooks always embedded an absolute/relative PATH to the
+        // binary — a bare `skill-graph-recommend-hook` word (e.g. in
+        // `echo skill-graph-recommend-hook`) is a foreign mention, not
+        // an invocation, and must not be claimed.
+        if !tok.contains('/') {
             return false;
         }
         Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
@@ -628,6 +686,9 @@ fn materialize_opencode_plugin() -> Result<PathBuf, String> {
 }
 
 pub fn run_adapter(args: &AdapterArgs) -> Result<(), String> {
+    if args.bin.is_some() && !matches!(args.action, Action::Enable) {
+        return Err("--bin is only valid for `adapter enable`".to_string());
+    }
     if args.runtime == Runtime::Opencode && args.bin.is_some() {
         return Err(
             "--bin is not supported for opencode (the plugin resolves skill-graph via PATH)"
@@ -642,13 +703,16 @@ pub fn run_adapter(args: &AdapterArgs) -> Result<(), String> {
     }
 }
 
-/// Strip skill-graph hooks from the dotfiles compose overlay
-/// (`~/.config/dotfiles/claude/settings.local.json`). The overlay may be a
-/// symlink into a dotfiles repo: keep the file even when it reduces to {},
-/// and tolerate an unreadable/missing overlay. Failures warn, not fail —
+/// Strip skill-graph hooks from the opt-in compose overlay named by
+/// SKILL_GRAPH_EXTRA_OVERLAY. The overlay may be a symlink into a
+/// dotfiles repo: keep the file even when it reduces to {}, and
+/// tolerate an unreadable/missing overlay. Failures warn, not fail —
 /// the overlay is not the file this command was asked to manage.
-fn clean_dotfiles_overlay() {
-    let overlay = dotfiles_overlay();
+/// Without the env var this is a no-op: no implicit personal paths.
+fn clean_extra_overlay() {
+    let Some(overlay) = extra_overlay() else {
+        return;
+    };
     if !(overlay.exists() || overlay.is_symlink()) {
         return;
     }
@@ -662,21 +726,18 @@ fn clean_dotfiles_overlay() {
                 return;
             }
             match write_json(&overlay, &config) {
-                Ok(()) => println!("cleaned dotfiles overlay: {}", overlay.display()),
+                Ok(()) => println!("cleaned overlay: {}", overlay.display()),
                 Err(e) => eprintln!(
-                    "warning: could not clean dotfiles overlay {}: {e}",
+                    "warning: could not clean overlay {}: {e}",
                     overlay.display()
                 ),
             }
         }
         Ok(_) => eprintln!(
-            "warning: dotfiles overlay {} is not a JSON object; left untouched",
+            "warning: overlay {} is not a JSON object; left untouched",
             overlay.display()
         ),
-        Err(e) => eprintln!(
-            "warning: could not read dotfiles overlay {}: {e}",
-            overlay.display()
-        ),
+        Err(e) => eprintln!("warning: could not read overlay {}: {e}", overlay.display()),
     }
 }
 
@@ -698,6 +759,15 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
 
     if args.runtime == Runtime::Opencode {
+        if !opencode_bin_resolvable() {
+            // Warn rather than fail: the runtime's PATH may differ from
+            // this process's, and the plugin fails open until a binary
+            // appears. `status` reports the same condition as broken.
+            eprintln!(
+                "warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH; \
+                 the plugin will fail open until one is installed"
+            );
+        }
         // Drop any prior skill-graph specifier (any generation), then append ours.
         strip_our_plugins(&mut config);
         let obj = config
@@ -752,12 +822,12 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             "note: trust the hooks via /hooks in Codex (hash-pinned; unchanged across updates)"
         );
     }
-    // On dotfiles-composed machines an older skill-graph entry in the
+    // On compose-overlay machines an older skill-graph entry in the
     // overlay would be re-imported alongside the new one at the next
-    // compose, leaving duplicate hooks. Migrate the overlay the same way
-    // disable does.
+    // compose, leaving duplicate hooks. Migrate the overlay the same
+    // way disable does — only when SKILL_GRAPH_EXTRA_OVERLAY opted in.
     if args.runtime == Runtime::ClaudeCode && args.scope == Scope::User {
-        clean_dotfiles_overlay();
+        clean_extra_overlay();
     }
     Ok(())
 }
@@ -795,13 +865,14 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         if !opencode_plugin_referenced() {
             let _ = std::fs::remove_dir_all(opencode_plugin_dir());
             println!(
-                "note: checked user and current-project opencode configs only;                  project configs in other directories may still reference the plugin"
+                "note: checked user and current-project opencode configs only; \
+                 project configs in other directories may still reference the plugin"
             );
         }
     }
 
     if args.runtime == Runtime::ClaudeCode && args.scope == Scope::User {
-        clean_dotfiles_overlay();
+        clean_extra_overlay();
     }
     Ok(())
 }
@@ -855,35 +926,43 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 .map(|p| {
                     p.iter().any(|s| {
                         s.as_str()
-                            .map(|x| x.contains(PLUGIN_MARKER))
+                            .map(|x| marker_at_boundary(x, PLUGIN_MARKER))
                             .unwrap_or(false)
                     })
                 })
                 .unwrap_or(false);
-            broken = v040_plugin && !opencode_plugin_dir().join("index.ts").is_file();
-            if broken {
+            let plugin_file_missing =
+                v040_plugin && !opencode_plugin_dir().join("index.ts").is_file();
+            let bin_missing = v040_plugin && !opencode_bin_resolvable();
+            broken = plugin_file_missing || bin_missing;
+            if plugin_file_missing {
                 println!(
                     "  warning: materialized plugin missing: {}",
                     opencode_plugin_dir().join("index.ts").display()
                 );
             }
-        } else if let Some(cmd) = first_hook_command(&config)
-            && let Some(bin_path) = embedded_bin(&cmd)
-        {
-            let bin = Path::new(&bin_path);
-            if !bin.exists() {
-                broken = true;
-                println!("  warning: embedded binary not found: {bin_path}");
-            } else if !is_executable(bin) {
-                broken = true;
-                println!("  warning: embedded binary is not executable: {bin_path}");
+            if bin_missing {
+                println!("  warning: no skill-graph binary resolvable via SKILL_GRAPH_BIN/PATH");
             }
-            // Deliberately no execution probe here: the embedded path comes
-            // from a config file that --project scope takes from the
-            // repository, so running it would let a crafted config execute
-            // an arbitrary binary during `adapter status`. Version
-            // staleness is only checked on candidate bins in resolve_bin,
-            // where the path came from PATH/the operator, not a repo file.
+        } else {
+            // Check the embedded binary of EVERY owned v0.4.x hook
+            // command — a healthy UserPromptSubmit must not mask a
+            // broken PostToolUse bin. Existence/executable-bit checks
+            // only: config-embedded paths are untrusted input (project
+            // scope reads repo files) and must never be executed
+            // (#167). Version capability is likewise unverified here,
+            // so `enabled` means "entries present and bins exist",
+            // nothing more.
+            for bin_path in owned_hook_bins(&config) {
+                let bin = Path::new(&bin_path);
+                if !bin.exists() {
+                    broken = true;
+                    println!("  warning: embedded binary not found: {bin_path}");
+                } else if !is_executable(bin) {
+                    broken = true;
+                    println!("  warning: embedded binary is not executable: {bin_path}");
+                }
+            }
         }
     }
 
@@ -904,21 +983,21 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     if legacy > 0 {
         println!("  legacy v0.3.x entries present: {legacy} (run `adapter enable` to migrate)");
     }
-    // Surface pending entries in the dotfiles compose overlay so `status`
+    // Surface pending entries in the opt-in compose overlay so `status`
     // does not report a clean state while a compose would re-add hooks.
-    if args.runtime == Runtime::ClaudeCode && args.scope == Scope::User {
-        let overlay = dotfiles_overlay();
-        if (overlay.exists() || overlay.is_symlink())
-            && let Ok(overlay_config) = read_config(&overlay)
-        {
-            let n = count_hook_entries(&overlay_config);
-            if n > 0 {
-                println!(
-                    "  note: {n} entr{} also in dotfiles overlay {}",
-                    if n == 1 { "y" } else { "ies" },
-                    overlay.display()
-                );
-            }
+    if args.runtime == Runtime::ClaudeCode
+        && args.scope == Scope::User
+        && let Some(overlay) = extra_overlay()
+        && (overlay.exists() || overlay.is_symlink())
+        && let Ok(overlay_config) = read_config(&overlay)
+    {
+        let n = count_hook_entries(&overlay_config);
+        if n > 0 {
+            println!(
+                "  note: {n} entr{} also in overlay {}",
+                if n == 1 { "y" } else { "ies" },
+                overlay.display()
+            );
         }
     }
     Ok(())
@@ -931,10 +1010,16 @@ fn count_legacy_entries(config: &Value) -> usize {
         .count()
 }
 
-fn first_hook_command(config: &Value) -> Option<String> {
+/// Unique embedded binary paths across all owned v0.4.x hook commands
+/// in `config`, in first-seen order.
+fn owned_hook_bins(config: &Value) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
     hook_commands(config)
-        .into_iter()
-        .find(|c| is_our_hook_command(c) && v040_hook_parts(c).is_some())
+        .iter()
+        .filter(|c| is_our_hook_command(c))
+        .filter_map(|c| embedded_bin(c))
+        .filter(|b| seen.insert(b.clone()))
+        .collect()
 }
 
 /// Embedded binary path of a v0.4.x hook command, unquoted. Only called

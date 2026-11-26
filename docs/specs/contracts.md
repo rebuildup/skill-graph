@@ -129,3 +129,21 @@ CLI・hook・MCP・plugin の全入口で同一規則を使う（`src/discovery.
 3. 呼び出し側の既定 root（CLI/plugin 既定、hook は runtime 別 fallback）— env 未設定かつ明示引数なしのときのみ
 
 `discover` は canonical 化した SKILL.md パスで重複を除くため、包含・重複する root を渡しても同一 skill を二重計上しない。
+
+## adapter の compose overlay（opt-in）
+
+`skill-graph adapter` は管理対象 config（`~/.claude/settings.json` 等）
+以外のファイルを既定では一切読み書きしない。dotfiles 管理の
+`settings.local.json` のように、compose 時に user config を再 import
+して古い skill-graph hook が復活しうる環境では、operator が
+`SKILL_GRAPH_EXTRA_OVERLAY=<path>` を明示設定した場合に限り、
+`enable` / `disable` / `status`（claude-code `--user`）がその overlay
+内の skill-graph 所有 hook を除去・計上する。env 未設定時は overlay
+機構は完全に無効であり、個人環境固有のパスはバイナリに埋め込まない
+（#174 / I-04）。
+
+`adapter status` の `broken` 判定は、config 内の全所有 v0.4.x hook
+command が埋め込む bin パスについて存在・実行ビットを非実行で検査
+する（#167: config 由来パスは信頼できない入力であり実行しない）。
+`enabled` は「エントリ存在 + bin 存在/実行可能」のみを意味し、
+bin のバージョン能力は status では未検証である。
