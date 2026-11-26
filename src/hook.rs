@@ -128,6 +128,48 @@ impl HookEnv {
         self.state_dir
             .join(format!("{}.{key_hash}", self.session_id))
     }
+
+    /// Per-session record of skill names surfaced by prompt-mode
+    /// recommendations (issue #128). Names only — prompt text, commands,
+    /// and tool responses are never persisted here.
+    fn recommended_path(&self) -> PathBuf {
+        self.state_dir
+            .join(format!("{}.recommended", self.session_id))
+    }
+
+    fn session_recommended(&self) -> Vec<String> {
+        if self.nostate {
+            return Vec::new();
+        }
+        std::fs::read_to_string(self.recommended_path())
+            .map(|s| {
+                s.lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_recommended(&self, names: &[String]) {
+        if self.nostate || names.is_empty() {
+            return;
+        }
+        const CAP: usize = 32;
+        let mut all = self.session_recommended();
+        for n in names {
+            if !all.contains(n) {
+                all.push(n.clone());
+            }
+        }
+        if all.len() > CAP {
+            all.drain(..all.len() - CAP);
+        }
+        if let Some(parent) = self.recommended_path().parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(self.recommended_path(), all.join("\n") + "\n");
+    }
 }
 
 /// POSIX cksum (the algorithm the `cksum` command implements): MSB-first
@@ -203,11 +245,12 @@ fn recommended_from(recs: &[crate::model::Recommendation]) -> Vec<RecommendedSki
 
 fn recommend_names(
     query: &str,
+    context: &str,
     max: usize,
     roots: &[PathBuf],
 ) -> Result<Vec<crate::model::Recommendation>, String> {
     let graph = build(discover(roots));
-    Ok(recommend(&graph, query, "", max))
+    Ok(recommend(&graph, query, context, max))
 }
 
 fn emit_recommendation(
@@ -307,8 +350,11 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
         return None;
     }
 
+    // Session continuity (issue #128): names this session's prompt mode
+    // already surfaced become recommendation context.
+    let session_ctx = env.session_recommended().join(" ");
     let start = Instant::now();
-    let recs = match recommend_names(&skill_name, 5, &roots) {
+    let recs = match recommend_names(&skill_name, &session_ctx, 5, &roots) {
         Ok(r) => r,
         Err(_) => {
             emit_recommendation(
@@ -406,7 +452,7 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
     env.touch_marker(&dedup_key);
 
     let start = Instant::now();
-    let recs = match recommend_names(&query, 5, &roots) {
+    let recs = match recommend_names(&query, "", 5, &roots) {
         Ok(r) => r,
         Err(_) => {
             emit_recommendation(
@@ -445,6 +491,7 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
         "recommended",
         Some(recommend_ms),
     );
+    env.record_recommended(&names.iter().map(|n| n.to_string()).collect::<Vec<String>>());
     let context = format!(
         "skill-graph: skills relevant to this task — {}. Read the matching SKILL.md before relying on it.",
         names.join(", ")

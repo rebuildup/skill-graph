@@ -240,3 +240,100 @@ fn unknown_runtime_and_mode_fail_open() {
     assert_eq!(rc, 0);
     assert!(out.trim().is_empty());
 }
+
+#[test]
+fn prompt_mode_records_recommended_names_per_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let state = dir.path().join("state");
+    let payload = json!({"session_id":"s1","prompt":"use alpha-skill please"});
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "prompt"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    assert!(!out.trim().is_empty());
+    let rec_file = state.join("s1.recommended");
+    let names = std::fs::read_to_string(&rec_file).expect("recommended file");
+    let lines: Vec<&str> = names.lines().collect();
+    assert!(!lines.is_empty());
+    // names only: every line is a fixture skill name, no prompt text
+    for line in &lines {
+        assert!(
+            line.ends_with("-skill") || *line == "kappa-skill",
+            "unexpected content: {line}"
+        );
+    }
+    assert!(!names.contains("please"));
+    // other sessions are untouched
+    assert!(!state.join("s2.recommended").exists());
+}
+
+#[test]
+fn skill_load_uses_session_recommended_as_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    // Seed session context whose terms hit beta-skill's description
+    // ("tests", "verification harnesses") — admits it via context alone.
+    std::fs::write(state.join("s1.recommended"), "tests harness\n").unwrap();
+    let payload = json!({
+        "session_id":"s1",
+        "tool_name":"Skill",
+        "tool_input":{"skill":"kappa-skill"}
+    });
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "skill-load"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    let v: Value = serde_json::from_str(out.trim()).expect("hook response json");
+    let ctx = v["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap();
+    assert!(ctx.contains("beta-skill"), "context was: {ctx}");
+}
+
+#[test]
+fn skill_load_without_session_context_has_no_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    // Same payload, no .recommended file -> kappa-skill has no deps,
+    // so no dependency recommendation is emitted.
+    let payload = json!({
+        "session_id":"s9",
+        "tool_name":"Skill",
+        "tool_input":{"skill":"kappa-skill"}
+    });
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "skill-load"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    assert!(out.trim().is_empty());
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    let rec = events
+        .iter()
+        .find(|e| e["kind"] == "recommendation")
+        .expect("recommendation event");
+    assert_eq!(rec["emitted"], false);
+}
+
+#[test]
+fn nostate_records_no_session_recommendations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envs = fixture_env(&dir);
+    envs.push(("SKILL_GRAPH_HOOK_NOSTATE".to_string(), "1".to_string()));
+    let payload = json!({"session_id":"s1","prompt":"use alpha-skill please"});
+    let (_, rc) = run_hook(
+        &["hook", "claude-code", "prompt"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    assert!(!dir.path().join("state").join("s1.recommended").exists());
+}
