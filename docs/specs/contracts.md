@@ -42,4 +42,14 @@ JSONL で追記し、`observe <path>` が contract 形式の行を検証付き�
 
 - `ResolveResult` は `name` / `path` / `unresolved` の tagged union。同名 skill が複数ある場合は `kind=name` かつ `ambiguous=true` とし、勝手に一意化しない。
 - `recommend` は候補がなければ空配列 `[]` を返す。推薦理由と観測根拠は各要素の `reasons` / `observation` に必須で含める。
-- cache・MCP・高度な graph algorithm はこの contract の対象外。
+- cache・高度な graph algorithm はこの contract の対象外。MCP tool surface は ADR-0005 / `docs/specs/v1.0.0.md` を参照。
+
+## Skill root の解決
+
+CLI・hook・MCP・plugin の全入口で同一規則を使う（`src/discovery.rs::resolve_roots`）:
+
+1. `SKILL_GRAPH_ROOTS`（`:` 区切り、存在する dir のみ）— 設定されていれば常に最優先。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。
+2. 明示引数（CLI `--root`、MCP tool `roots`。MCP は 32 件上限）
+3. 呼び出し側の既定 root（CLI/plugin 既定、hook は runtime 別 fallback）
+
+`discover` は canonical 化した SKILL.md パスで重複を除くため、包含・重複する root を渡しても同一 skill を二重計上しない。

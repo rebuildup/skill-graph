@@ -29,10 +29,42 @@ pub fn default_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// Parse `SKILL_GRAPH_ROOTS` (colon-separated, existing dirs only).
+/// Returns `None` when unset or nothing usable remains.
+pub fn env_roots() -> Option<Vec<PathBuf>> {
+    let spec = std::env::var("SKILL_GRAPH_ROOTS").ok()?;
+    let roots: Vec<PathBuf> = spec
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .collect();
+    (!roots.is_empty()).then_some(roots)
+}
+
+/// Shared root resolution for every entry point (CLI, hook, MCP, plugin):
+/// `SKILL_GRAPH_ROOTS` wins over explicit arguments, which win over the
+/// caller-provided fallback (runtime- or CLI-specific defaults). The
+/// operator-controlled env var therefore cannot be overridden by an
+/// agent-supplied argument — see ADR-0005.
+pub fn resolve_roots(
+    explicit: Vec<PathBuf>,
+    fallback: impl FnOnce() -> Vec<PathBuf>,
+) -> Vec<PathBuf> {
+    if let Some(roots) = env_roots() {
+        return roots;
+    }
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    fallback()
+}
+
 pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
     let mut seen_roots = HashSet::new();
+    let mut seen_files = HashSet::new();
 
     for requested in roots {
         let Ok(root) = std::fs::canonicalize(requested) else {
@@ -51,6 +83,14 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             }
             let path = entry.path();
             if !path.is_file() {
+                continue;
+            }
+            // Contained/overlapping roots can surface the same SKILL.md
+            // twice; count each file once.
+            let Ok(canonical) = std::fs::canonicalize(path) else {
+                continue;
+            };
+            if !seen_files.insert(canonical) {
                 continue;
             }
             match parse_skill(path, &root) {
