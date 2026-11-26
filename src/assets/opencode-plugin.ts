@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, mkdirSync } from "node:fs"
+import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
@@ -22,6 +22,10 @@ const dbg = (m: string) => { if (DBG) try { appendFileSync(DBG, m + "\n") } catc
 const SKILL_GRAPH_BIN = process.env.SKILL_GRAPH_BIN ?? "skill-graph"
 const EVENT_LOG =
   process.env.SKILL_GRAPH_EVENT_LOG ?? join(tmpdir(), "skill-graph-events.jsonl")
+// Parity with the Rust hook: SKILL_GRAPH_HOOK_NOSTATE=1 suppresses all
+// event writes; SKILL_GRAPH_EVENT_LOG_MAX bounds the log (rotate to .1).
+const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
+const EVENT_LOG_MAX = Number(process.env.SKILL_GRAPH_EVENT_LOG_MAX ?? 64 * 1024 * 1024)
 const emitted = new Set<string>()
 
 function sha256(text: string): string {
@@ -29,8 +33,14 @@ function sha256(text: string): string {
 }
 
 function emit(event: Record<string, unknown>) {
+  if (NOSTATE) return
   try {
     mkdirSync(dirname(EVENT_LOG), { recursive: true })
+    try {
+      if (statSync(EVENT_LOG).size > EVENT_LOG_MAX) {
+        renameSync(EVENT_LOG, EVENT_LOG + ".1")
+      }
+    } catch {}
     appendFileSync(EVENT_LOG, JSON.stringify(event) + "\n")
   } catch (e) {
     dbg("emit failed: " + e)
@@ -167,6 +177,7 @@ export default Plugin.define({
       if (emitted.has(key)) return
       emitted.add(key)
       const recs = await recommendNames(text, 3).catch(() => [])
+      // recommended[] must equal the injected set for funnel integrity.
       const names = recs.map((r) => r.name)
       emit({
         ...base("recommendation"),
@@ -195,12 +206,13 @@ export default Plugin.define({
       // Dependency lookup for the just-loaded skill (same contract as the
       // shell adapters' skill-load mode).
       const deps = await recommendNames(skillName, 5).catch(() => [])
-      const names = deps.map((r) => r.name).filter((n) => n !== skillName).slice(0, 3)
+      const injected = deps.filter((d) => d.name !== skillName).slice(0, 3)
+      const names = injected.map((r) => r.name)
       emit({
         ...base("recommendation"),
         session_id: sessionID,
         trigger: "skill_load",
-        recommended: deps,
+        recommended: injected,
         emitted: names.length > 0,
         reason: names.length > 0 ? "recommended" : "no_recommendations",
       })
