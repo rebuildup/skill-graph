@@ -4,6 +4,13 @@
 //! `recommend`, `discover`, `resolve`. No writes, no event log, no dedup
 //! state, no config mutation — package install or MCP registration alone
 //! activates nothing; each client's config entry is the opt-in path.
+//!
+//! There is deliberately no graph cache: a stdio MCP server stays alive
+//! for the whole agent session, so any memoization would serve stale
+//! skills after a SKILL.md is added, edited, or deleted. Cold
+//! discover+build is ~7.7 ms at 500 skills (release), so every tool call
+//! rebuilds the graph in memory — skill edits are visible on the very
+//! next call with no freshness bound to document.
 
 use crate::discovery::{discover, resolve_roots};
 use crate::model::{DiscoveryOutput, Skill};
@@ -29,59 +36,11 @@ const MAX_TOOL_ROOTS: usize = 32;
 /// the tool into an unbounded filesystem enumeration oracle.
 const MAX_DISCOVER_SKILLS: usize = 512;
 
-/// One memoized scan per roots signature. The graph owns the skill
-/// list; `errors` is kept separately so the `discover` tool can render
-/// DiscoveryOutput without retaining a second full copy of every skill
-/// body (~2× corpus per entry otherwise).
-struct CacheEntry {
-    graph: Arc<Graph>,
-    errors: Vec<String>,
-}
-
-/// Bounded LRU of memoized scans keyed by roots signature. Alternating
-/// between a few roots sets must not rescan on every call, but unbounded
-/// growth is not acceptable either — evict least-recently-used beyond
-/// MAX_CACHE_ENTRIES.
-const MAX_CACHE_ENTRIES: usize = 4;
-
-type GraphCache = Arc<std::sync::Mutex<Vec<(String, Arc<CacheEntry>)>>>;
-
-struct SkillGraphMcp {
-    graph_cache: GraphCache,
-}
+struct SkillGraphMcp;
 
 impl SkillGraphMcp {
     fn new() -> Self {
-        Self {
-            graph_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-
-    fn entry_for(cache: &GraphCache, roots: &[PathBuf]) -> Arc<CacheEntry> {
-        // JSON array encoding is injective — no separator collision.
-        let key = serde_json::to_string(
-            &roots
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_default();
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        // Most-recently-used lives at the back.
-        if let Some(pos) = guard.iter().rposition(|(k, _)| *k == key) {
-            let (_, entry) = guard.remove(pos);
-            guard.push((key, entry.clone()));
-            return entry;
-        }
-        let discovery = discover(roots);
-        let errors = discovery.errors.clone();
-        let graph = Arc::new(build(discovery));
-        let entry = Arc::new(CacheEntry { graph, errors });
-        guard.push((key, entry.clone()));
-        if guard.len() > MAX_CACHE_ENTRIES {
-            guard.remove(0);
-        }
-        entry
+        Self
     }
 }
 
@@ -220,30 +179,44 @@ impl ServerHandler for SkillGraphMcp {
     ) -> Result<CallToolResponse, McpError> {
         let args = request.arguments.clone().unwrap_or_default();
         let name = request.name.clone();
-        let cache = self.graph_cache.clone();
         // Discovery/recommend/resolve do synchronous filesystem scans and
         // CPU-bound scoring; run them on the blocking pool so a slow or
         // huge corpus cannot stall the stdio server's async runtime.
-        tokio::task::spawn_blocking(move || compute_tool(&cache, name.as_ref(), &args))
+        tokio::task::spawn_blocking(move || compute_tool(name.as_ref(), &args))
             .await
             .map_err(|e| McpError::internal_error(format!("tool task failed: {e}"), None))?
     }
 }
 
-fn compute_tool(
-    cache: &GraphCache,
-    name: &str,
-    args: &JsonObject,
-) -> Result<CallToolResponse, McpError> {
+/// One fresh in-memory scan per tool call. Cold discover+build costs
+/// ~7.7 ms at 500 skills (release; see docs/evidence/
+/// 2026-11-25-c03-performance-benchmark.md), far below any interactive
+/// budget, and it keeps every call consistent with the filesystem —
+/// no staleness window for a long-lived stdio server.
+struct BuiltGraph {
+    graph: Graph,
+    errors: Vec<String>,
+}
+
+fn build_graph(roots: &[PathBuf]) -> BuiltGraph {
+    let discovery = discover(roots);
+    let errors = discovery.errors.clone();
+    BuiltGraph {
+        graph: build(discovery),
+        errors,
+    }
+}
+
+fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpError> {
     let result = match name {
         "recommend" => {
             let Some(query) = arg_str(args, "query") else {
                 return Ok(tool_error("missing required argument: query"));
             };
             let roots = tool_roots(args.get("roots"));
-            let entry = SkillGraphMcp::entry_for(cache, &roots);
+            let built = build_graph(&roots);
             let recs = recommend(
-                &entry.graph,
+                &built.graph,
                 query,
                 arg_str(args, "context").unwrap_or(""),
                 arg_usize(args, "max", 3),
@@ -252,10 +225,10 @@ fn compute_tool(
         }
         "discover" => {
             let roots = tool_roots(args.get("roots"));
-            let entry = SkillGraphMcp::entry_for(cache, &roots);
+            let built = build_graph(&roots);
             let mut output = DiscoveryOutput {
-                skills: entry.graph.skills.iter().map(Skill::summary).collect(),
-                errors: entry.errors.clone(),
+                skills: built.graph.skills.iter().map(Skill::summary).collect(),
+                errors: built.errors.clone(),
             };
             if output.skills.len() > MAX_DISCOVER_SKILLS {
                 output.skills.truncate(MAX_DISCOVER_SKILLS);
@@ -270,8 +243,8 @@ fn compute_tool(
                 return Ok(tool_error("missing required argument: target"));
             };
             let roots = tool_roots(args.get("roots"));
-            let entry = SkillGraphMcp::entry_for(cache, &roots);
-            tool_result(&json!(crate::cli::resolve_target(&entry.graph, target)))
+            let built = build_graph(&roots);
+            tool_result(&json!(crate::cli::resolve_target(&built.graph, target)))
         }
         other => {
             return Err(McpError::invalid_params(
