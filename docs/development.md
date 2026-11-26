@@ -19,7 +19,7 @@ mise run check
 
 ```text
 src/                 CLI とコアエンジン（cli/hook/adapter/mcp/observe/events 等）
-tests/               統合テスト（core/hook/adapter/mcp/observe/contract/security）
+tests/               統合テスト（core/hook/adapter/mcp/observe/contract/security/cli/detect）
 contracts/v1/        公開 JSON Schema（CLI 出力・Skill Usage Event）
 fixtures/skills/     テスト・評価用の最小スキル群
 evals/               評価データセットとハーネス

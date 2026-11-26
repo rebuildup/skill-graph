@@ -102,11 +102,13 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
 }
 
 fn corpus_root(size: usize) -> Result<PathBuf, String> {
-    let root = std::env::temp_dir().join(format!("skill-graph-perf-{}-{size}", std::process::id()));
-    if root.exists() {
-        fs::remove_dir_all(&root).map_err(|err| err.to_string())?;
-    }
-    fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+    // Private tempdir: a predictable shared-/tmp path would let another
+    // local user pre-plant SKILL.md symlinks and redirect the writes.
+    let root = tempfile::Builder::new()
+        .prefix("skill-graph-perf-")
+        .tempdir()
+        .map_err(|e| e.to_string())?
+        .keep();
     for index in 0..size {
         let name = format!("perf-skill-{index:04}");
         let description = if index == 0 {

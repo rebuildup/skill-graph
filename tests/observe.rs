@@ -346,3 +346,32 @@ fn observe_survives_symlink_cycle() {
     let obs = observe_path(dir.path()).unwrap();
     assert_eq!(obs.files_scanned, 1);
 }
+
+/// Recommendation events with an empty `recommended` list must pass
+/// through (the hook emits `recommended: []` for dedup/no_recommendations
+/// outcomes), while explicit JSON nulls for required fields are rejected
+/// rather than re-serialized into schema-invalid output.
+#[test]
+fn passthrough_accepts_empty_recommended_rejects_null_required() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "events.jsonl",
+        &[
+            // valid: emitted=false with recommended: []
+            r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:00Z","observed_via":"hook","trigger":"prompt_submit","recommended":[],"emitted":false,"reason":"dedup_skip"}"#,
+            // invalid: emitted is explicit null — must be skipped
+            r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:01Z","observed_via":"hook","trigger":"prompt_submit","recommended":[],"emitted":null,"reason":"x"}"#,
+            // invalid: recommended item name empty
+            r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:02Z","observed_via":"hook","trigger":"prompt_submit","recommended":[{"name":""}],"emitted":true,"reason":"recommended"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.events.len(), 1, "events: {:?}", obs.events);
+    assert_eq!(obs.lines_skipped, 2);
+    assert_eq!(
+        obs.events[0].kind,
+        skill_graph::events::EventKind::Recommendation
+    );
+    assert_eq!(obs.events[0].emitted, Some(false));
+}

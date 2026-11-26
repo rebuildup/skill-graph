@@ -104,6 +104,7 @@ impl HookEnv {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        no_follow(&mut opts);
         if let Ok(mut f) = opts.open(&self.event_log) {
             // mode(0o600) only applies at creation; tighten pre-existing logs.
             restrict_perms(&self.event_log);
@@ -112,7 +113,13 @@ impl HookEnv {
     }
 
     fn marker_exists(&self, dedup_key: &str) -> bool {
-        !self.nostate && self.marker_path(dedup_key).exists()
+        // symlink_metadata: a planted symlink must not satisfy dedup.
+        !self.nostate
+            && self
+                .marker_path(dedup_key)
+                .symlink_metadata()
+                .map(|m| m.is_file())
+                .unwrap_or(false)
     }
 
     fn touch_marker(&self, dedup_key: &str) {
@@ -130,6 +137,7 @@ impl HookEnv {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        no_follow(&mut opts);
         let _ = opts.open(path);
     }
 
@@ -187,6 +195,7 @@ impl HookEnv {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
+        no_follow(&mut opts);
         if let Ok(mut f) = opts.open(self.recommended_path()) {
             use std::io::Write;
             let _ = f.write_all((all.join("\n") + "\n").as_bytes());
@@ -214,6 +223,18 @@ fn restrict_dir_perms(path: &std::path::Path) {
 
 #[cfg(not(unix))]
 fn restrict_dir_perms(_path: &std::path::Path) {}
+
+/// Refuse to follow a symlink at the final path component. State lives
+/// under a shared TMPDIR where another local user could pre-plant links;
+/// O_NOFOLLOW makes open(2) fail instead of writing through them.
+#[cfg(unix)]
+fn no_follow(opts: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+fn no_follow(_opts: &mut std::fs::OpenOptions) {}
 
 /// POSIX cksum (the algorithm the `cksum` command implements): MSB-first
 /// CRC, polynomial 0x04C11DB7, init 0; the input length is appended
@@ -358,6 +379,7 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     // Discovery+graph build happens once per payload, not per skill.
     let mut contexts = Vec::new();
     let mut graph_cache: Option<crate::resolver::Graph> = None;
+    let mut no_roots_emitted = false;
     for mut event in detected {
         // Normalize to the sanitized session id so all events agree.
         event.session_id = env.session_id.clone();
@@ -377,17 +399,21 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
             build(discover(&roots))
         });
         if graph.skills.is_empty() {
-            // No skills discovered: emit no_roots once and stop.
-            emit_recommendation(
-                env,
-                Trigger::SkillLoad,
-                None,
-                &[],
-                false,
-                "no_roots",
-                Some(0),
-            );
-            return None;
+            // No skills discovered: emit no_roots once, keep logging any
+            // remaining detected events in this payload.
+            if !no_roots_emitted {
+                emit_recommendation(
+                    env,
+                    Trigger::SkillLoad,
+                    None,
+                    &[],
+                    false,
+                    "no_roots",
+                    Some(0),
+                );
+                no_roots_emitted = true;
+            }
+            continue;
         }
         if let Some(ctx) = skill_load_context(env, &skill_name, graph) {
             contexts.push(ctx);

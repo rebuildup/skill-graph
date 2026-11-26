@@ -137,18 +137,33 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
 /// emitting anything, while older releases fail on the unknown
 /// subcommand or missing arguments.
 fn supports_hook_subcommand(path: &Path) -> bool {
-    match std::process::Command::new(path)
+    let Ok(mut child) = std::process::Command::new(path)
         .args(["hook", "claude-code", "prompt"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(s) => s.success(),
+        .spawn()
+    else {
         // A spawn failure (transient resource exhaustion, exec-format
         // edge) is inconclusive: is_executable already screened the file,
         // and failing enable on it would be flakier than the hook itself.
-        Err(_) => true,
+        return true;
+    };
+    // Bounded wait: a FIFO or wedged binary must not hang `adapter`.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Err(_) => return true,
+        }
     }
 }
 
@@ -284,15 +299,32 @@ fn is_our_hook_command(command: &str) -> bool {
     }
 }
 
+/// True when `marker` occurs in `s` at path/URI boundaries: preceded by
+/// `/` (or at the start) and followed by end or a URI/path delimiter.
+/// Keeps `my-skill-graph/opencode-plugin` and `opencode-plugin-fork`
+/// from being claimed as ours.
+fn marker_at_boundary(s: &str, marker: &str) -> bool {
+    s.match_indices(marker).any(|(i, m)| {
+        let before_ok = i == 0 || s.as_bytes()[i - 1] == b'/';
+        let rest = &s[i + m.len()..];
+        let after_ok = rest.is_empty() || rest.starts_with(['/', '?', '#', '%']);
+        before_ok && after_ok
+    })
+}
+
 fn is_our_plugin(spec: &Value) -> bool {
     spec.as_str()
-        .map(|s| s.contains(PLUGIN_MARKER) || s.contains(LEGACY_PLUGIN_MARKER))
+        .map(|s| {
+            marker_at_boundary(s, PLUGIN_MARKER) || marker_at_boundary(s, LEGACY_PLUGIN_MARKER)
+        })
         .unwrap_or(false)
 }
 
 fn is_legacy_plugin(spec: &Value) -> bool {
     spec.as_str()
-        .map(|s| s.contains(LEGACY_PLUGIN_MARKER) && !s.contains(PLUGIN_MARKER))
+        .map(|s| {
+            marker_at_boundary(s, LEGACY_PLUGIN_MARKER) && !marker_at_boundary(s, PLUGIN_MARKER)
+        })
         .unwrap_or(false)
 }
 
@@ -431,6 +463,7 @@ fn strip_our_hooks(config: &mut Value) {
     let Some(hooks) = config.get_mut("hooks").and_then(Value::as_object_mut) else {
         return;
     };
+    let mut any_pruned = false;
     let events: Vec<String> = hooks.keys().cloned().collect();
     for event in events {
         let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
@@ -455,6 +488,7 @@ fn strip_our_hooks(config: &mut Value) {
                 return true;
             }
             pruned = true;
+            any_pruned = true;
             // Prune the group only if stripping emptied it; groups that
             // never had a `hooks` array are foreign shapes and stay.
             group
@@ -469,7 +503,10 @@ fn strip_our_hooks(config: &mut Value) {
             hooks.remove(&event);
         }
     }
+    // Drop the "hooks" key only when our stripping emptied it — a
+    // pre-existing empty `"hooks": {}` is foreign content and stays.
     if hooks.is_empty()
+        && any_pruned
         && let Some(obj) = config.as_object_mut()
     {
         obj.remove("hooks");
@@ -567,7 +604,7 @@ fn materialize_opencode_plugin() -> Result<PathBuf, String> {
     let dir = opencode_plugin_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("index.ts");
-    std::fs::write(&file, OPENCODE_PLUGIN_TS).map_err(|e| format!("{}: {e}", file.display()))?;
+    write_text_atomic(&file, OPENCODE_PLUGIN_TS)?;
     Ok(dir)
 }
 
@@ -598,7 +635,13 @@ fn clean_dotfiles_overlay() {
     }
     match read_config(&overlay) {
         Ok(mut config) if config.is_object() => {
+            let before = config.clone();
             strip_our_hooks(&mut config);
+            if config == before {
+                // Nothing of ours in the overlay — do not rewrite a
+                // user-managed file (serde reorders/pretty-prints it).
+                return;
+            }
             match write_json(&overlay, &config) {
                 Ok(()) => println!("cleaned dotfiles overlay: {}", overlay.display()),
                 Err(e) => eprintln!(
@@ -726,8 +769,13 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     if args.runtime == Runtime::Opencode {
         // Remove the materialized plugin only when no remaining config
         // references it — user and project scopes share one payload dir.
+        // Project configs in other directories cannot be enumerated, so
+        // absence of references here is best-effort.
         if !opencode_plugin_referenced() {
             let _ = std::fs::remove_dir_all(opencode_plugin_dir());
+            println!(
+                "note: checked user and current-project opencode configs only;                  project configs in other directories may still reference the plugin"
+            );
         }
     }
 

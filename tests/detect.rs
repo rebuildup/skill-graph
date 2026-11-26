@@ -118,3 +118,53 @@ fn detect_via_transcript_and_db_accepted() {
         assert_eq!(event["observed_via"], via);
     }
 }
+
+/// A command touching several SKILL.md files must emit one NDJSON event
+/// per file — the OpenCode plugin depends on this line-per-event shape.
+#[test]
+fn detect_emits_one_line_per_skill_md_access() {
+    let payload = json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": "cat /repo/skills/alpha-skill/SKILL.md; grep -r foo /repo/skills/beta-skill/SKILL.md"},
+        "tool_response": {"stdout": "..."},
+        "session_id": "s-multi"
+    });
+    let (out, rc) = run_detect(
+        &["detect", "--runtime", "claude-code", "--via", "hook"],
+        &payload.to_string(),
+    );
+    assert_eq!(rc, 0, "{out}");
+    let lines: Vec<&str> = out.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 2, "expected 2 NDJSON events: {out}");
+    let events: Vec<Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("ndjson line"))
+        .collect();
+    let names: Vec<&str> = events
+        .iter()
+        .filter_map(|e| e["skill_name"].as_str())
+        .collect();
+    assert!(names.contains(&"alpha-skill"), "{names:?}");
+    assert!(names.contains(&"beta-skill"), "{names:?}");
+}
+
+/// Codex `exec` tool carries JS source, not a shell command; the
+/// exec_command({cmd: ...}) extraction path must classify SKILL.md
+/// accesses inside it.
+#[test]
+fn detect_exec_tool_extracts_js_commands() {
+    let payload = json!({
+        "tool_name": "exec",
+        "tool_input": {"input": "await exec_command({cmd: \"cat /repo/skills/alpha-skill/SKILL.md\"})"},
+        "tool_response": "file contents",
+        "session_id": "s-exec"
+    });
+    let (out, rc) = run_detect(
+        &["detect", "--runtime", "codex", "--via", "hook"],
+        &payload.to_string(),
+    );
+    assert_eq!(rc, 0, "{out}");
+    let event: Value = serde_json::from_str(out.trim()).expect("event json");
+    assert_eq!(event["kind"], "skill_load");
+    assert_eq!(event["skill_name"], "alpha-skill");
+}
