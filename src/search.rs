@@ -6,9 +6,11 @@ struct Evidence {
     direct: f64,
     weak: f64,
     necessity: f64,
-    name_hits: Vec<(String, usize)>,
-    description_hits: Vec<(String, usize)>,
-    context_hits: Vec<(String, usize)>,
+    // Hit terms only; document frequency is attached later, computed just
+    // for the union of hit terms rather than every query term.
+    name_hits: Vec<String>,
+    description_hits: Vec<String>,
+    context_hits: Vec<String>,
     reasons: Vec<String>,
 }
 
@@ -106,14 +108,6 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut candidates: Vec<usize> = rep_of_name.values().copied().collect();
     candidates.sort_unstable();
 
-    let document_frequency = document_frequency(
-        graph,
-        &candidates,
-        &skill_names,
-        &skill_descriptions,
-        query_terms.iter().chain(context_terms.iter()),
-    );
-
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
 
@@ -130,7 +124,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let direct = field_score(
             &query,
             &query_terms,
-            &skill.name,
+            &skill_names[index],
             20.0,
             "name",
             &mut direct_reasons,
@@ -150,23 +144,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             &mut direct_reasons,
         );
 
-        // Weak relatedness evidence: body text and link targets. This can rank
-        // an admitted skill but cannot admit one by itself.
-        let mut weak = field_score(
-            &query,
-            &query_terms,
-            &skill_bodies[index],
-            2.0,
-            "body",
-            &mut weak_reasons,
-        ) + field_score(
-            &context,
-            &context_terms,
-            &skill_bodies[index],
-            1.0,
-            "context+body",
-            &mut weak_reasons,
-        );
+        // Weak relatedness evidence: link targets here; body text is
+        // scored only for admitted skills after admission (below) — body
+        // fields can be ~1 MiB each, so scanning them for every corpus
+        // skill would make recommend() quadratic in corpus size. Body
+        // evidence can rank an admitted skill but never admit one.
+        let mut weak = 0.0;
         for link in &skill.links {
             match link.kind {
                 LinkKind::Requires | LinkKind::Markdown if matches_query(&query, &link.target) => {
@@ -193,32 +176,17 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let name_hits = query_terms
             .iter()
             .filter(|term| name_lower.contains(term.as_str()))
-            .map(|term| {
-                (
-                    term.clone(),
-                    *document_frequency.get(term).unwrap_or(&usize::MAX),
-                )
-            })
+            .cloned()
             .collect::<Vec<_>>();
         let description_hits = query_terms
             .iter()
             .filter(|term| description_lower.contains(term.as_str()))
-            .map(|term| {
-                (
-                    term.clone(),
-                    *document_frequency.get(term).unwrap_or(&usize::MAX),
-                )
-            })
+            .cloned()
             .collect::<Vec<_>>();
         let context_hits = context_terms
             .iter()
             .filter(|term| skill_descriptions_base[index].contains(term.as_str()))
-            .map(|term| {
-                (
-                    term.clone(),
-                    *document_frequency.get(term).unwrap_or(&usize::MAX),
-                )
-            })
+            .cloned()
             .collect::<Vec<_>>();
 
         infos[index] = Some(Evidence {
@@ -231,6 +199,28 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             reasons,
         });
     }
+
+    // Document frequency is needed only for admission decisions on terms
+    // that actually hit a field; computing it for every query term would
+    // scan the corpus once per term even when nothing matches.
+    let hit_terms: Vec<&str> = infos
+        .iter()
+        .flatten()
+        .flat_map(|info| {
+            info.name_hits
+                .iter()
+                .chain(&info.description_hits)
+                .chain(&info.context_hits)
+                .map(String::as_str)
+        })
+        .collect();
+    let document_frequency = document_frequency(
+        graph,
+        &candidates,
+        &skill_names,
+        &skill_descriptions,
+        hit_terms.iter().copied(),
+    );
 
     // Admission is structural, not score-based:
     // - a name hit admits when it is specific enough (multiple name terms or a
@@ -247,7 +237,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     for (index, info) in infos.iter().enumerate() {
         if info
             .as_ref()
-            .is_some_and(|info| directly_admitted(info, &query_sources))
+            .is_some_and(|info| directly_admitted(info, &query_sources, &document_frequency))
         {
             admitted.insert(index, Vec::new());
             seeds.push(index);
@@ -269,9 +259,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 if graph.skills[target].parse_error.is_some() {
                     continue;
                 }
-                let is_seed = infos[target]
-                    .as_ref()
-                    .is_some_and(|info| directly_admitted(info, &query_sources));
+                let is_seed = infos[target].as_ref().is_some_and(|info| {
+                    directly_admitted(info, &query_sources, &document_frequency)
+                });
                 let entry = admitted.entry(target).or_default();
                 entry.push(format!("required by {}", graph.skills[*seed].name));
                 if !is_seed && let Some(info) = infos[target].as_mut() {
@@ -279,6 +269,30 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 }
             }
         }
+    }
+
+    // Body-text weak evidence applies only to admitted skills: it can
+    // raise an admitted skill's rank but cannot admit a skill by itself,
+    // so scanning ~1 MiB bodies for non-admitted skills is wasted work.
+    for &index in admitted.keys() {
+        let Some(info) = infos[index].as_mut() else {
+            continue;
+        };
+        info.weak += field_score(
+            &query,
+            &query_terms,
+            &skill_bodies[index],
+            2.0,
+            "body",
+            &mut info.reasons,
+        ) + field_score(
+            &context,
+            &context_terms,
+            &skill_bodies[index],
+            1.0,
+            "context+body",
+            &mut info.reasons,
+        );
     }
 
     let mut out: Vec<Recommendation> = infos
@@ -336,13 +350,18 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     out
 }
 
-fn directly_admitted(info: &Evidence, query_sources: &HashMap<String, String>) -> bool {
+fn directly_admitted(
+    info: &Evidence,
+    query_sources: &HashMap<String, String>,
+    document_frequency: &HashMap<String, usize>,
+) -> bool {
+    let df = |term: &str| document_frequency.get(term).copied().unwrap_or(usize::MAX);
     // The skill name is the skill's identity: two or more query terms inside
     // one name is specific regardless of corpus-wide document frequency.
     // A single name hit stays conservative (low df, meaningful length).
     let multiple_name_hits = info.name_hits.len() >= 2;
     let unique_name_hit =
-        info.name_hits.len() == 1 && info.name_hits[0].1 == 1 && info.name_hits[0].0.len() >= 4;
+        info.name_hits.len() == 1 && df(&info.name_hits[0]) == 1 && info.name_hits[0].len() >= 4;
     // A name hit plus independent description evidence admits: the name anchors
     // identity while the description confirms topical fit. This keeps high-df
     // description terms from admitting alone but lets e.g. "PR review" reach
@@ -355,7 +374,7 @@ fn directly_admitted(info: &Evidence, query_sources: &HashMap<String, String>) -
     let description_sources: HashSet<&str> = info
         .description_hits
         .iter()
-        .map(|(term, _)| {
+        .map(|term| {
             query_sources
                 .get(term)
                 .map(String::as_str)
@@ -364,7 +383,7 @@ fn directly_admitted(info: &Evidence, query_sources: &HashMap<String, String>) -
         .collect();
     let description_admitted = info.description_hits.len() >= 2
         && description_sources.len() >= 2
-        && info.description_hits.iter().any(|(_, df)| *df == 1);
+        && info.description_hits.iter().any(|term| df(term) == 1);
     let context_admitted = info.context_hits.len() >= 2;
     multiple_name_hits
         || unique_name_hit
@@ -378,11 +397,11 @@ fn document_frequency<'a>(
     candidates: &[usize],
     skill_names: &[String],
     skill_descriptions: &[String],
-    terms: impl Iterator<Item = &'a String>,
+    terms: impl Iterator<Item = &'a str>,
 ) -> HashMap<String, usize> {
     let mut unique = HashSet::new();
     for term in terms {
-        unique.insert(term.as_str());
+        unique.insert(term);
     }
     let mut frequencies = HashMap::new();
     for term in unique {
@@ -407,6 +426,9 @@ fn document_frequency<'a>(
     frequencies
 }
 
+/// `field` must already be lowercase — callers pass pre-lowered
+/// descriptions/bodies/names. Lowercasing inside this per-skill hot loop
+/// would copy up to ~1 MiB per field per recommend() call.
 fn field_score(
     query: &str,
     query_terms: &[String],
@@ -418,15 +440,14 @@ fn field_score(
     if query.is_empty() || field.is_empty() {
         return 0.0;
     }
-    let field_lower = field.to_lowercase();
     let mut score = 0.0;
     for term in query_terms {
-        if field_lower.contains(term.as_str()) {
+        if field.contains(term.as_str()) {
             score += weight;
             reasons.push(format!("{label}: {term}"));
         }
     }
-    if !query.contains(char::is_whitespace) && field_lower.contains(query) {
+    if !query.contains(char::is_whitespace) && field.contains(query) {
         score += weight * 2.0;
         reasons.push(format!("{label}: {query}"));
     }

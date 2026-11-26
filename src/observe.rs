@@ -9,8 +9,16 @@
 //! - skill-graph event logs already in contract form (JSONL passthrough)
 //!
 //! Only SELECT-style reads are performed; no runtime data is modified.
-//! Unknown line shapes and missing tables are tolerated and reported in
-//! `errors`/`lines_skipped` rather than failing the scan.
+//! Unreadable files/dirs, missing tables, and malformed lines are
+//! tolerated and reported in `errors`/`lines_skipped` rather than
+//! failing the scan. Valid-JSON lines matching no known shape are
+//! ignored silently (format-drift tolerance).
+//!
+//! Co-observation hazard: transcript-derived events and the hook/plugin
+//! event log describe the same deliveries. Pointing `observe` at a tree
+//! containing both (e.g. `observe ~` when the event log lives under $HOME)
+//! double-counts recommendations and halves conversion_rate — observe
+//! transcripts OR the event log, not both, for metric use.
 
 use crate::events::{
     self, Confidence, Detection, EventKind, ObservedVia, RecommendedSkill, Runtime,
@@ -50,10 +58,11 @@ pub struct SkillLoad {
 }
 
 pub fn observe_path(path: &Path) -> Result<Observation, String> {
-    let mut files = Vec::new();
-    collect_observables(path, &mut files)?;
+    let (files, collect_errors) = collect_observables(path);
+    let mut files = files;
     files.sort();
     let mut obs = Observation::default();
+    obs.errors.extend(collect_errors);
     let mut sessions = BTreeSet::new();
     for file in files {
         obs.files_scanned += 1;
@@ -98,62 +107,104 @@ fn line_session_id(value: &Value) -> Option<String> {
     }
 }
 
-fn collect_observables(path: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let mut visited = std::collections::HashSet::new();
-    collect_observables_inner(path, out, &mut visited)
+/// Collect observable files plus non-fatal collection errors. A single
+/// unreadable directory must not abort the whole scan, and files reachable
+/// through multiple paths (symlinked/hardlinked transcripts) are scanned
+/// once — canonicalizing the file dedups them so events are not
+/// double-counted.
+fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let mut visited_dirs = std::collections::HashSet::new();
+    let mut seen_files = std::collections::HashSet::new();
+    collect_observables_inner(
+        path,
+        &mut out,
+        &mut errors,
+        &mut visited_dirs,
+        &mut seen_files,
+    );
+    (out, errors)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_observables_inner(
     path: &Path,
     out: &mut Vec<PathBuf>,
-    visited: &mut std::collections::HashSet<PathBuf>,
-) -> Result<(), String> {
+    errors: &mut Vec<String>,
+    visited_dirs: &mut std::collections::HashSet<PathBuf>,
+    seen_files: &mut std::collections::HashSet<PathBuf>,
+) {
     if path.is_file() {
         if matches!(
             path.extension().and_then(|e| e.to_str()),
             Some("jsonl") | Some("db")
         ) {
-            out.push(path.to_path_buf());
+            push_observable(path, out, seen_files);
         }
-        return Ok(());
+        return;
     }
     if !path.is_dir() {
-        return Err(format!("not a file or directory: {}", path.display()));
+        errors.push(format!("not a file or directory: {}", path.display()));
+        return;
     }
     // `is_dir` follows symlinks; a symlink cycle would recurse forever.
     // Canonicalize each directory and visit it at most once — this also
     // dedups bind mounts and overlapping roots.
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(canonical) {
-        return Ok(());
+    if !visited_dirs.insert(canonical) {
+        return;
     }
-    for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
-        let entry = entry.map_err(|e| e.to_string())?;
+    let entries = match fs::read_dir(path) {
+        Ok(e) => e,
+        Err(e) => {
+            errors.push(format!("{}: {e}", path.display()));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                errors.push(format!("{}: {e}", path.display()));
+                continue;
+            }
+        };
         let p = entry.path();
         if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
             // Never recurse through symlinked directories (unbounded
             // scan risk), but a symlinked .jsonl/.db file is a single
-            // bounded read and is followed.
+            // bounded read and is followed — deduped by canonical target.
             if p.is_file()
                 && matches!(
                     p.extension().and_then(|e| e.to_str()),
                     Some("jsonl") | Some("db")
                 )
             {
-                out.push(p);
+                push_observable(&p, out, seen_files);
             }
             continue;
         }
         if p.is_dir() {
-            collect_observables_inner(&p, out, visited)?;
+            collect_observables_inner(&p, out, errors, visited_dirs, seen_files);
         } else if matches!(
             p.extension().and_then(|e| e.to_str()),
             Some("jsonl") | Some("db")
         ) {
-            out.push(p);
+            push_observable(&p, out, seen_files);
         }
     }
-    Ok(())
+}
+
+fn push_observable(
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if seen.insert(canonical) {
+        out.push(path.to_path_buf());
+    }
 }
 
 /// Transcript/DB inputs are user data and can be huge; refuse to slurp
@@ -210,6 +261,36 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
         return true;
     };
     if event.schema_version != events::SCHEMA_VERSION {
+        obs.lines_skipped += 1;
+        return true;
+    }
+    // Top-level additionalProperties:false — serde drops unknown keys
+    // silently, so reject them explicitly to keep invalid input visible
+    // in lines_skipped rather than normalized into valid output.
+    const EVENT_KEYS: &[&str] = &[
+        "schema_version",
+        "kind",
+        "runtime",
+        "session_id",
+        "timestamp",
+        "observed_via",
+        "prompt_hash",
+        "trigger",
+        "recommended",
+        "emitted",
+        "reason",
+        "recommend_ms",
+        "skill_name",
+        "skill_path",
+        "skill_digest",
+        "detection",
+        "confidence",
+        "tool",
+    ];
+    if value
+        .as_object()
+        .is_some_and(|o| o.keys().any(|k| !EVENT_KEYS.contains(&k.as_str())))
+    {
         obs.lines_skipped += 1;
         return true;
     }
@@ -913,19 +994,21 @@ pub fn summary(obs: &Observation) -> Value {
     // capped so a huge log cannot produce unbounded output.
     const MAX_SUMMARY_SESSIONS: usize = 500;
     let mut by_session_map = serde_json::Map::new();
-    let mut session_events: std::collections::BTreeMap<&str, Vec<&crate::events::SkillUsageEvent>> =
-        std::collections::BTreeMap::new();
+    let mut session_events: std::collections::BTreeMap<
+        String,
+        Vec<&crate::events::SkillUsageEvent>,
+    > = std::collections::BTreeMap::new();
     for e in &all {
         if !e.session_id.is_empty() {
             session_events
-                .entry(e.session_id.as_str())
+                .entry(format!("{}:{}", e.runtime.as_str(), e.session_id))
                 .or_default()
                 .push(*e);
         }
     }
     let total_sessions = session_events.len();
     for (session_id, events) in session_events.into_iter().take(MAX_SUMMARY_SESSIONS) {
-        by_session_map.insert(session_id.to_string(), funnel_for(&events).into_json());
+        by_session_map.insert(session_id, funnel_for(&events).into_json());
     }
     out["by_session"] = Value::Object(by_session_map);
     if total_sessions > MAX_SUMMARY_SESSIONS {
@@ -1003,59 +1086,74 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
     // Stable per-session ordering: (timestamp, input order).
     let mut order: Vec<usize> = (0..events.len()).collect();
     order.sort_by_key(|&i| (rfc3339_secs(&events[i].timestamp).unwrap_or(i64::MAX), i));
-    let mut by_session: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+
+    // Top-level counters cover every event, including unattributable
+    // ones (empty session_id) — they just never join a session funnel.
     for &i in &order {
+        let e = events[i];
+        match e.kind {
+            EventKind::PromptSubmit => f.prompt_submits += 1,
+            EventKind::Recommendation => {
+                f.recommendations += 1;
+                if e.emitted == Some(true) {
+                    f.emitted += 1;
+                    if !e.session_id.is_empty() {
+                        *f.emitted_per_session
+                            .entry(format!("{}:{}", e.runtime.as_str(), e.session_id))
+                            .or_default() += 1;
+                    }
+                }
+            }
+            EventKind::SkillLoad if e.counts_as_load() => {
+                f.load_grade_loads += 1;
+                if !e.session_id.is_empty() {
+                    f.sessions_with_loads.insert(format!(
+                        "{}:{}",
+                        e.runtime.as_str(),
+                        e.session_id
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Session-scoped joins group by (runtime, session_id): ids are only
+    // unique within a runtime, and events with no session id must not
+    // merge into one pseudo-session across unrelated files.
+    let mut by_session: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    for &i in &order {
+        let e = events[i];
+        if e.session_id.is_empty() {
+            continue;
+        }
+        f.sessions
+            .insert(format!("{}:{}", e.runtime.as_str(), e.session_id));
         by_session
-            .entry(events[i].session_id.as_str())
+            .entry((e.runtime.as_str(), e.session_id.as_str()))
             .or_default()
             .push(i);
     }
     for idxs in by_session.values() {
-        let recs: Vec<usize> = idxs
-            .iter()
-            .copied()
-            .filter(|&i| events[i].kind == EventKind::Recommendation)
-            .collect();
-        let loads: Vec<usize> = idxs
-            .iter()
-            .copied()
-            .filter(|&i| events[i].counts_as_load())
-            .collect();
-        for &i in idxs {
-            let e = events[i];
-            f.sessions.insert(e.session_id.clone());
-            match e.kind {
-                EventKind::PromptSubmit => f.prompt_submits += 1,
-                EventKind::Recommendation => {
-                    f.recommendations += 1;
-                    if e.emitted == Some(true) {
-                        f.emitted += 1;
-                        *f.emitted_per_session
-                            .entry(e.session_id.clone())
-                            .or_default() += 1;
-                    }
-                }
-                EventKind::SkillLoad if e.counts_as_load() => {
-                    f.load_grade_loads += 1;
-                    f.sessions_with_loads.insert(e.session_id.clone());
-                }
-                _ => {}
-            }
-        }
-        session_funnel(&mut f, events, idxs, &recs, &loads);
+        session_funnel(&mut f, events, idxs);
     }
     f
 }
 
 /// conversion / unnecessary-load / timeliness for one session's
 /// timestamp-ordered event indexes.
-fn session_funnel(
-    f: &mut Funnel,
-    events: &[&crate::events::SkillUsageEvent],
-    idxs: &[usize],
-    recs: &[usize],
-    loads: &[usize],
-) {
+fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], idxs: &[usize]) {
+    use crate::events::EventKind;
+    let recs: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&i| events[i].kind == EventKind::Recommendation)
+        .collect();
+    let loads: Vec<usize> = idxs
+        .iter()
+        .copied()
+        .filter(|&i| events[i].counts_as_load())
+        .collect();
     // Positions within the timestamp-sorted session order; the no-
     // timestamp fallback must compare order positions, not raw indices.
     let pos: std::collections::HashMap<usize, usize> =
@@ -1063,7 +1161,7 @@ fn session_funnel(
     // recommended names from emitted recommendations only — loads of
     // names we never surfaced count as unnecessary per the pilot def.
     let mut recommended_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for &ri in recs {
+    for &ri in &recs {
         let e = events[ri];
         if e.emitted == Some(true) {
             for r in &e.recommended {
@@ -1071,7 +1169,7 @@ fn session_funnel(
             }
         }
     }
-    for &li in loads {
+    for &li in &loads {
         let name = events[li].skill_name.as_deref().unwrap_or("");
         if !recommended_names.contains(name) {
             f.unnecessary_loads += 1;
@@ -1082,7 +1180,7 @@ fn session_funnel(
     // later load-grade load naming one of its recommendations; each load
     // converts at most one recommendation.
     let mut consumed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for &ri in recs {
+    for &ri in &recs {
         let rec = events[ri];
         if rec.emitted != Some(true) {
             continue;
@@ -1093,7 +1191,7 @@ fn session_funnel(
             continue;
         }
         let rec_ts = rfc3339_secs(&rec.timestamp);
-        for &li in loads {
+        for &li in &loads {
             if consumed.contains(&li) {
                 continue;
             }

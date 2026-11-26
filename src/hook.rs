@@ -167,14 +167,33 @@ impl HookEnv {
         if self.nostate || self.state_disabled {
             return Vec::new();
         }
-        std::fs::read_to_string(self.recommended_path())
-            .map(|s| {
-                s.lines()
-                    .filter(|l| !l.is_empty() && crate::parser::valid_skill_name(l))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+        // State lives under a shared TMPDIR: bound the read so a planted
+        // oversized file cannot OOM the hook, and refuse symlinks.
+        const MAX_STATE_BYTES: u64 = 64 * 1024;
+        let Ok(meta) = std::fs::symlink_metadata(self.recommended_path()) else {
+            return Vec::new();
+        };
+        if meta.file_type().is_symlink() || meta.len() > MAX_STATE_BYTES {
+            return Vec::new();
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        no_follow(&mut opts);
+        let Ok(f) = opts.open(self.recommended_path()) else {
+            return Vec::new();
+        };
+        let mut buf = String::new();
+        use std::io::Read;
+        if f.take(MAX_STATE_BYTES + 1)
+            .read_to_string(&mut buf)
+            .is_err()
+        {
+            return Vec::new();
+        }
+        buf.lines()
+            .filter(|l| !l.is_empty() && crate::parser::valid_skill_name(l))
+            .map(str::to_string)
+            .collect()
     }
 
     fn record_recommended(&self, names: &[String]) {

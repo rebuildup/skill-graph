@@ -42,7 +42,18 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         cases.push(case);
     }
 
+    // `skill_root` is repository-relative per evals/dataset/schema.md.
+    // Resolve it against the repo root (nearest ancestor of the dataset
+    // containing Cargo.toml), falling back to the dataset's parent —
+    // never silently against an arbitrary cwd.
+    let repo_root = dataset
+        .parent()
+        .and_then(|d| d.ancestors().find(|a| a.join("Cargo.toml").exists()))
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dataset.parent().unwrap_or(Path::new(".")).to_path_buf());
+
     let mut graphs: HashMap<PathBuf, crate::resolver::Graph> = HashMap::new();
+    let mut discovery_errors: Vec<String> = Vec::new();
     let mut results = Vec::new();
     let mut totals = json!({
         "cases": cases.len(),
@@ -58,21 +69,15 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     let started = Instant::now();
 
     for case in cases {
-        let cwd_root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&case.skill_root);
         let root = if case.skill_root.is_absolute() {
             case.skill_root.clone()
-        } else if cwd_root.exists() {
-            cwd_root
         } else {
-            dataset
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(case.skill_root)
+            repo_root.join(&case.skill_root)
         };
         if !graphs.contains_key(&root) {
-            graphs.insert(root.clone(), build(discover(std::slice::from_ref(&root))));
+            let discovery = discover(std::slice::from_ref(&root));
+            discovery_errors.extend(discovery.errors.iter().cloned());
+            graphs.insert(root.clone(), build(discovery));
         }
         let graph = graphs
             .get(&root)
@@ -145,5 +150,9 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     });
     totals["cases"] = json!(results.len());
 
-    Ok(json!({ "summary": totals, "cases": results }))
+    let mut out = json!({ "summary": totals, "cases": results });
+    if !discovery_errors.is_empty() {
+        out["discovery_errors"] = json!(discovery_errors);
+    }
+    Ok(out)
 }

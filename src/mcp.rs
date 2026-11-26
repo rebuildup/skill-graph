@@ -35,7 +35,13 @@ struct CacheEntry {
     graph: Arc<Graph>,
 }
 
-type GraphCache = Arc<std::sync::Mutex<Option<(String, Arc<CacheEntry>)>>>;
+/// Bounded LRU of memoized scans keyed by roots signature. Alternating
+/// between a few roots sets must not rescan on every call, but unbounded
+/// growth is not acceptable either — evict least-recently-used beyond
+/// MAX_CACHE_ENTRIES.
+const MAX_CACHE_ENTRIES: usize = 4;
+
+type GraphCache = Arc<std::sync::Mutex<Vec<(String, Arc<CacheEntry>)>>>;
 
 struct SkillGraphMcp {
     graph_cache: GraphCache,
@@ -44,7 +50,7 @@ struct SkillGraphMcp {
 impl SkillGraphMcp {
     fn new() -> Self {
         Self {
-            graph_cache: Arc::new(std::sync::Mutex::new(None)),
+            graph_cache: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -58,10 +64,11 @@ impl SkillGraphMcp {
         )
         .unwrap_or_default();
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((k, entry)) = guard.as_ref()
-            && *k == key
-        {
-            return entry.clone();
+        // Most-recently-used lives at the back.
+        if let Some(pos) = guard.iter().rposition(|(k, _)| *k == key) {
+            let (_, entry) = guard.remove(pos);
+            guard.push((key, entry.clone()));
+            return entry;
         }
         let discovery = Arc::new(discover(roots));
         // build() consumes the discovery; clone skills/errors (Skill is
@@ -71,7 +78,10 @@ impl SkillGraphMcp {
             errors: discovery.errors.clone(),
         }));
         let entry = Arc::new(CacheEntry { discovery, graph });
-        *guard = Some((key, entry.clone()));
+        guard.push((key, entry.clone()));
+        if guard.len() > MAX_CACHE_ENTRIES {
+            guard.remove(0);
+        }
         entry
     }
 }

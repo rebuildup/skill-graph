@@ -81,7 +81,7 @@ enum Command {
     /// emits Skill Usage Events, and prints additionalContext injection.
     /// Always exits 0 (fail-open).
     Hook {
-        /// claude-code | codex
+        /// claude-code | codex | opencode
         runtime: String,
         /// prompt | skill-load
         mode: String,
