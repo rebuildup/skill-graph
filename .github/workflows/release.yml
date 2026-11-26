@@ -40,10 +40,16 @@ jobs:
           bin="target/${{ matrix.target }}/release/skill-graph"
           strip "$bin" 2>/dev/null || true
           cp "$bin" "skill-graph-${{ matrix.target }}"
+          mkdir -p pkg
+          cp "$bin" pkg/skill-graph
+          tar -czf "skill-graph-${{ matrix.target }}.tar.gz" -C pkg skill-graph
+          rm -rf pkg
       - uses: actions/upload-artifact@v4
         with:
           name: skill-graph-${{ matrix.target }}
-          path: skill-graph-${{ matrix.target }}
+          path: |
+            skill-graph-${{ matrix.target }}
+            skill-graph-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
