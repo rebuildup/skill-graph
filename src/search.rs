@@ -19,7 +19,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         return Vec::new();
     }
 
-    let query_terms = terms(&query);
+    // Terms carry a provenance source: glossary expansions share the CJK
+    // substring they were derived from, so admission can tell independent
+    // evidence from one substring's bigram+gloss cluster (#78).
+    let query_tagged = terms_tagged(&query);
+    let query_terms: Vec<String> = query_tagged.iter().map(|(t, _)| t.clone()).collect();
+    let query_sources = term_sources(&query_tagged);
     let context_terms = terms(&context);
     let skill_names: Vec<String> = graph
         .skills
@@ -28,8 +33,24 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         .collect();
     // Match text for description-level evidence: the description plus any
     // declared `keywords` (e.g. translations or aliases). Keywords are
-    // opt-in frontmatter, so corpus df stays honest.
+    // opt-in frontmatter, so corpus df stays honest. CJK substrings are
+    // additionally expanded through the built-in glossary so Japanese
+    // descriptions remain reachable from English query terms (#78).
     let skill_descriptions: Vec<String> = graph
+        .skills
+        .iter()
+        .map(|skill| {
+            let mut text = skill.description.to_lowercase();
+            for keyword in &skill.keywords {
+                text.push(' ');
+                text.push_str(&keyword.to_lowercase());
+            }
+            expand_gloss(&text)
+        })
+        .collect();
+    // Unexpanded description text: context-level admission counts hits here
+    // only, so glossary expansion cannot inflate the weakest signal (#78).
+    let skill_descriptions_base: Vec<String> = graph
         .skills
         .iter()
         .map(|skill| {
@@ -40,6 +61,14 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             }
             text
         })
+        .collect();
+    // Body text gets the same glossary expansion so English query terms can
+    // reach Japanese-heavy skill bodies. Expansion is appended, never
+    // rewritten, so original text still matches verbatim.
+    let skill_bodies: Vec<String> = graph
+        .skills
+        .iter()
+        .map(|skill| expand_gloss(&skill.body_text.to_lowercase()))
         .collect();
     // Recommendation identity is the skill name: duplicate installs of the
     // same skill across roots collapse to one candidate. The representative is
@@ -106,14 +135,14 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let mut weak = field_score(
             &query,
             &query_terms,
-            &skill.body_text,
+            &skill_bodies[index],
             2.0,
             "body",
             &mut weak_reasons,
         ) + field_score(
             &context,
             &context_terms,
-            &skill.body_text,
+            &skill_bodies[index],
             1.0,
             "context+body",
             &mut weak_reasons,
@@ -163,7 +192,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             .collect::<Vec<_>>();
         let context_hits = context_terms
             .iter()
-            .filter(|term| description_lower.contains(term.as_str()))
+            .filter(|term| skill_descriptions_base[index].contains(term.as_str()))
             .map(|term| {
                 (
                     term.clone(),
@@ -196,7 +225,10 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
     for (index, info) in infos.iter().enumerate() {
-        if info.as_ref().is_some_and(directly_admitted) {
+        if info
+            .as_ref()
+            .is_some_and(|info| directly_admitted(info, &query_sources))
+        {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
@@ -217,7 +249,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 if graph.skills[target].parse_error.is_some() {
                     continue;
                 }
-                let is_seed = infos[target].as_ref().is_some_and(directly_admitted);
+                let is_seed = infos[target]
+                    .as_ref()
+                    .is_some_and(|info| directly_admitted(info, &query_sources));
                 let entry = admitted.entry(target).or_default();
                 entry.push(format!("required by {}", graph.skills[*seed].name));
                 if !is_seed && let Some(info) = infos[target].as_mut() {
@@ -282,7 +316,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     out
 }
 
-fn directly_admitted(info: &Evidence) -> bool {
+fn directly_admitted(info: &Evidence, query_sources: &HashMap<String, String>) -> bool {
     // The skill name is the skill's identity: two or more query terms inside
     // one name is specific regardless of corpus-wide document frequency.
     // A single name hit stays conservative (low df, meaningful length).
@@ -294,8 +328,23 @@ fn directly_admitted(info: &Evidence) -> bool {
     // description terms from admitting alone but lets e.g. "PR review" reach
     // `code-review` on real-size corpora.
     let name_plus_description = !info.name_hits.is_empty() && info.description_hits.len() >= 2;
-    let description_admitted =
-        info.description_hits.len() >= 2 && info.description_hits.iter().any(|(_, df)| *df == 1);
+    // Description-only admission (no name anchor) requires hits from at
+    // least two distinct query-term sources: a single CJK substring emits a
+    // bigram cluster plus glossary terms, and those must not count as
+    // independent evidence (#78).
+    let description_sources: HashSet<&str> = info
+        .description_hits
+        .iter()
+        .map(|(term, _)| {
+            query_sources
+                .get(term)
+                .map(String::as_str)
+                .unwrap_or(term.as_str())
+        })
+        .collect();
+    let description_admitted = info.description_hits.len() >= 2
+        && description_sources.len() >= 2
+        && info.description_hits.iter().any(|(_, df)| *df == 1);
     let context_admitted = info.context_hits.len() >= 2;
     multiple_name_hits
         || unique_name_hit
@@ -512,22 +561,51 @@ const STOPWORDS: &[&str] = &[
 ];
 
 fn terms(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    terms_tagged(text)
+        .into_iter()
+        .map(|(term, _)| term)
+        .collect()
+}
+
+// term -> provenance source. Glossary-derived terms share the CJK key they
+// came from; all other terms are their own source.
+fn term_sources(tagged: &[(String, String)]) -> HashMap<String, String> {
+    let mut sources = HashMap::new();
+    for (term, source) in tagged {
+        sources
+            .entry(term.clone())
+            .or_insert_with(|| source.clone());
+    }
+    sources
+}
+
+fn terms_tagged(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut ascii_run = String::new();
     let mut cjk_run = String::new();
     let mut flush = |ascii: &mut String, cjk: &mut String| {
         if ascii.chars().count() >= 2 {
             let lower = ascii.to_lowercase();
             if !STOPWORDS.contains(&lower.as_str()) {
-                out.push(lower);
+                out.push((lower.clone(), lower));
             }
         }
         ascii.clear();
         // CJK has no whitespace and no case: emit character bigrams so
-        // substring matching works against Japanese descriptions (#61).
+        // substring matching works against Japanese descriptions (#61),
+        // plus English glossary terms for known dev vocabulary so queries
+        // can reach English-only skill text (#78). Gloss terms carry their
+        // CJK key as provenance so one substring cannot self-admit.
         let chars: Vec<char> = cjk.chars().collect();
         for window in chars.windows(2) {
-            out.push(window.iter().collect());
+            let bigram: String = window.iter().collect();
+            out.push((bigram.clone(), bigram));
+        }
+        let run: String = chars.iter().collect();
+        for (gloss, key) in gloss_terms(&run) {
+            if !STOPWORDS.contains(&gloss.as_str()) {
+                out.push((gloss, key.to_string()));
+            }
         }
         cjk.clear();
     };
@@ -554,6 +632,17 @@ fn terms(text: &str) -> Vec<String> {
         }
         flush(&mut ascii_run, &mut cjk_run);
     }
+    // Common abbreviation expansion: "pull request" is routinely shortened
+    // to "PR"/"pr" in skill text, so emit the abbreviation as an extra term.
+    // Substring matching means "pr" is noisy, but it only adds evidence on
+    // queries that actually contain the phrase.
+    let lower = text.to_lowercase();
+    if lower.contains("pull request")
+        || lower.contains("pull-request")
+        || lower.contains("pull_request")
+    {
+        out.push(("pr".to_string(), "pull-request".to_string()));
+    }
     out
 }
 
@@ -564,9 +653,351 @@ fn is_cjk(c: char) -> bool {
     )
 }
 
+// Minimal Japanese↔English dev glossary for #78. This is deliberately
+// small and hand-maintained: it covers high-frequency katakana loanwords
+// and common kanji compounds in this domain, not general Japanese. Each
+// entry maps a CJK substring to English terms appended to match text
+// (both directions via the same table). All matching keys contribute.
+const GLOSS: &[(&str, &str)] = &[
+    ("リリースノート", "release notes changelog"),
+    ("プルリクエスト", "pull request pr"),
+    ("プルリク", "pull request pr"),
+    ("コードレビュー", "code review"),
+    ("コミットメッセージ", "commit message"),
+    ("ベストプラクティス", "best practice"),
+    ("テクニカルデット", "tech debt technical debt"),
+    ("オブザーバビリティ", "observability"),
+    ("オーケストレーション", "orchestration"),
+    ("スケーラビリティ", "scalability"),
+    ("パフォーマンス", "performance"),
+    ("デッドロック", "deadlock"),
+    ("フォールバック", "fallback"),
+    ("ポストモーテム", "postmortem"),
+    ("バックアップ", "backup"),
+    ("リファクタリング", "refactoring refactor"),
+    ("リファクタ", "refactor refactoring"),
+    ("マイグレーション", "migration"),
+    ("インターフェース", "interface"),
+    ("コンポーネント", "component"),
+    ("フレームワーク", "framework"),
+    ("アーキテクチャ", "architecture"),
+    ("データベース", "database db"),
+    ("ドキュメンテーション", "documentation"),
+    ("ドキュメント", "documentation docs"),
+    ("ライブラリ", "library"),
+    ("サンドボックス", "sandbox"),
+    ("チェックアウト", "checkout"),
+    ("ロールバック", "rollback"),
+    ("リバート", "revert"),
+    ("バージョン", "version"),
+    ("不具合", "bug defect"),
+    ("脆弱性", "vulnerability"),
+    ("インシデント", "incident"),
+    ("障害", "incident outage failure"),
+    ("セキュリティ", "security"),
+    ("環境変数", "env environment variable"),
+    ("依存関係", "dependencies dependency"),
+    ("リリース候補", "release candidate rc"),
+    ("タイムアウト", "timeout"),
+    ("レビュー", "review"),
+    ("テスト", "test testing"),
+    ("デバッグ", "debug"),
+    ("デプロイ", "deploy deployment"),
+    ("ビルド", "build"),
+    ("コミット", "commit"),
+    ("プッシュ", "push"),
+    ("マージ", "merge"),
+    ("ブランチ", "branch"),
+    ("フェッチ", "fetch"),
+    ("リベース", "rebase"),
+    ("ワークツリー", "worktree"),
+    ("バグ", "bug"),
+    ("暗号化", "encryption encrypt"),
+    ("認証", "auth authentication"),
+    ("認可", "authorization"),
+    ("権限", "permission"),
+    ("ユーザー", "user"),
+    ("アカウント", "account"),
+    ("セッション", "session"),
+    ("パスワード", "password"),
+    ("設定", "config configuration settings"),
+    ("構成", "config configuration"),
+    ("変数", "variable"),
+    ("関数", "function"),
+    ("メソッド", "method"),
+    ("クラス", "class"),
+    ("コマンド", "command"),
+    ("スクリプト", "script"),
+    ("ツール", "tool"),
+    ("ユーティリティ", "utility"),
+    ("サービス", "service"),
+    ("システム", "system"),
+    ("プラットフォーム", "platform"),
+    ("環境", "environment"),
+    ("サーバー", "server"),
+    ("クライアント", "client"),
+    ("ネットワーク", "network"),
+    ("データ", "data"),
+    ("ファイル", "file"),
+    ("ディレクトリ", "directory"),
+    ("パス", "path"),
+    ("キャッシュ", "cache"),
+    ("キュー", "queue"),
+    ("ジョブ", "job"),
+    ("タスク", "task"),
+    ("ワーカー", "worker"),
+    ("プロセス", "process"),
+    ("スレッド", "thread"),
+    ("非同期", "async asynchronous"),
+    ("並列", "parallel"),
+    ("同期", "sync synchronous"),
+    ("リトライ", "retry"),
+    ("依存", "dependency"),
+    ("仕様", "spec specification"),
+    ("要件", "requirement"),
+    ("機能", "feature"),
+    ("品質", "quality"),
+    ("設計", "design"),
+    ("実装", "implementation"),
+    ("検証", "verification validate"),
+    ("確認", "check verify"),
+    ("評価", "evaluation"),
+    ("分析", "analysis analyze"),
+    ("調査", "investigation research"),
+    ("診断", "diagnosis diagnose"),
+    ("命名", "naming name"),
+    ("リネーム", "rename"),
+    ("作成", "create"),
+    ("編集", "edit"),
+    ("更新", "update"),
+    ("削除", "delete remove"),
+    ("追加", "add"),
+    ("移動", "move"),
+    ("変換", "convert transform"),
+    ("生成", "generate"),
+    ("読み込み", "read load"),
+    ("書き込み", "write"),
+    ("書い", "write writing"),
+    ("書く", "write writing"),
+    ("表示", "display show"),
+    ("検索", "search"),
+    ("クエリ", "query"),
+    ("結果", "result"),
+    ("成功", "success"),
+    ("失敗", "failure fail"),
+    ("完了", "complete done"),
+    ("開始", "start launch"),
+    ("停止", "stop"),
+    ("再起動", "restart"),
+    ("インストール", "install"),
+    ("セットアップ", "setup"),
+    ("アンインストール", "uninstall"),
+    ("初期化", "init initialize"),
+    ("プロジェクト", "project"),
+    ("リポジトリ", "repository repo"),
+    ("コード", "code"),
+    ("コメント", "comment"),
+    ("ガイド", "guide"),
+    ("チュートリアル", "tutorial"),
+    ("ハンドブック", "handbook"),
+    ("ポリシー", "policy"),
+    ("ルール", "rule"),
+    ("規約", "convention standards"),
+    ("標準", "standard"),
+    ("原則", "principle"),
+    ("パターン", "pattern"),
+    ("構造", "structure"),
+    ("責務", "responsibility"),
+    ("階層", "hierarchy"),
+    ("境界", "boundary"),
+    ("抽象", "abstract abstraction"),
+    ("詳細", "detail"),
+    ("概要", "overview"),
+    ("日本語", "japanese"),
+    ("自然", "natural"),
+    ("英語", "english"),
+    ("翻訳", "translation translate"),
+    ("文章", "prose writing"),
+    ("文書", "document"),
+    ("文体", "style writing"),
+    ("表現", "expression wording"),
+    ("推敲", "polish revise"),
+    ("校正", "proofread"),
+    ("監査", "audit"),
+    ("審査", "review audit"),
+    ("承認", "approval approve"),
+    ("提案", "proposal suggest"),
+    ("改善", "improvement improve"),
+    ("最適化", "optimization optimize"),
+    ("効率", "efficiency"),
+    ("コスト", "cost"),
+    ("リソース", "resource"),
+    ("容量", "capacity"),
+    ("制限", "limit"),
+    ("閾値", "threshold"),
+    ("条件", "condition"),
+    ("制約", "constraint"),
+    ("不変条件", "invariant"),
+    ("契約", "contract"),
+    ("互換性", "compatibility"),
+    ("移行", "migration migrate"),
+    ("廃止", "deprecate"),
+    ("非推奨", "deprecated"),
+    ("安定", "stable"),
+    ("実験", "experiment"),
+    ("ベータ", "beta"),
+    ("本番", "production"),
+    ("開発", "development dev"),
+    ("運用", "operations"),
+    ("保守", "maintenance"),
+    ("監視", "monitoring monitor"),
+    ("通知", "notification"),
+    ("警告", "warning"),
+    ("アラート", "alert"),
+    ("メトリクス", "metrics"),
+    ("ダッシュボード", "dashboard"),
+    ("レポート", "report"),
+    ("履歴", "history"),
+    ("記録", "record log"),
+    ("観測", "observation observe"),
+    ("計測", "measurement"),
+    ("ベンチマーク", "benchmark"),
+    ("性能", "performance"),
+    ("速度", "speed performance"),
+    ("メモリ", "memory"),
+    ("ストレージ", "storage"),
+    ("ディスク", "disk"),
+    ("帯域", "bandwidth"),
+    ("遅延", "latency delay"),
+    ("スループット", "throughput"),
+    ("負荷", "load"),
+    ("可用性", "availability"),
+    ("信頼性", "reliability"),
+    ("耐障害性", "fault tolerance"),
+    ("冗長", "redundancy"),
+    ("クラスタ", "cluster"),
+    ("分散", "distributed distribution"),
+    ("スケール", "scale"),
+    ("インフラ", "infrastructure infra"),
+    ("コンテナ", "container"),
+    ("仮想", "virtual"),
+    ("マシン", "machine"),
+    ("デバイス", "device"),
+    ("端末", "device terminal"),
+    ("競合", "conflict race"),
+    ("ロック", "lock"),
+    ("排他", "exclusive mutex"),
+    ("共有", "shared"),
+    ("プライベート", "private"),
+    ("公開", "public"),
+    ("内部", "internal"),
+    ("外部", "external"),
+    ("秘密", "secret"),
+    ("機密", "confidential sensitive"),
+    ("漏洩", "leak breach"),
+    ("侵害", "breach compromise"),
+    ("脅威", "threat"),
+    ("攻撃", "attack"),
+    ("防御", "defense"),
+    ("マルウェア", "malware"),
+    ("ウイルス", "virus"),
+    ("フィッシング", "phishing"),
+    ("暗号", "crypto cryptography"),
+    ("ハッシュ", "hash"),
+    ("署名", "signature sign"),
+    ("証明書", "certificate cert"),
+    ("鍵", "key"),
+    ("復号", "decryption decrypt"),
+    ("復旧", "recovery recover"),
+    ("原因", "cause root cause"),
+    ("根本原因", "root cause"),
+    ("再現", "reproduce reproduction"),
+    ("修正", "fix"),
+    ("パッチ", "patch"),
+    ("ホットフィックス", "hotfix"),
+    ("回帰", "regression"),
+    ("デグレ", "regression degrade"),
+    ("互換", "compatible compatibility"),
+    ("後方互換", "backward compatibility"),
+    ("リリース", "release"),
+    ("ノート", "note"),
+    ("変更", "change"),
+    ("差分", "diff"),
+    ("コンフリクト", "conflict"),
+    ("プル", "pull"),
+    ("クローン", "clone"),
+    ("サブモジュール", "submodule"),
+    ("ステージング", "staging"),
+    ("インデックス", "index"),
+    ("メイン", "main"),
+    ("マスター", "master main"),
+    ("デフォルト", "default"),
+    ("ベース", "base"),
+    ("ターゲット", "target"),
+    ("ソース", "source"),
+    ("オリジン", "origin upstream"),
+    ("アップストリーム", "upstream"),
+    ("フォーク", "fork"),
+    ("解決", "resolve"),
+    ("クローズ", "close closed"),
+    ("リオープン", "reopen"),
+    ("ラベル", "label"),
+    ("マイルストーン", "milestone"),
+    ("アサイン", "assign"),
+    ("担当", "assignee owner"),
+    ("レビュアー", "reviewer"),
+    ("差し戻し", "request changes"),
+    ("マージ可能", "mergeable"),
+    ("自動マージ", "auto merge"),
+    ("スカッシュ", "squash"),
+    ("チェリーピック", "cherry-pick"),
+    ("リセット", "reset"),
+    ("ツリー", "tree"),
+    ("オブジェクト", "object"),
+    ("ブロブ", "blob"),
+    ("ダイジェスト", "digest"),
+    ("整合性", "integrity"),
+    ("チェックサム", "checksum"),
+    ("トークン", "token"),
+    ("ログ", "log logging"),
+];
+
+// Returns (English term, CJK key) pairs for every glossary key present in
+// `text`, deduplicated by term. Used in both directions: query terms emit
+// these into the term list (key becomes the provenance source), and skill
+// match text gets the terms appended.
+fn gloss_terms(text: &str) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (key, gloss) in GLOSS {
+        if gloss.is_empty() || !text.contains(key) {
+            continue;
+        }
+        for term in gloss.split_whitespace() {
+            if seen.insert(term.to_string()) {
+                out.push((term.to_string(), key.to_string()));
+            }
+        }
+    }
+    out
+}
+
+// Appends English glossary expansions for every CJK substring in `text`.
+// Original text is preserved verbatim; expansions are appended so CJK
+// descriptions remain reachable from English query terms and vice versa.
+fn expand_gloss(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 128);
+    out.push_str(text);
+    for (term, _) in gloss_terms(text) {
+        out.push(' ');
+        out.push_str(&term);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::terms;
+    use super::{expand_gloss, term_sources, terms, terms_tagged};
 
     #[test]
     fn cjk_query_produces_bigrams() {
@@ -574,5 +1005,44 @@ mod tests {
         eprintln!("terms={t:?}");
         assert!(t.iter().any(|x| x == "不具"), "{t:?}");
         assert!(t.iter().any(|x| x == "報告"), "{t:?}");
+    }
+
+    #[test]
+    fn cjk_query_emits_glossary_terms() {
+        let t = terms("PRをレビューして");
+        assert!(t.iter().any(|x| x == "review"), "{t:?}");
+        let t = terms("新しい関数の命名を考えて");
+        assert!(t.iter().any(|x| x == "naming"), "{t:?}");
+        assert!(t.iter().any(|x| x == "function"), "{t:?}");
+    }
+
+    #[test]
+    fn gloss_terms_carry_cjk_key_as_source() {
+        let tagged = terms_tagged("文章を自然にしたい");
+        let sources = term_sources(&tagged);
+        // "prose"/"writing" come from the 文章 key; the bigram 文章 is its
+        // own source but shares the same string, so all three collapse to
+        // one provenance group for admission purposes.
+        assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
+        assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
+        assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
+    }
+
+    #[test]
+    fn expand_gloss_appends_without_rewriting() {
+        let out = expand_gloss("命名と設計を扱う");
+        assert!(out.starts_with("命名と設計を扱う"));
+        assert!(out.contains("naming"));
+        assert!(out.contains("design"));
+        // ASCII-only text is unchanged.
+        assert_eq!(expand_gloss("code review"), "code review");
+    }
+
+    #[test]
+    fn pull_request_phrase_emits_pr() {
+        let t = terms("review this pull request");
+        assert!(t.iter().any(|x| x == "pr"), "{t:?}");
+        let t = terms("review the changes");
+        assert!(!t.iter().any(|x| x == "pr"), "{t:?}");
     }
 }

@@ -1,0 +1,85 @@
+name: Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build release assets for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package binary
+        run: |
+          bin="target/${{ matrix.target }}/release/skill-graph"
+          strip "$bin" 2>/dev/null || true
+          cp "$bin" "skill-graph-${{ matrix.target }}"
+          mkdir -p pkg
+          cp "$bin" pkg/skill-graph
+          tar -czf "skill-graph-${{ matrix.target }}.tar.gz" -C pkg skill-graph
+          rm -rf pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skill-graph-${{ matrix.target }}
+          path: |
+            skill-graph-${{ matrix.target }}
+            skill-graph-${{ matrix.target }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Package adapters bundle
+        run: |
+          mkdir -p bundle dist
+          cp -r adapters contracts plugins bundle/
+          tar -czf dist/skill-graph-adapters.tar.gz -C bundle .
+          rm -rf bundle
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum skill-graph-* > ../sha256sums.txt
+          cat ../sha256sums.txt
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          notes="docs/release/${tag}.md"
+          [ -f "$notes" ] || notes=""
+          gh release create "$tag" dist/* sha256sums.txt \
+            --title "skill-graph $tag" \
+            ${notes:+--notes-file "$notes"} --verify-tag
