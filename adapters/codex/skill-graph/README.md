@@ -42,15 +42,21 @@ Verified against the Codex hooks documentation (2026-11):
    that launches Codex).
 4. Restart Codex. Non-managed hooks require review: open `/hooks` in the TUI
    and trust the new hook definitions (they are recorded against their hash;
-   edits require re-trust).
+   edits require re-trust). This `/hooks` trust step is the **normal install
+   path** — it is a one-time, per-definition approval recorded by Codex.
+   Bypassing or auto-approving hook trust (e.g. config flags that skip
+   review) is for experiments only and must not be part of the documented
+   install flow.
 
 ## Verified live (codex-cli 0.171.0, ChatGPT auth)
 
 - `UserPromptSubmit` fires; `additionalContext` confirmed in rollout JSONL.
 - Multi-turn via `exec resume` works; ~33ms/hook.
-- `PostToolUse`/`Skill` does NOT fire: Codex has no Skill tool — skills are
-  read via ordinary file/Bash calls. Dependency injection on skill load is
-  unavailable in Codex (see docs/evidence/2026-11-25-v020-codex-live-verification.md).
+- `PostToolUse` fires with matcher `Bash` (Codex has no Skill tool — skills
+  are read via ordinary file/Bash calls). The hook script classifies the
+  command via `skill-graph detect` and emits `skill_load` Skill Usage
+  Events; dependency injection on skill load now works through the same
+  path (see docs/evidence/2026-11-26-w02-skill-usage-events.md).
 - Codex's own skill discovery (`~/.agents/skills`, `.agents/skills`,
   `~/.codex/skills` legacy) overlaps with the hook's default roots; duplicates
   are handled by the engine's name-grouping contract.

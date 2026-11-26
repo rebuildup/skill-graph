@@ -38,6 +38,8 @@ adapters/install.sh claude-code --user      # ~/.claude/settings.json
 adapters/install.sh claude-code --project   # ./.claude/settings.json
 adapters/install.sh codex --user            # ~/.codex/hooks.json
 adapters/install.sh codex --project         # ./.codex/hooks.json
+adapters/install.sh opencode --user         # $XDG_CONFIG_HOME/opencode/opencode.json
+adapters/install.sh opencode --project      # ./opencode.json
 adapters/install.sh <runtime> <scope> --dry-run
 adapters/install.sh <runtime> <scope> --uninstall
 ```
@@ -46,9 +48,17 @@ adapters/install.sh <runtime> <scope> --uninstall
   install is idempotent (entries referencing the adapter are replaced, not
   duplicated).
 - Uninstall removes only entries whose command references the adapter script
-  and prunes emptied groups; unrelated config is untouched.
-- OpenCode has no shell-hook config; install its plugin via `opencode.json`
-  (see `opencode/skill-graph/README.md`).
+  (or, for OpenCode, the plugin specifier) and prunes emptied groups; a config
+  reduced to `{}` is deleted so the pre-install state is fully restored.
+- OpenCode's extension point is a TS plugin, not shell hooks: `install.sh
+  opencode` merges a `file://<abs path>/adapters/opencode/skill-graph`
+  specifier into `opencode.json`'s `plugins` array.
+- Codex requires the new hooks to be trusted once via `/hooks` in the Codex
+  TUI before they run; this is the normal install path. Bypassing trust is
+  for experiments only.
+- `test-install-roundtrip.sh` verifies install → reinstall → uninstall
+  restores seeded config for every runtime/scope (see
+  `docs/evidence/2026-11-26-w04-install-roundtrip.md`).
 
 ## Distribution layout
 

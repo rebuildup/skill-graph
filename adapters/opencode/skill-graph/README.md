@@ -31,13 +31,21 @@ emitted as a `skill_load` Skill Usage Event to the shared JSONL log.
 - Dedup is in-memory per plugin instance (one emission per session+prompt).
   Fail-open: any CLI error yields no injection.
 
-## Install (planned)
+## Install
+
+`adapters/install.sh opencode` merges the plugin specifier into
+`opencode.json` (global: `$XDG_CONFIG_HOME/opencode/opencode.json`, or
+project: `./opencode.json`) using absolute paths; `--uninstall` removes
+exactly that entry and preserves other plugins/keys. Requires `jq` and a
+`skill-graph` binary (`SKILL_GRAPH_BIN` or `SKILL_GRAPH_HOME`/`PATH`).
+
+Manual equivalent:
 
 1. `cargo build --release` for the `skill-graph` binary.
 2. Set `SKILL_GRAPH_BIN` to its absolute path and optionally
    `SKILL_GRAPH_ROOTS` (colon-separated) in the environment that launches
    OpenCode.
-3. Add the plugin to `opencode.json`:
+3. Add to `opencode.json`:
    `"plugins": ["file:///absolute/path/to/adapters/opencode/skill-graph"]`
    (exact specifier format pending live verification).
 
