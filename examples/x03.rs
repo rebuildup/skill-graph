@@ -1,8 +1,8 @@
-use crate::discovery::discover;
-use crate::resolver::{Graph, build};
-use crate::search::recommend;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use skill_graph::discovery::discover;
+use skill_graph::resolver::{Graph, build};
+use skill_graph::search::recommend;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -227,5 +227,22 @@ fn case_root(dataset: &Path, case: &Case) -> PathBuf {
             .parent()
             .unwrap_or(Path::new("."))
             .join(&case.skill_root)
+    }
+}
+
+fn main() {
+    let dataset = std::env::args()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("evals/dataset/cases.jsonl"));
+    match run(&dataset) {
+        Ok(value) => println!(
+            "{}",
+            serde_json::to_string_pretty(&value).expect("serialize x03 report")
+        ),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
     }
 }
