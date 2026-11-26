@@ -129,6 +129,25 @@ fn resolve_result_contract_covers_name_path_unresolved_and_ambiguity() {
     assert_eq!(ambiguous["skills"].as_array().unwrap().len(), 2);
 }
 
+#[test]
+fn resolve_by_unnormalized_absolute_path_matches() {
+    let graph = build(discover(&[fixture_root()]));
+    let skill_path = graph.skills[0].path.clone();
+    // Detour through `<dir>/../<dir>` which normalizes back to the same
+    // file; by_path lookup must still hit.
+    let dir = skill_path.parent().unwrap();
+    let detoured = dir
+        .parent()
+        .unwrap()
+        .join(dir.file_name().unwrap())
+        .join("..")
+        .join(dir.file_name().unwrap())
+        .join(skill_path.file_name().unwrap());
+    let result = serde_json::to_value(resolve_target(&graph, detoured.to_str().unwrap())).unwrap();
+    assert_eq!(result["kind"], "path", "{result}");
+    assert_eq!(result["skill"]["name"], graph.skills[0].name);
+}
+
 // --- JSON Schema validation against contracts/v1/*.schema.json ---
 // The skill-* schemas reference skill-summary.schema.json by relative
 // $ref; the registry resolves it to the published $id base.
