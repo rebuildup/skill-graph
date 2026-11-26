@@ -45,12 +45,15 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     // `skill_root` is repository-relative per evals/dataset/schema.md.
     // Resolve it against the repo root (nearest ancestor of the dataset
     // containing Cargo.toml), falling back to the dataset's parent —
-    // never silently against an arbitrary cwd.
-    let repo_root = dataset
+    // never silently against an arbitrary cwd. Absolutize first: a
+    // relative dataset path would otherwise stop the ancestor walk at
+    // the dataset directory itself.
+    let dataset_abs = std::path::absolute(dataset).unwrap_or_else(|_| dataset.to_path_buf());
+    let repo_root = dataset_abs
         .parent()
         .and_then(|d| d.ancestors().find(|a| a.join("Cargo.toml").exists()))
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| dataset.parent().unwrap_or(Path::new(".")).to_path_buf());
+        .unwrap_or_else(|| dataset_abs.parent().unwrap_or(Path::new(".")).to_path_buf());
 
     let mut graphs: HashMap<PathBuf, crate::resolver::Graph> = HashMap::new();
     let mut discovery_errors: Vec<String> = Vec::new();

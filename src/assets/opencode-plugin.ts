@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from "node:fs"
+import { appendFileSync, closeSync, constants, fchmodSync, fstatSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
@@ -82,6 +82,12 @@ function emit(event: Record<string, unknown>) {
       0o600,
     )
     try {
+      // A pre-existing log owned by another user (planted 0666 file in a
+      // shared TMPDIR) must not receive our events: the open succeeds and
+      // fchmod would fail, but the append would still land in a file we
+      // do not own. Skip the write unless the file is ours.
+      const st = fstatSync(fd)
+      if (typeof process.getuid === "function" && st.uid !== process.getuid()) return
       // mode only applies at creation; tighten pre-existing logs too.
       // Isolated: on filesystems where fchmod fails post-open, the event
       // write must still succeed (0600 was already applied at O_CREAT).

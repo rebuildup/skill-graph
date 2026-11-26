@@ -116,7 +116,7 @@ fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut out = Vec::new();
     let mut errors = Vec::new();
     let mut visited_dirs = std::collections::HashSet::new();
-    let mut seen_files = std::collections::HashSet::new();
+    let mut seen_files: std::collections::HashSet<ObsKey> = std::collections::HashSet::new();
     collect_observables_inner(
         path,
         &mut out,
@@ -133,7 +133,7 @@ fn collect_observables_inner(
     out: &mut Vec<PathBuf>,
     errors: &mut Vec<String>,
     visited_dirs: &mut std::collections::HashSet<PathBuf>,
-    seen_files: &mut std::collections::HashSet<PathBuf>,
+    seen_files: &mut std::collections::HashSet<ObsKey>,
 ) {
     if path.is_file() {
         if matches!(
@@ -196,13 +196,34 @@ fn collect_observables_inner(
     }
 }
 
+/// File identity for observable dedup. On Unix, (dev, ino) unifies
+/// hardlinks and symlink targets that canonicalize to different paths;
+/// elsewhere (or when metadata fails) the canonical path is the key.
+#[derive(Hash, PartialEq, Eq)]
+enum ObsKey {
+    File(u64, u64),
+    Path(PathBuf),
+}
+
+fn observable_key(path: &Path) -> ObsKey {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // metadata() follows symlinks, so a symlinked .jsonl dedups
+        // against its target just like canonicalize did.
+        if let Ok(m) = fs::metadata(path) {
+            return ObsKey::File(m.dev(), m.ino());
+        }
+    }
+    ObsKey::Path(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
+}
+
 fn push_observable(
     path: &Path,
     out: &mut Vec<PathBuf>,
-    seen: &mut std::collections::HashSet<PathBuf>,
+    seen: &mut std::collections::HashSet<ObsKey>,
 ) {
-    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if seen.insert(canonical) {
+    if seen.insert(observable_key(path)) {
         out.push(path.to_path_buf());
     }
 }
@@ -1017,6 +1038,21 @@ pub fn summary(obs: &Observation) -> Value {
     out["events"] = json!(obs.events.len());
     out["files_scanned"] = json!(obs.files_scanned);
     out["lines_skipped"] = json!(obs.lines_skipped);
+    // Collection errors (unreadable dirs/files, oversized inputs) mean the
+    // aggregates above are partial — surface them like by_session does.
+    const MAX_SUMMARY_ERRORS: usize = 100;
+    out["collection_errors"] = json!(obs.errors.len());
+    if !obs.errors.is_empty() {
+        out["errors"] = json!(
+            obs.errors
+                .iter()
+                .take(MAX_SUMMARY_ERRORS)
+                .collect::<Vec<_>>()
+        );
+        if obs.errors.len() > MAX_SUMMARY_ERRORS {
+            out["errors_omitted"] = json!(obs.errors.len() - MAX_SUMMARY_ERRORS);
+        }
+    }
     out
 }
 
