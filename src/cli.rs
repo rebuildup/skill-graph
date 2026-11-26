@@ -276,11 +276,30 @@ pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveRe
             skills: indexes.iter().map(|i| graph.skills[*i].summary()).collect(),
         };
     }
-    let path = crate::resolver::normalize_path(&std::path::PathBuf::from(target));
-    if let Some(index) = graph.by_path.get(&path) {
-        return ResolveResult::Path {
-            skill: graph.skills[*index].summary(),
-        };
+    // by_path keys are absolute (discovery canonicalizes roots); a
+    // relative or non-normalized target must be absolutized first or it
+    // can never match.
+    let raw = std::path::PathBuf::from(target);
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&raw))
+            .unwrap_or(raw)
+    };
+    let mut candidates = vec![crate::resolver::normalize_path(&abs)];
+    if let Ok(canon) = std::fs::canonicalize(&abs) {
+        let p = crate::resolver::normalize_path(&canon);
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+    for path in candidates {
+        if let Some(index) = graph.by_path.get(&path) {
+            return ResolveResult::Path {
+                skill: graph.skills[*index].summary(),
+            };
+        }
     }
     ResolveResult::Unresolved {
         target: target.to_string(),

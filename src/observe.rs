@@ -665,7 +665,12 @@ fn observe_db(
         })
         .map_err(|e| format!("query: {e}"))?;
     for row in rows {
-        let (session_id, kind, data, created_ms) = row.map_err(|e| format!("row: {e}"))?;
+        // A single malformed row (NULL column, type drift) must not abort
+        // the whole database scan.
+        let Ok((session_id, kind, data, created_ms)) = row else {
+            obs.lines_skipped += 1;
+            continue;
+        };
         sessions.insert(session_id.clone());
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             obs.lines_skipped += 1;
