@@ -1115,16 +1115,50 @@ pub fn summary(obs: &Observation) -> Value {
 }
 
 /// RFC 3339 (`YYYY-MM-DDTHH:MM:SS[.fff]Z` or `±hh:mm`) → epoch seconds.
-/// None for unparseable input; callers treat that as "unknown time".
+/// Strict calendar validation: real month lengths with leap-year-aware
+/// February, hour 0–23, minute 0–59, second 0–60 (leap second), and a
+/// bounded `±hh:mm` offset. None for unparseable or out-of-range input;
+/// callers treat that as "unknown time" so an invalid timestamp can never
+/// distort `timeliness_ms` (ordering/conversion fall back to input order,
+/// timeliness deltas require both endpoints).
 fn rfc3339_secs(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 20 {
         return None;
     }
-    let num = |i: usize, n: usize| -> Option<i64> { s.get(i..i + n)?.parse().ok() };
+    // Fixed-width digit fields only — a sign or other non-digit in a
+    // numeric position is not RFC 3339.
+    let num = |i: usize, n: usize| -> Option<i64> {
+        let field = s.get(i..i + n)?;
+        if !field.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        field.parse().ok()
+    };
+    if b.get(4) != Some(&b'-')
+        || b.get(7) != Some(&b'-')
+        || b.get(10) != Some(&b'T')
+        || b.get(13) != Some(&b':')
+        || b.get(16) != Some(&b':')
+    {
+        return None;
+    }
     let (y, mo, d) = (num(0, 4)?, num(5, 2)?, num(8, 2)?);
     let (h, mi, sec) = (num(11, 2)?, num(14, 2)?, num(17, 2)?);
-    if b.get(10) != Some(&b'T') || !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    // Month length with the Gregorian leap-year rule (divisible by 4,
+    // except centuries unless divisible by 400).
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let dim = match mo {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=dim).contains(&d) {
         return None;
     }
     // days-from-civil (Howard Hinnant)
@@ -1139,19 +1173,27 @@ fn rfc3339_secs(s: &str) -> Option<i64> {
     let mut i = 19;
     if b.get(i) == Some(&b'.') {
         i += 1;
+        // RFC 3339 requires at least one digit after the decimal point.
+        if !b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            return None;
+        }
         while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
             i += 1;
         }
     }
     match b.get(i) {
-        Some(b'Z') | None => Some(secs),
+        // 'Z' or absent offset must terminate the timestamp.
+        Some(b'Z') if i + 1 == b.len() => Some(secs),
+        None => Some(secs),
         Some(sign @ (b'+' | b'-')) => {
-            let off_h = num(i + 1, 2)?;
-            let off_m = if b.get(i + 3) == Some(&b':') {
-                num(i + 4, 2)?
+            let (off_h, off_m, end) = if b.get(i + 3) == Some(&b':') {
+                (num(i + 1, 2)?, num(i + 4, 2)?, i + 6)
             } else {
-                num(i + 3, 2)?
+                (num(i + 1, 2)?, num(i + 3, 2)?, i + 5)
             };
+            if end != b.len() || off_h > 23 || off_m > 59 {
+                return None;
+            }
             let off = off_h * 3600 + off_m * 60;
             Some(secs + if *sign == b'+' { -off } else { off })
         }
