@@ -9,29 +9,49 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 
 ## Install
 
-### Prebuilt binary（推奨）
-
-[GitHub Releases](https://github.com/rebuildup/skill-graph/releases) から
-OS/arch に対応するバイナリを取得し、checksum を検証する:
+### Installer script（推奨）
 
 ```bash
-# Linux x86_64 の例
-curl -fLO https://github.com/rebuildup/skill-graph/releases/latest/download/skill-graph-x86_64-unknown-linux-gnu
-curl -fLO https://github.com/rebuildup/skill-graph/releases/latest/download/sha256sums.txt
-sha256sum -c sha256sums.txt --ignore-missing
-install -m 755 skill-graph-x86_64-unknown-linux-gnu ~/.local/bin/skill-graph
+curl -fsSL https://github.com/rebuildup/skill-graph/releases/latest/download/install.sh | bash
 ```
+
+または release の `install.sh` を直接実行。OS/arch を自動検出し、
+`sha256sums.txt` を検証したうえで以下を行う:
+
+- `~/.local/share/skill-graph/<version>/` に binary + adapter bundle を展開
+- `current` symlink で version 非依存の参照パスを維持（更新・Codex trust
+  の hash-pin をまたいで有効）
+- `~/.local/bin/skill-graph` シンボリックリンクを作成（PATH/shell rc は
+  変更しない。`--bin-dir` / `SKILL_GRAPH_NO_BIN=1` で調整可）
+- `--runtime claude-code|codex|opencode` で adapter を opt-in 有効化
+
+```bash
+./install.sh --runtime claude-code --runtime codex --runtime opencode
+./install.sh --version 0.3.0      # バージョン固定
+./install.sh --uninstall [--purge]  # adapter 復元 + bin リンク除去
+```
+
+前提: `curl`、`tar`、`jq`（adapter install 時）。Windows は WSL2 経由。
+
+### Manual
+
+[GitHub Releases](https://github.com/rebuildup/skill-graph/releases) から
+OS/arch に対応する `skill-graph-<target>.tar.gz` と
+`skill-graph-adapters.tar.gz`、`sha256sums.txt` を取得し checksum を
+検証する。展開先は versioned ディレクトリ + `current` symlink を推奨
+（Codex の `/hooks` trust がコマンド文字列の hash-pin のため、参照パスを
+version 非依存に保つと更新をまたいで trust が維持される）。
 
 | Asset | Target |
 |---|---|
-| `skill-graph-x86_64-unknown-linux-gnu` | Linux x86_64 (glibc), WSL2 含む |
-| `skill-graph-aarch64-unknown-linux-gnu` | Linux ARM64 (glibc) |
-| `skill-graph-aarch64-apple-darwin` | macOS Apple Silicon |
-| `skill-graph-x86_64-apple-darwin` | macOS Intel |
+| `skill-graph-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc), WSL2 含む |
+| `skill-graph-aarch64-unknown-linux-gnu.tar.gz` | Linux ARM64 (glibc) |
+| `skill-graph-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+| `skill-graph-x86_64-apple-darwin.tar.gz` | macOS Intel |
 
-`skill-graph-adapters.tar.gz` に adapter・`install.sh`・`contracts/`・
-`plugins/` が同梱される。PATH 登録は不要 — `install.sh` は絶対パスで
-配線する（`SKILL_GRAPH_BIN` にバイナリのパスを指定）。
+`skill-graph-adapters.tar.gz` に `adapters/`・`contracts/`・`plugins/`
+が同梱される。PATH 登録は不要 — `install.sh` は絶対パスで配線する
+（`SKILL_GRAPH_BIN` にバイナリのパスを指定）。
 
 ### Source
 
