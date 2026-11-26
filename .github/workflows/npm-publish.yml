@@ -119,7 +119,7 @@ jobs:
               echo "$name@$ver already published, skipping"
               continue
             fi
-            npm publish "$pkg" --access public --provenance
+            npm publish "./$pkg" --access public --provenance
           done <<< "$TARGETS"
       - name: Publish metapackage
         env:
@@ -131,4 +131,4 @@ jobs:
             echo "@rebuildup/skill-graph@$ver already published, skipping"
             exit 0
           fi
-          npm publish npm/skill-graph --access public --provenance
+          npm publish ./npm/skill-graph --access public --provenance
