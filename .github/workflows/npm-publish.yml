@@ -11,11 +11,21 @@ on:
 
 permissions:
   contents: read
+  id-token: write # required for `npm publish --provenance`
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Single source of truth for the npm platform set; consumed by both
+    # the assemble and publish steps. Keep in sync with the release.yml
+    # build matrix and npm/skill-graph optionalDependencies.
+    env:
+      TARGETS: |
+        linux-x64:x86_64-unknown-linux-gnu
+        linux-arm64:aarch64-unknown-linux-gnu
+        darwin-x64:x86_64-apple-darwin
+        darwin-arm64:aarch64-apple-darwin
     concurrency:
       group: npm-publish-${{ github.event.inputs.tag || github.ref_name }}
       cancel-in-progress: false
@@ -70,12 +80,6 @@ jobs:
           cd dist
           sha256sum -c --ignore-missing sha256sums.txt
       - name: Assemble platform packages
-        env:
-          TARGETS: |
-            linux-x64:x86_64-unknown-linux-gnu
-            linux-arm64:aarch64-unknown-linux-gnu
-            darwin-x64:x86_64-apple-darwin
-            darwin-arm64:aarch64-apple-darwin
         run: |
           set -euo pipefail
           while IFS=: read -r target triple; do
@@ -113,7 +117,7 @@ jobs:
               echo "$name@$ver already published, skipping"
               continue
             fi
-            npm publish "$pkg" --access public
+            npm publish "$pkg" --access public --provenance
           done <<< "$TARGETS"
       - name: Publish metapackage
         env:
@@ -125,4 +129,4 @@ jobs:
             echo "@rebuildup/skill-graph@$ver already published, skipping"
             exit 0
           fi
-          npm publish npm/skill-graph --access public
+          npm publish npm/skill-graph --access public --provenance
