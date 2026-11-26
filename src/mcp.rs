@@ -19,7 +19,37 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-struct SkillGraphMcp;
+/// Process-internal memoization (v1.0.0 spec §6): the built graph is
+/// cached per roots signature for the lifetime of this server process.
+/// No persistent cache — a client restart or new roots signature rebuilds.
+struct SkillGraphMcp {
+    graph_cache: Arc<std::sync::Mutex<Option<(String, Arc<crate::resolver::Graph>)>>>,
+}
+
+impl SkillGraphMcp {
+    fn new() -> Self {
+        Self {
+            graph_cache: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn graph_for(&self, roots: &[PathBuf]) -> Arc<crate::resolver::Graph> {
+        let key = roots
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\u{1f}");
+        let mut guard = self.graph_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, g)) = guard.as_ref()
+            && *k == key
+        {
+            return g.clone();
+        }
+        let g = Arc::new(build(discover(roots)));
+        *guard = Some((key, g.clone()));
+        g
+    }
+}
 
 /// Roots resolution shared with hook/CLI semantics: SKILL_GRAPH_ROOTS
 /// (colon-separated) wins, then explicit tool `roots`, then defaults.
@@ -165,7 +195,7 @@ impl ServerHandler for SkillGraphMcp {
                     return Ok(tool_error("missing required argument: query"));
                 };
                 let roots = resolve_roots(args.get("roots"));
-                let graph = build(discover(&roots));
+                let graph = self.graph_for(&roots);
                 let recs = recommend(
                     &graph,
                     query,
@@ -183,7 +213,7 @@ impl ServerHandler for SkillGraphMcp {
                     return Ok(tool_error("missing required argument: target"));
                 };
                 let roots = resolve_roots(args.get("roots"));
-                let graph = build(discover(&roots));
+                let graph = self.graph_for(&roots);
                 tool_result(&json!(crate::cli::resolve_target(&graph, target)))
             }
             other => {
@@ -205,7 +235,7 @@ pub fn run() -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
     runtime.block_on(async {
-        let server = SkillGraphMcp
+        let server = SkillGraphMcp::new()
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|e| format!("mcp serve: {e}"))?;
