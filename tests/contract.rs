@@ -148,6 +148,27 @@ fn resolve_by_unnormalized_absolute_path_matches() {
     assert_eq!(result["skill"]["name"], graph.skills[0].name);
 }
 
+#[test]
+fn resolve_completes_directory_and_file_uri_targets() {
+    // Regression for #171 (audit D-06): a directory path resolves to its
+    // SKILL.md, and a local file:// URI maps to the same path-bounded
+    // lookup.
+    let graph = build(discover(&[fixture_root()]));
+    let dir = graph.skills[0].path.parent().unwrap().to_path_buf();
+    let by_dir = serde_json::to_value(resolve_target(&graph, dir.to_str().unwrap())).unwrap();
+    assert_eq!(by_dir["kind"], "path", "{by_dir}");
+    assert_eq!(by_dir["skill"]["name"], graph.skills[0].name);
+
+    let file_uri = format!("file://{}", graph.skills[0].path.display());
+    let by_uri = serde_json::to_value(resolve_target(&graph, &file_uri)).unwrap();
+    assert_eq!(by_uri["kind"], "path", "{by_uri}");
+    assert_eq!(by_uri["skill"]["name"], graph.skills[0].name);
+
+    // Remote authorities are not local files and stay unresolved.
+    let remote = serde_json::to_value(resolve_target(&graph, "file://example.com/x")).unwrap();
+    assert_eq!(remote["kind"], "unresolved");
+}
+
 // --- JSON Schema validation against contracts/v1/*.schema.json ---
 // The skill-* schemas reference skill-summary.schema.json by relative
 // $ref; the registry resolves it to the published $id base.

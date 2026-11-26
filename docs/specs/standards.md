@@ -11,7 +11,7 @@
 | CommonMark | 規範仕様 | 0.31.2 | https://spec.commonmark.org/ | Markdown 本文のリンク抽出に使う。リンク関係の意味論は標準化されていない |
 | YAML | 規範仕様 | 1.2 | https://yaml.org/spec/ | `SKILL.md` frontmatter は YAML。実装は厳密な YAML 1.2 subset を前提にしない |
 | URI Generic Syntax | 規範仕様 | RFC 3986 | https://www.rfc-editor.org/rfc/rfc3986 | link / file URI 解決。相対参照解決と正規化を利用 |
-| file URI | 規範仕様 | RFC 8089 | https://www.rfc-editor.org/rfc/rfc8089 | local file URI のみ対象。UNC 等の非標準は拒否または明示診断 |
+| file URI | 規範仕様 | RFC 8089 | https://www.rfc-editor.org/rfc/rfc8089 | local file URI のみ対象。UNC 等の非標準は拒否または明示診断。境界: SKILL.md 内の `file://` link target は他の `scheme://` target と同じく `External`（graph edge にしない）。`resolve` の target として渡された local `file://` URI はローカルパスへ写像するが、解決は発見済み skill（`by_path`）に限定し、外部取得はしない |
 | JSON Schema | 公開仕様 | draft は実装時に固定 | https://json-schema.org/ | eval dataset / plugin manifest / output contract の検証に使う |
 | MCP | 公開仕様 | ~~version は adapter 実装時に固定~~ → **superseded**: ADR-0005 で境界確定、`rmcp` 3.11.0（server + stdio transport）を採用 | https://modelcontextprotocol.io/ | `skill-graph mcp`（stdio・read-only 3 tools）として v0.4.0 で実装済み。仕様 version negotiation は rmcp に委譲 |
 | XDG Base Directory | 公開仕様 | 0.8 | https://specifications.freedesktop.org/basedir-spec/latest/ | user-level state / config の将来配置。project 内への書き込みは禁止のまま |
