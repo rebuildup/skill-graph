@@ -12,10 +12,13 @@
     "skill-graph": "bin/skill-graph.js"
   },
   "files": [
-    "bin/"
+    "bin/",
+    "plugin/",
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
-    "node": ">=14"
+    "node": ">=14.18"
   },
   "optionalDependencies": {
     "@rebuildup/skill-graph-linux-x64": "0.4.0",
