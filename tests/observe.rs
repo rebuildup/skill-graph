@@ -527,7 +527,7 @@ fn passthrough_accepts_empty_recommended_rejects_null_required() {
 
 /// RFC 3339 boundary timestamps must parse: leap-year-aware February,
 /// hour 23, leap second 60, fractional seconds, and bounded `±hh:mm`
-/// offsets (with or without the colon).
+/// offsets (colon required — `+0900` is not RFC 3339).
 #[test]
 fn summary_accepts_rfc3339_boundary_timestamps() {
     use skill_graph::observe::{Observation, summary};
@@ -543,9 +543,9 @@ fn summary_accepts_rfc3339_boundary_timestamps() {
             // s3: leap second 23:59:60 == next midnight; +1s load = 1s.
             rec_event("s3", "2024-06-30T23:59:60Z", &["gamma"], true),
             load_event("s3", "2024-07-01T00:00:01Z", "gamma"),
-            // s4: fractional seconds and a colon-less offset = 2s.
+            // s4: fractional seconds and a zero offset = 2s.
             rec_event("s4", "2026-01-01T09:00:00.250+09:00", &["delta"], true),
-            load_event("s4", "2026-01-01T00:00:02+0000", "delta"),
+            load_event("s4", "2026-01-01T00:00:02+00:00", "delta"),
         ],
         ..Default::default()
     };
@@ -581,6 +581,8 @@ fn summary_rejects_invalid_rfc3339_timestamps() {
         "2026-01-01T00:01:00Zjunk",  // trailing garbage after Z
         "2026-01-01T00:01:00.Z",     // decimal point with no digits
         "2026/01/01T00:01:00Z",      // wrong date separators
+        "2026-01-01T00:01:00",       // missing offset — not RFC 3339
+        "2026-01-01T00:01:00+0900",  // colon-less offset — not RFC 3339
     ];
     let mut events = Vec::new();
     for (i, ts) in invalid_load_ts.iter().enumerate() {
@@ -723,4 +725,25 @@ fn summary_conversion_pairs_greedily_at_scale() {
     assert_eq!(v["converted_recommendations"], 500);
     assert_eq!(v["unnecessary_loads"], 0);
     assert_eq!(v["load_grade_loads"], 500);
+}
+
+/// #144 round-11: passthrough `skill_load.skill_name` must satisfy the
+/// same valid-skill-name charset as `recommended[].name` — a foreign
+/// log line with an impossible name is skipped, not admitted into
+/// funnel join keys.
+#[test]
+fn passthrough_skill_name_charset_is_validated() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "events.jsonl",
+        &[
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:01Z","observed_via":"hook","skill_name":"!!! not a name !!!","detection":"file_read","confidence":"high"}"#,
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:02Z","observed_via":"hook","skill_name":"alpha-skill","detection":"file_read","confidence":"high"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.lines_skipped, 1);
+    assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&1));
+    assert_eq!(obs.skill_loads.len(), 1);
 }

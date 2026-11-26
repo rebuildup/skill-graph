@@ -224,7 +224,7 @@ impl SkillUsageEvent {
             session_id: sanitize_session_id(session_id),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
-            prompt_hash,
+            prompt_hash: prompt_hash.map(|h| h.chars().take(128).collect()),
             trigger: Some(trigger),
             recommended: names
                 .into_iter()
@@ -343,6 +343,13 @@ fn unix_secs_to_rfc3339(secs: u64) -> String {
 /// a `---/name:/---` block appearing later in the body is prose, not
 /// frontmatter, and must not spoof the skill name. Only a bounded head
 /// is scanned and fences must be `---` alone on their line.
+///
+/// Deliberate divergences from the canonical parser, all in the
+/// conservative direction for truncated tool output: an unterminated
+/// frontmatter still yields the name (runtimes routinely truncate tool
+/// results mid-block, and the name line precedes the close fence), the
+/// 8 KB scan window may cut a long value short, and the first `name:`
+/// wins where YAML duplicate-key semantics would differ.
 pub fn frontmatter_name(text: &str) -> Option<String> {
     const MAX_SCAN: usize = 8 * 1024;
     let head: String = text.chars().take(MAX_SCAN).collect();
@@ -372,8 +379,14 @@ pub fn frontmatter_name(text: &str) -> Option<String> {
         if line == "---" {
             return None;
         }
-        if let Some(value) = line.trim_end().strip_prefix("name:") {
-            let value = value.trim().trim_matches('"').trim_matches('\'');
+        if let Some(rest) = line.trim_end().strip_prefix("name:") {
+            // YAML requires separation after the colon: `name:foo` is a
+            // plain scalar, not a mapping — the canonical parser would
+            // not see a name there, so neither may we.
+            if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            let value = rest.trim().trim_matches('"').trim_matches('\'');
             // Only spec-conforming names may flow into events/state;
             // anything else is treated as absent.
             if !value.is_empty() && crate::parser::valid_skill_name(value) {
@@ -431,7 +444,12 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut pos = 0usize;
-    while pos + NEEDLE.len() <= bytes.len() {
+    // Distinct candidates and per-candidate length are both bounded: a
+    // max-size payload could otherwise materialize hundreds of MB of
+    // path strings before any downstream cap applies.
+    const MAX_CANDIDATES: usize = 256;
+    const MAX_CANDIDATE_BYTES: usize = 4096;
+    while pos + NEEDLE.len() <= bytes.len() && out.len() < MAX_CANDIDATES {
         if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
             pos += 1;
             continue;
@@ -456,6 +474,7 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
         // keeps `bar/SKILL.md` only if `=` were allowed — it is, so instead we
         // accept the whole run; `is_skill_md_path` filters non-SKILL.md names).
         if let Ok(candidate) = std::str::from_utf8(&bytes[start..end])
+            && candidate.len() <= MAX_CANDIDATE_BYTES
             && !candidate.is_empty()
             && seen.insert(candidate)
         {
@@ -500,7 +519,19 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     // is ordered by its READ segment, not its first mention — tool output
     // follows command order, so this is the order files' contents appear.
     let mut decisive: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Bound the retained access list: events per payload are capped at
+    // MAX_EVENTS_PER_PAYLOAD, so accumulating more classifications than
+    // that can never change the emitted output.
+    const MAX_COMMAND_ACCESSES: usize = MAX_EVENTS_PER_PAYLOAD * 4;
     for (seq, segment) in command.split(['&', ';', '|', '\n']).enumerate() {
+        if out.len() >= MAX_COMMAND_ACCESSES {
+            break;
+        }
+        // Cheap reject before allocating skill_md_paths' buffers: most
+        // segments in a large command never mention SKILL.md.
+        if !segment.contains("SKILL.md") {
+            continue;
+        }
         let access = if segment_has_read_verb(segment) {
             Access::Read
         } else {
@@ -894,6 +925,12 @@ pub fn detect_all_from_payload(
     // explicit error status/success flag produce no load events.
     if payload.get("status").and_then(Value::as_str) == Some("error")
         || payload.get("success").and_then(Value::as_bool) == Some(false)
+        || payload.get("error").is_some_and(|e| {
+            // The OpenCode plugin forwards `error` defensively; any
+            // non-empty error value marks a failed call. null/false/""
+            // are not errors.
+            !e.is_null() && *e != Value::Bool(false) && e.as_str() != Some("")
+        })
     {
         return Vec::new();
     }
@@ -974,6 +1011,13 @@ pub fn detect_all_from_payload(
                 return;
             }
             let key = c.skill_path.clone().or_else(|| c.skill_name.clone());
+            // Only the first MAX_EVENTS_PER_PAYLOAD classes are ever
+            // emitted; refuse new keys past that so a hostile payload
+            // cannot grow the intermediate vec (upgrades to existing
+            // keys still apply).
+            if classes.len() >= MAX_EVENTS_PER_PAYLOAD && !index.contains_key(&key) {
+                return;
+            }
             match index.get(&key) {
                 Some(&i) if rank(&classes[i]) >= rank(&c) => {}
                 Some(&i) => classes[i] = c,
@@ -1230,5 +1274,26 @@ mod tests {
     fn rfc3339_conversion() {
         assert_eq!(unix_secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(epoch_ms_to_rfc3339(1793321018917), "2026-10-30T00:43:38Z");
+    }
+
+    /// #144 round-11: `name:foo` without YAML separation is a scalar,
+    /// not a mapping — the canonical parser sees no name, so the
+    /// transcript-side extractor must not claim one either.
+    #[test]
+    fn frontmatter_name_requires_yaml_separator() {
+        assert_eq!(
+            frontmatter_name("---\nname:foo\n---\nbody"),
+            None,
+            "name:foo is a scalar, not a mapping"
+        );
+        assert_eq!(
+            frontmatter_name("---\nname: foo-bar\n---\nbody"),
+            Some("foo-bar".to_string())
+        );
+        assert_eq!(
+            frontmatter_name("---\nname:\tfoo-bar\n---\nbody"),
+            Some("foo-bar".to_string()),
+            "tab is valid YAML separation"
+        );
     }
 }

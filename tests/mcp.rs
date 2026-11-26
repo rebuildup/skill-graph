@@ -273,3 +273,33 @@ fn all_invalid_explicit_roots_do_not_widen_to_defaults() {
     let recs: Value = serde_json::from_str(text).unwrap();
     assert_eq!(recs.as_array().unwrap().len(), 0, "{recs}");
 }
+
+/// #144 round-11: a present `roots` array defines the scope even when it
+/// is empty or every entry is non-string — `[]` and `[123]` must NOT
+/// widen to the default corpus (same rule as all-invalid string roots).
+#[test]
+fn empty_and_nonstring_roots_arrays_do_not_widen() {
+    let mut mcp = Mcp::spawn();
+    for roots in [json!([]), json!([123]), json!([null, {}])] {
+        let result = mcp.call("discover", json!({"roots": roots}));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let disc: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            disc["skills"].as_array().unwrap().len(),
+            0,
+            "roots={roots} widened to defaults: {disc}"
+        );
+    }
+}
+
+/// A non-array `roots` value is a malformed call, not a scope: it must
+/// be rejected as invalid_params rather than reinterpreted.
+#[test]
+fn non_array_roots_is_rejected() {
+    let mut mcp = Mcp::spawn();
+    let res = mcp.request(
+        "tools/call",
+        json!({"name": "discover", "arguments": {"roots": "/tmp"}}),
+    );
+    assert!(res.get("error").is_some(), "expected JSON-RPC error: {res}");
+}

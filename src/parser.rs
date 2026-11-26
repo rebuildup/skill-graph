@@ -88,13 +88,32 @@ struct Frontmatter {
     allowed_tools: Option<String>,
 }
 
+/// Discovery skips symlinked SKILL.md files at walk time, but the path
+/// can be swapped for a symlink before `open` — O_NOFOLLOW makes the
+/// open fail instead of reading through the link (same defense as the
+/// hook's state files). O_NONBLOCK keeps a swapped-in FIFO from
+/// hanging the read; both are no-ops on regular files.
+#[cfg(unix)]
+fn no_follow(opts: &mut fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+}
+
+#[cfg(not(unix))]
+fn no_follow(_opts: &mut fs::OpenOptions) {}
+
 /// Read at most `MAX_SKILL_BYTES + 1` bytes. The size cap is enforced
 /// on bytes actually read — pre-read metadata can be falsified by a
 /// file that grows between `metadata()` and `read()`, is swapped, or
 /// lives on a filesystem reporting misleading sizes.
 fn read_skill_bytes(path: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let file = fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    no_follow(&mut opts);
+    let file = opts
+        .open(path)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut buf = Vec::new();
     file.take(MAX_SKILL_BYTES + 1)
         .read_to_end(&mut buf)

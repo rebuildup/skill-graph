@@ -51,6 +51,11 @@ pub struct Observation {
     pub events_truncated: bool,
     #[serde(skip)]
     pub loads_truncated: bool,
+    /// Cumulative estimated bytes of retained per-event and per-load
+    /// detail, bounded by MAX_OBSERVE_RETAINED_BYTES. Counter maps stay
+    /// accurate; only retained detail is dropped past the budget.
+    #[serde(skip)]
+    pub retained_bytes: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +143,25 @@ fn line_session_id(value: &Value) -> Option<String> {
 /// Aggregate bound on observable inputs: per-file caps alone still allow
 /// `observe ~` to read an unbounded number of files into memory.
 const MAX_OBSERVE_FILES: usize = 4096;
+/// Directory recursion and per-scan error count are bounded too: the
+/// file cap does not limit empty/unreadable directories, and a deep or
+/// hostile tree could otherwise overflow the stack or grow `errors`
+/// without bound.
+const MAX_OBSERVE_DEPTH: usize = 64;
+const MAX_OBSERVE_ERRORS: usize = 1024;
+
+/// Push a collection error, capped; the overflow note latches so a
+/// hostile tree cannot grow `errors` with input size.
+fn note_error(errors: &mut Vec<String>, noted: &mut bool, msg: String) {
+    if errors.len() < MAX_OBSERVE_ERRORS {
+        errors.push(msg);
+    } else if !*noted {
+        *noted = true;
+        errors.push(format!(
+            "further scan errors suppressed at {MAX_OBSERVE_ERRORS}"
+        ));
+    }
+}
 
 fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut out = Vec::new();
@@ -145,6 +169,8 @@ fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
     let mut visited_dirs = std::collections::HashSet::new();
     let mut seen_files: std::collections::HashSet<ObsKey> = std::collections::HashSet::new();
     let mut cap_noted = false;
+    let mut err_noted = false;
+    let mut depth_noted = false;
     collect_observables_inner(
         path,
         &mut out,
@@ -152,6 +178,9 @@ fn collect_observables(path: &Path) -> (Vec<PathBuf>, Vec<String>) {
         &mut visited_dirs,
         &mut seen_files,
         &mut cap_noted,
+        &mut err_noted,
+        &mut depth_noted,
+        0,
     );
     (out, errors)
 }
@@ -175,7 +204,21 @@ fn collect_observables_inner(
     visited_dirs: &mut std::collections::HashSet<PathBuf>,
     seen_files: &mut std::collections::HashSet<ObsKey>,
     cap_noted: &mut bool,
+    err_noted: &mut bool,
+    depth_noted: &mut bool,
+    depth: usize,
 ) {
+    if depth > MAX_OBSERVE_DEPTH {
+        if !*depth_noted {
+            *depth_noted = true;
+            note_error(
+                errors,
+                err_noted,
+                format!("directory depth exceeds {MAX_OBSERVE_DEPTH}; deeper inputs skipped"),
+            );
+        }
+        return;
+    }
     if out.len() >= MAX_OBSERVE_FILES {
         note_observable_cap(out.len(), errors, cap_noted);
         return;
@@ -190,7 +233,11 @@ fn collect_observables_inner(
         return;
     }
     if !path.is_dir() {
-        errors.push(format!("not a file or directory: {}", path.display()));
+        note_error(
+            errors,
+            err_noted,
+            format!("not a file or directory: {}", path.display()),
+        );
         return;
     }
     // `is_dir` follows symlinks; a symlink cycle would recurse forever.
@@ -203,7 +250,7 @@ fn collect_observables_inner(
     let entries = match fs::read_dir(path) {
         Ok(e) => e,
         Err(e) => {
-            errors.push(format!("{}: {e}", path.display()));
+            note_error(errors, err_noted, format!("{}: {e}", path.display()));
             return;
         }
     };
@@ -215,7 +262,7 @@ fn collect_observables_inner(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                errors.push(format!("{}: {e}", path.display()));
+                note_error(errors, err_noted, format!("{}: {e}", path.display()));
                 continue;
             }
         };
@@ -235,7 +282,17 @@ fn collect_observables_inner(
             continue;
         }
         if p.is_dir() {
-            collect_observables_inner(&p, out, errors, visited_dirs, seen_files, cap_noted);
+            collect_observables_inner(
+                &p,
+                out,
+                errors,
+                visited_dirs,
+                seen_files,
+                cap_noted,
+                err_noted,
+                depth_noted,
+                depth + 1,
+            );
         } else if matches!(
             p.extension().and_then(|e| e.to_str()),
             Some("jsonl") | Some("db")
@@ -388,6 +445,19 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
         obs.lines_skipped += 1;
         return true;
     }
+    // skill_name must satisfy the same charset rule as recommended[].name:
+    // constructors only emit valid_skill_name values, so a foreign log
+    // line carrying anything else is schema-invalid in spirit and would
+    // otherwise flow into funnel join keys and observe output.
+    if event.kind == EventKind::SkillLoad
+        && !event
+            .skill_name
+            .as_deref()
+            .is_some_and(crate::parser::valid_skill_name)
+    {
+        obs.lines_skipped += 1;
+        return true;
+    }
     // Normalize payload-controlled fields to the bounds the event
     // constructors apply; a contract-shaped log line can otherwise carry
     // unbounded strings into downstream map keys.
@@ -463,6 +533,42 @@ fn looks_like_claude_transcript(value: &Value) -> bool {
 /// per-event detail is truncated, with a single notice in `errors`.
 const MAX_OBSERVE_EVENTS: usize = 1_000_000;
 const MAX_OBSERVE_LOADS: usize = 1_000_000;
+/// Retained-detail byte budget alongside the count caps: every string
+/// field is individually capped, but a contract-valid log can still pad
+/// each event to ~13 KB, so 1M events would retain >10 GB (and `observe`
+/// serializes the whole Observation into one String). Past the budget,
+/// further detail is dropped with the same latched truncation notice.
+const MAX_OBSERVE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
+
+/// Conservative estimate of one event's retained heap/serialized size.
+fn event_retained_bytes(e: &SkillUsageEvent) -> usize {
+    let mut n = 256usize;
+    n += e.session_id.len() + e.timestamp.len();
+    for s in [
+        &e.prompt_hash,
+        &e.reason,
+        &e.skill_name,
+        &e.skill_path,
+        &e.skill_digest,
+    ] {
+        n += s.as_deref().map_or(0, str::len);
+    }
+    n += e
+        .recommended
+        .iter()
+        .map(|r| r.name.len() + r.digest.as_deref().map_or(0, str::len) + 48)
+        .sum::<usize>();
+    n
+}
+
+fn load_retained_bytes(l: &SkillLoad) -> usize {
+    96 + l.session_id.len()
+        + l.skill.len()
+        + l.timestamp.len()
+        + l.file.len()
+        + l.runtime.len()
+        + l.detection.len()
+}
 
 /// Returns true while `len` is below `max`; emits one truncation notice
 /// per collection via `noted`, which latches so post-cap rejections do
@@ -510,7 +616,7 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
                 &mut obs.loads_truncated,
                 &mut obs.errors,
             ) {
-                obs.loads.push(SkillLoad {
+                let load = SkillLoad {
                     session_id: event.session_id.clone(),
                     skill: name.clone(),
                     timestamp: event.timestamp.clone(),
@@ -521,7 +627,16 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
                         .map(detection_name)
                         .unwrap_or_default()
                         .to_string(),
-                });
+                };
+                let lb = load_retained_bytes(&load);
+                if obs.retained_bytes.saturating_add(lb) <= MAX_OBSERVE_RETAINED_BYTES {
+                    obs.retained_bytes += lb;
+                    obs.loads.push(load);
+                } else if !obs.loads_truncated {
+                    obs.loads_truncated = true;
+                    obs.errors
+                        .push("loads truncated at retained-byte budget".to_string());
+                }
             }
         }
     }
@@ -532,7 +647,15 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
         &mut obs.events_truncated,
         &mut obs.errors,
     ) {
-        obs.events.push(event);
+        let eb = event_retained_bytes(&event);
+        if obs.retained_bytes.saturating_add(eb) <= MAX_OBSERVE_RETAINED_BYTES {
+            obs.retained_bytes += eb;
+            obs.events.push(event);
+        } else if !obs.events_truncated {
+            obs.events_truncated = true;
+            obs.errors
+                .push("events truncated at retained-byte budget".to_string());
+        }
     }
 }
 
@@ -726,37 +849,73 @@ impl CodexScan {
                         .unwrap_or("")
                         .to_string();
                     let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
-                    let mut accesses: Vec<(String, events::Access)> = Vec::new();
-                    for cmd in events::extract_exec_commands(input) {
-                        accesses.extend(events::classify_command(&cmd));
-                    }
-                    // Fallback: unparsed JS may still reference SKILL.md in
-                    // the raw input text.
-                    if accesses.is_empty() && input.contains("SKILL.md") {
-                        accesses.extend(events::classify_command(input));
-                    }
                     // Dedup by path keeping the stronger access so one
                     // call touching the same SKILL.md twice counts once.
+                    // The retained position is the DECISIVE access's
+                    // sequence number: upgrading Reference -> Read must
+                    // move the entry to the read's position or finish()
+                    // would attribute the output frontmatter to a file
+                    // whose content appears later (same contract as
+                    // events::classify_command's decisive ordering).
                     // HashMap index keeps this O(1) per access — a hostile
                     // transcript could otherwise force quadratic scans.
-                    let mut deduped: Vec<(String, events::Access)> = Vec::new();
+                    // Access accumulation is bounded: only the first
+                    // MAX_CODEX_ACCESSES accesses per call are retained.
+                    const MAX_CODEX_ACCESSES: usize = 2048;
+                    let mut deduped: Vec<(String, events::Access, usize)> = Vec::new();
                     let mut dedup_index: std::collections::HashMap<String, usize> =
                         std::collections::HashMap::new();
-                    for (path, access) in accesses {
-                        match dedup_index.get(&path) {
-                            Some(&i)
-                                if access == events::Access::Read
-                                    && deduped[i].1 == events::Access::Reference =>
-                            {
-                                deduped[i].1 = events::Access::Read;
+                    'accesses: for (seq, cmd) in
+                        events::extract_exec_commands(input).iter().enumerate()
+                    {
+                        for (path, access) in events::classify_command(cmd) {
+                            if deduped.len() >= MAX_CODEX_ACCESSES {
+                                break 'accesses;
                             }
-                            Some(_) => {}
-                            None => {
-                                dedup_index.insert(path.clone(), deduped.len());
-                                deduped.push((path, access));
+                            match dedup_index.get(&path) {
+                                Some(&i)
+                                    if access == events::Access::Read
+                                        && deduped[i].1 == events::Access::Reference =>
+                                {
+                                    deduped[i].1 = events::Access::Read;
+                                    deduped[i].2 = seq;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    dedup_index.insert(path.clone(), deduped.len());
+                                    deduped.push((path, access, seq));
+                                }
                             }
                         }
                     }
+                    // Fallback: unparsed JS may still reference SKILL.md in
+                    // the raw input text.
+                    if deduped.is_empty() && input.contains("SKILL.md") {
+                        for (seq, (path, access)) in
+                            events::classify_command(input).into_iter().enumerate()
+                        {
+                            if deduped.len() >= MAX_CODEX_ACCESSES {
+                                break;
+                            }
+                            match dedup_index.get(&path) {
+                                Some(&i)
+                                    if access == events::Access::Read
+                                        && deduped[i].1 == events::Access::Reference =>
+                                {
+                                    deduped[i].1 = events::Access::Read;
+                                    deduped[i].2 = seq;
+                                }
+                                Some(_) => {}
+                                None => {
+                                    dedup_index.insert(path.clone(), deduped.len());
+                                    deduped.push((path, access, seq));
+                                }
+                            }
+                        }
+                    }
+                    deduped.sort_by_key(|&(_, _, seq)| seq);
+                    let deduped: Vec<(String, events::Access)> =
+                        deduped.into_iter().map(|(p, a, _)| (p, a)).collect();
                     if !deduped.is_empty() {
                         self.pending.push(PendingCall {
                             call_id,
@@ -1220,9 +1379,10 @@ fn rfc3339_ms(s: &str) -> Option<i64> {
         }
         field.parse().ok()
     };
+    // RFC 3339 permits lowercase 't'/'z' (section 5.6 NOTE).
     if b.get(4) != Some(&b'-')
         || b.get(7) != Some(&b'-')
-        || b.get(10) != Some(&b'T')
+        || !matches!(b.get(10), Some(b'T') | Some(b't'))
         || b.get(13) != Some(&b':')
         || b.get(16) != Some(&b':')
     {
@@ -1280,15 +1440,16 @@ fn rfc3339_ms(s: &str) -> Option<i64> {
     }
     let epoch_ms = secs * 1000 + millis;
     match b.get(i) {
-        // 'Z' or absent offset must terminate the timestamp.
-        Some(b'Z') if i + 1 == b.len() => Some(epoch_ms),
-        None => Some(epoch_ms),
+        // 'Z'/'z' must terminate the timestamp; an offset is REQUIRED —
+        // an offset-less local time is not RFC 3339 and must not be
+        // silently treated as UTC.
+        Some(b'Z') | Some(b'z') if i + 1 == b.len() => Some(epoch_ms),
         Some(sign @ (b'+' | b'-')) => {
-            let (off_h, off_m, end) = if b.get(i + 3) == Some(&b':') {
-                (num(i + 1, 2)?, num(i + 4, 2)?, i + 6)
-            } else {
-                (num(i + 1, 2)?, num(i + 3, 2)?, i + 5)
-            };
+            // time-numoffset requires the colon: ±hh:mm only.
+            if b.get(i + 3) != Some(&b':') {
+                return None;
+            }
+            let (off_h, off_m, end) = (num(i + 1, 2)?, num(i + 4, 2)?, i + 6);
             if end != b.len() || off_h > 23 || off_m > 59 {
                 return None;
             }
@@ -1417,19 +1578,10 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
         }
     }
 
-    // Index loads by skill name and parse timestamps once: the
-    // conversion scan below must not be O(recommendations × loads) —
-    // a large contract-shaped event log would otherwise hang
-    // `observe --summary` (the by_session cap does not bound the
-    // top-level funnel, which runs over all events).
-    let mut loads_by_name: std::collections::HashMap<&str, Vec<usize>> =
-        std::collections::HashMap::new();
-    for &li in &loads {
-        loads_by_name
-            .entry(events[li].skill_name.as_deref().unwrap_or(""))
-            .or_default()
-            .push(li);
-    }
+    // Parse timestamps once: the conversion scan below must not be
+    // O(recommendations × loads) — a large contract-shaped event log
+    // would otherwise hang `observe --summary` (the by_session cap does
+    // not bound the top-level funnel, which runs over all events).
     let timestamps: std::collections::HashMap<usize, Option<i64>> = idxs
         .iter()
         .map(|&i| (i, rfc3339_ms(&events[i].timestamp)))
@@ -1438,8 +1590,44 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
     // Greedy conversion: each emitted recommendation converts the first
     // later load-grade load naming one of its recommendations; each load
     // converts at most one recommendation.
-    let mut consumed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for &ri in &recs {
+    //
+    // The naive union-of-candidates scan is O(recommendations × loads)
+    // when every recommendation names the same skill — a crafted log
+    // could hang `observe --summary`. Instead each name's load list
+    // (already in session order) gets a cursor: loads are consumed or
+    // permanently ineligible (timestamp strictly before the current
+    // rec's — rec timestamps are non-decreasing in this loop) only move
+    // the cursor forward, never backward. The first eligible load per
+    // name is found by a short forward scan; the rec converts the
+    // minimum-position winner across its names, which is exactly the
+    // first eligible element of the merged union.
+    //
+    // Loads failing the timestamp fallback (`li > ri` encounter-order
+    // check) are NOT permanently ineligible and are re-examined by
+    // later recs, so a hostile all-missing-timestamp log could still
+    // force quadratic scans. A global examination budget bounds that:
+    // past it, remaining recs simply do not convert (deterministic —
+    // rec order is fixed).
+    const MAX_FUNNEL_PAIR_CHECKS: usize = 8_000_000;
+    #[derive(Default)]
+    struct NameLoads {
+        list: Vec<usize>,
+        cursor: usize,
+    }
+    let mut by_name: std::collections::HashMap<&str, NameLoads> = std::collections::HashMap::new();
+    for &li in &loads {
+        by_name
+            .entry(events[li].skill_name.as_deref().unwrap_or(""))
+            .or_default()
+            .list
+            .push(li);
+    }
+    let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut checks_left = MAX_FUNNEL_PAIR_CHECKS;
+    'recs: for &ri in &recs {
+        if consumed.len() == loads.len() {
+            break;
+        }
         let rec = events[ri];
         if rec.emitted != Some(true) {
             continue;
@@ -1450,40 +1638,66 @@ fn session_funnel(f: &mut Funnel, events: &[&crate::events::SkillUsageEvent], id
             continue;
         }
         let rec_ts = timestamps[&ri];
-        // Union of candidate loads across recommended names, visited in
-        // session order — equivalent to scanning `loads` while skipping
-        // non-matching names, but only touches relevant loads.
-        let mut candidates: Vec<usize> = names
-            .iter()
-            .filter_map(|name| loads_by_name.get(*name))
-            .flatten()
-            .copied()
-            .collect();
-        candidates.sort_by_key(|&li| pos[&li]);
-        for li in candidates {
-            if consumed.contains(&li) {
+        // (session position, event index) of the earliest eligible load
+        // per name; the winner is the minimum position across names.
+        let mut best: Option<(usize, usize)> = None;
+        for name in &names {
+            let Some(nl) = by_name.get_mut(*name) else {
                 continue;
-            }
-            let load_ts = timestamps[&li];
-            // When either timestamp is unparseable, fall back to input
-            // (encounter) order — events are collected in transcript/log
-            // order, which is the best available chronology. The
-            // timestamp-sorted position must NOT be used here: missing
-            // timestamps sort to i64::MAX, so a position comparison would
-            // fabricate "missing ts = latest" and invert real ordering.
-            let after = match (rec_ts, load_ts) {
-                (Some(a), Some(b)) => b >= a,
-                _ => li > ri,
             };
-            if !after {
-                continue;
+            // Advance the cursor past loads that are dead for this and
+            // every later rec: consumed, or timestamped strictly before
+            // rec_ts (rec timestamps are non-decreasing).
+            while nl.cursor < nl.list.len() {
+                let li = nl.list[nl.cursor];
+                let dead = match (rec_ts, timestamps[&li]) {
+                    (Some(a), Some(b)) => b < a,
+                    _ => false,
+                };
+                if consumed.contains(&li) || dead {
+                    nl.cursor += 1;
+                } else {
+                    break;
+                }
             }
+            let mut j = nl.cursor;
+            while j < nl.list.len() {
+                let li = nl.list[j];
+                j += 1;
+                checks_left = checks_left.saturating_sub(1);
+                if checks_left == 0 {
+                    break 'recs;
+                }
+                if consumed.contains(&li) {
+                    continue;
+                }
+                let load_ts = timestamps[&li];
+                // When either timestamp is unparseable, fall back to input
+                // (encounter) order — events are collected in transcript/log
+                // order, which is the best available chronology. The
+                // timestamp-sorted position must NOT be used here: missing
+                // timestamps sort to i64::MAX, so a position comparison would
+                // fabricate "missing ts = latest" and invert real ordering.
+                let after = match (rec_ts, load_ts) {
+                    (Some(a), Some(b)) => b >= a,
+                    _ => li > ri,
+                };
+                if !after {
+                    continue;
+                }
+                let p = pos[&li];
+                if best.is_none_or(|(bp, _)| p < bp) {
+                    best = Some((p, li));
+                }
+                break;
+            }
+        }
+        if let Some((_, li)) = best {
             consumed.insert(li);
             f.converted += 1;
-            if let (Some(a), Some(b)) = (rec_ts, load_ts) {
+            if let (Some(a), Some(b)) = (rec_ts, timestamps[&li]) {
                 f.deltas_ms.push(b - a);
             }
-            break;
         }
     }
 }
@@ -1567,5 +1781,27 @@ mod tests {
         assert!(!under_cap(2, 2, "events", &mut noted, &mut errors));
         assert!(!under_cap(999, 2, "events", &mut noted, &mut errors));
         assert_eq!(errors, vec!["events truncated at 2".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::rfc3339_ms;
+
+    #[test]
+    fn rfc3339_requires_offset_and_colon() {
+        // Offset-less local time is not RFC 3339 — must not parse as UTC.
+        assert_eq!(rfc3339_ms("2026-01-01T00:00:00"), None);
+        // Colon-less numeric offset is not RFC 3339.
+        assert_eq!(rfc3339_ms("2026-01-01T00:00:00+0900"), None);
+        // Lowercase t/z are permitted by RFC 3339 section 5.6 NOTE.
+        assert!(rfc3339_ms("2026-01-01t00:00:00z").is_some());
+        // Canonical forms still parse.
+        assert!(rfc3339_ms("2026-01-01T00:00:00Z").is_some());
+        assert!(rfc3339_ms("2026-01-01T09:00:00+09:00").is_some());
+        assert_eq!(
+            rfc3339_ms("2026-01-01T00:00:00Z"),
+            rfc3339_ms("2026-01-01T09:00:00+09:00")
+        );
     }
 }

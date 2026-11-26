@@ -79,11 +79,23 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
     let started = Instant::now();
 
     for case in cases {
-        let root = if case.skill_root.is_absolute() {
-            case.skill_root.clone()
-        } else {
-            repo_root.join(&case.skill_root)
-        };
+        // Dataset contract (evals/dataset/schema.md): skill_root stays
+        // inside the repository — no absolute paths, no `..` segments.
+        // A violating case is a dataset bug; fail loudly rather than
+        // scanning outside the repo.
+        if case.skill_root.is_absolute()
+            || case
+                .skill_root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "case {}: skill_root must be a repository-relative path without '..': {}",
+                case.id,
+                case.skill_root.display()
+            ));
+        }
+        let root = repo_root.join(&case.skill_root);
         if !graphs.contains_key(&root) {
             let discovery = discover(std::slice::from_ref(&root));
             discovery_errors.extend(discovery.errors.iter().cloned());

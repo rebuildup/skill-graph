@@ -52,21 +52,43 @@ impl SkillGraphMcp {
 /// `discover` reports "root is not a directory" diagnostics and returns
 /// an empty scan — silently dropping them would widen the query to the
 /// default corpus, the same violation #177 fixed for SKILL_GRAPH_ROOTS.
-fn tool_roots(arg_roots: Option<&Value>) -> Vec<PathBuf> {
-    let explicit: Vec<PathBuf> = arg_roots
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .take(MAX_TOOL_ROOTS)
-                .map(PathBuf::from)
-                .collect()
-        })
-        .unwrap_or_default();
-    // Truncation to MAX_TOOL_ROOTS is deliberate: silently falling back
-    // to env/defaults would return results for a corpus the caller did
-    // not ask about.
-    resolve_roots(explicit, crate::discovery::default_roots)
+fn tool_roots(arg_roots: Option<&Value>) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let Some(value) = arg_roots else {
+        return Ok((
+            resolve_roots(Vec::new(), crate::discovery::default_roots),
+            Vec::new(),
+        ));
+    };
+    let Some(arr) = value.as_array() else {
+        return Err("roots must be an array of strings".to_string());
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut dropped = 0usize;
+    for item in arr {
+        match item.as_str() {
+            Some(s) if roots.len() < MAX_TOOL_ROOTS => roots.push(PathBuf::from(s)),
+            _ => dropped += 1,
+        }
+    }
+    let mut diagnostics = Vec::new();
+    if dropped > 0 {
+        diagnostics.push(format!(
+            "roots: {dropped} entr(ies) ignored (non-string or beyond {MAX_TOOL_ROOTS})"
+        ));
+    }
+    if roots.is_empty() {
+        // A present `roots` array defines the scope even when empty or
+        // entirely invalid — `resolve_roots` would treat an empty
+        // explicit list as "use defaults" and silently widen the query
+        // to the full corpus (the #177 violation). An empty PathBuf is
+        // never a directory, so discovery diagnoses it and returns an
+        // empty scan instead.
+        roots.push(PathBuf::new());
+    }
+    Ok((
+        resolve_roots(roots, crate::discovery::default_roots),
+        diagnostics,
+    ))
 }
 
 fn arg_str<'a>(args: &'a JsonObject, key: &str) -> Option<&'a str> {
@@ -220,7 +242,11 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
             let Some(query) = arg_str(args, "query") else {
                 return Ok(tool_error("missing required argument: query"));
             };
-            let roots = tool_roots(args.get("roots"));
+            let (roots, diagnostics) =
+                tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
+            for err in &diagnostics {
+                crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
+            }
             let built = build_graph(&roots);
             let recs = recommend(
                 &built.graph,
@@ -231,11 +257,15 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
             tool_result(&json!(recs))
         }
         "discover" => {
-            let roots = tool_roots(args.get("roots"));
+            let (roots, diagnostics) =
+                tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
             let built = build_graph(&roots);
             let mut output = DiscoveryOutput {
                 skills: built.graph.skills.iter().map(Skill::summary).collect(),
-                errors: built.errors.clone(),
+                errors: diagnostics
+                    .into_iter()
+                    .chain(built.errors.iter().cloned())
+                    .collect(),
             };
             if output.skills.len() > MAX_DISCOVER_SKILLS {
                 output.skills.truncate(MAX_DISCOVER_SKILLS);
@@ -243,13 +273,26 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
                     "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
                 ));
             }
+            // skills is capped; errors need the same bound — a hostile
+            // corpus can otherwise produce ~10k parse-error entries.
+            const MAX_DISCOVER_ERRORS: usize = 256;
+            if output.errors.len() > MAX_DISCOVER_ERRORS {
+                output.errors.truncate(MAX_DISCOVER_ERRORS);
+                output
+                    .errors
+                    .push(format!("errors truncated at {MAX_DISCOVER_ERRORS}"));
+            }
             tool_result(&json!(output))
         }
         "resolve" => {
             let Some(target) = arg_str(args, "target") else {
                 return Ok(tool_error("missing required argument: target"));
             };
-            let roots = tool_roots(args.get("roots"));
+            let (roots, diagnostics) =
+                tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
+            for err in &diagnostics {
+                crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
+            }
             let built = build_graph(&roots);
             tool_result(&json!(crate::cli::resolve_target(&built.graph, target)))
         }
