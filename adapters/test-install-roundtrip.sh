@@ -86,4 +86,27 @@ d=$(mktemp -d); HOME="$d" SKILL_GRAPH_BIN="$bin" "$install" codex --user --unins
 [ ! -e "$d/.codex/hooks.json" ] && echo "PASS codex uninstall on absent file" || { echo "FAIL codex uninstall on absent file"; fail=1; }
 rm -rf "$d"
 
+# dotfiles overlay: uninstall must also clean the compose overlay, or the
+# next `claude-settings compose` would regenerate the hooks.
+d=$(mktemp -d)
+mkdir -p "$d/.config/dotfiles/claude" "$d/.claude"
+cat > "$d/.config/dotfiles/claude/settings.local.json" <<'JSON'
+{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo keep"}]}]}}
+JSON
+cp "$d/.claude/settings.json" "$work/x" 2>/dev/null || true
+HOME="$d" SKILL_GRAPH_BIN="$bin" "$install" claude-code --user >/dev/null
+# simulate dotfiles compose having imported our hooks into the overlay:
+# copy the live .hooks wholesale (exactly what `extras(shared, live)` yields)
+jq --slurpfile live "$d/.claude/settings.json" '.hooks = (.hooks + $live[0].hooks)' \
+  "$d/.config/dotfiles/claude/settings.local.json" > "$d/ov.tmp" && mv "$d/ov.tmp" "$d/.config/dotfiles/claude/settings.local.json"
+HOME="$d" SKILL_GRAPH_BIN="$bin" "$install" claude-code --user --uninstall >/dev/null
+if jq -e '[.. | strings | select(contains("skill-graph-recommend-hook"))] | length == 0' \
+     "$d/.config/dotfiles/claude/settings.local.json" >/dev/null \
+   && jq -e '.hooks.SessionStart | length == 1' "$d/.config/dotfiles/claude/settings.local.json" >/dev/null; then
+  echo "PASS claude-code --user: uninstall cleans dotfiles overlay"
+else
+  echo "FAIL claude-code --user: uninstall cleans dotfiles overlay"; fail=1
+fi
+rm -rf "$d"
+
 exit "$fail"
