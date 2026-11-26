@@ -60,6 +60,11 @@ pub fn resolve_roots(
     fallback()
 }
 
+/// Upper bound on filesystem entries scanned per root. MCP callers can
+/// pass arbitrary roots (e.g. `/`); without a cap a single call walks
+/// the whole filesystem before output truncation applies.
+const MAX_DISCOVER_ENTRIES: usize = 100_000;
+
 pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
@@ -68,16 +73,19 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
 
     for requested in roots {
         let Ok(root) = std::fs::canonicalize(requested) else {
+            errors.push(format!(
+                "root not found or unreadable: {}",
+                requested.display()
+            ));
             continue;
         };
         if !root.is_dir() || !seen_roots.insert(root.clone()) {
             continue;
         }
-        for entry in WalkDir::new(&root)
-            .follow_links(false)
-            .into_iter()
-            .flatten()
-        {
+        let mut entries = WalkDir::new(&root).follow_links(false).into_iter();
+        let mut scanned = 0usize;
+        for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES).flatten() {
+            scanned += 1;
             if entry.file_type().is_symlink() || entry.file_name() != "SKILL.md" {
                 continue;
             }
@@ -97,6 +105,13 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 Ok(skill) => skills.push(skill),
                 Err(err) => errors.push(err),
             }
+        }
+        if scanned >= MAX_DISCOVER_ENTRIES && entries.next().is_some() {
+            errors.push(format!(
+                "{}: entry scan truncated at {} entries",
+                root.display(),
+                MAX_DISCOVER_ENTRIES
+            ));
         }
     }
 

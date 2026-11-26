@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, mkdirSync, renameSync, statSync } from "node:fs"
+import { appendFileSync, closeSync, mkdirSync, openSync, renameSync, statSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
@@ -25,8 +25,20 @@ const EVENT_LOG =
 // Parity with the Rust hook: SKILL_GRAPH_HOOK_NOSTATE=1 suppresses all
 // event writes; SKILL_GRAPH_EVENT_LOG_MAX bounds the log (rotate to .1).
 const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
-const EVENT_LOG_MAX = Number(process.env.SKILL_GRAPH_EVENT_LOG_MAX ?? 64 * 1024 * 1024)
+// Mirror the Rust hook's env parsing: positive integers only, anything
+// else falls back to the default.
+function envUint(name: string, fallback: number): number {
+  const n = Number(process.env[name])
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback
+}
+const EVENT_LOG_MAX = envUint("SKILL_GRAPH_EVENT_LOG_MAX", 64 * 1024 * 1024)
+// Bound in-memory state: this plugin lives for the whole OpenCode server
+// process, so unbounded maps would grow forever.
+const MAX_EMITTED = 10_000
+const MAX_PENDING_SESSIONS = 200
+const MAX_SESSION_CTX = 200
 const emitted = new Set<string>()
+const sessionCtx = new Map<string, string[]>()
 
 function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex")
@@ -41,7 +53,14 @@ function emit(event: Record<string, unknown>) {
         renameSync(EVENT_LOG, EVENT_LOG + ".1")
       }
     } catch {}
-    appendFileSync(EVENT_LOG, JSON.stringify(event) + "\n")
+    // Open with mode 0600 so a freshly created log is owner-only, matching
+    // the Rust hook's permissions.
+    const fd = openSync(EVENT_LOG, "a", 0o600)
+    try {
+      writeSync(fd, JSON.stringify(event) + "\n")
+    } finally {
+      closeSync(fd)
+    }
   } catch (e) {
     dbg("emit failed: " + e)
   }
@@ -57,15 +76,29 @@ function base(kind: string) {
   }
 }
 
-async function recommendNames(query: string, max = 5): Promise<{ name: string; digest?: string }[]> {
+async function recommendNames(
+  query: string,
+  max = 5,
+  context = "",
+): Promise<{ name: string; digest?: string }[]> {
   const roots = (process.env.SKILL_GRAPH_ROOTS ?? "")
     .split(":")
     .filter(Boolean)
     .flatMap((r) => ["--root", r])
-  const proc = Bun.spawn(
-    [SKILL_GRAPH_BIN, "recommend", query, ...roots, "--max", String(max), "--format", "json"],
-    { stdout: "pipe", stderr: "ignore" },
-  )
+  // The query travels on stdin (--query-stdin), not argv: prompts may
+  // begin with `-` and prompt bodies should not sit in process listings.
+  const args = [
+    SKILL_GRAPH_BIN, "recommend", "--query-stdin",
+    ...roots, "--max", String(max), "--format", "json",
+  ]
+  if (context) args.push("--context", context)
+  const proc = Bun.spawn(args, {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "ignore",
+  })
+  proc.stdin.write(query)
+  proc.stdin.end()
   const out = await new Response(proc.stdout).text()
   await proc.exited
   try {
@@ -96,7 +129,7 @@ function resultText(result: unknown): string {
   }
 }
 
-async function detectLoad(event: any): Promise<Record<string, any> | null> {
+async function detectLoad(event: any): Promise<Record<string, any>[]> {
   // Cheap pre-filter: only SKILL.md-touching tools reach the binary.
   const tool = String(event.tool ?? "")
   const input = event.input ?? {}
@@ -104,7 +137,7 @@ async function detectLoad(event: any): Promise<Record<string, any> | null> {
   const isSkillTool = tool.toLowerCase() === "skill"
   const touches = inputJson.includes("SKILL.md") ||
     (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
-  if (!isSkillTool && !touches) return null
+  if (!isSkillTool && !touches) return []
 
   const payload = {
     tool_name: tool,
@@ -122,11 +155,21 @@ async function detectLoad(event: any): Promise<Record<string, any> | null> {
     const out = await new Response(proc.stdout).text()
     await proc.exited
     const trimmed = out.trim()
-    if (!trimmed) return null
-    return JSON.parse(trimmed)
+    if (!trimmed) return []
+    // `detect` emits one JSON object per line (a payload may touch
+    // several SKILL.md files); parse each line independently.
+    const events: Record<string, any>[] = []
+    for (const line of trimmed.split("\n")) {
+      try {
+        events.push(JSON.parse(line))
+      } catch {
+        dbg("detect: unparseable line: " + line.slice(0, 120))
+      }
+    }
+    return events
   } catch (e) {
     dbg("detect failed: " + e)
-    return null
+    return []
   }
 }
 
@@ -141,9 +184,26 @@ export default Plugin.define({
 
     const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
       if (!names.length) return
+      if (!pending.has(sessionID) && pending.size >= MAX_PENDING_SESSIONS) {
+        // FIFO-evict the oldest session; its queued context is dropped.
+        const oldest = pending.keys().next().value
+        if (oldest !== undefined) pending.delete(oldest)
+      }
       const list = pending.get(sessionID) ?? []
       list.push({ kind, names })
       pending.set(sessionID, list)
+    }
+
+    // Session continuity parity with the Rust hook (issue #128): names a
+    // session's prompt mode surfaced become context for later skill-load
+    // dependency lookups. Bounded like `pending`.
+    const rememberSession = (sessionID: string, names: string[]) => {
+      if (!names.length) return
+      if (!sessionCtx.has(sessionID) && sessionCtx.size >= MAX_SESSION_CTX) {
+        const oldest = sessionCtx.keys().next().value
+        if (oldest !== undefined) sessionCtx.delete(oldest)
+      }
+      sessionCtx.set(sessionID, names)
     }
 
     await ctx.session.hook("prompt", async (event) => {
@@ -173,12 +233,17 @@ export default Plugin.define({
           }
         }
       }
-      const key = `${sessionID}:${text.length}:${text.slice(0, 64)}`
+      const key = sha256(`${sessionID}\n${text}`)
       if (emitted.has(key)) return
+      if (emitted.size >= MAX_EMITTED) {
+        const oldest = emitted.values().next().value
+        if (oldest !== undefined) emitted.delete(oldest)
+      }
       emitted.add(key)
       const recs = await recommendNames(text, 3).catch(() => [])
       // recommended[] must equal the injected set for funnel integrity.
       const names = recs.map((r) => r.name)
+      rememberSession(sessionID, names)
       emit({
         ...base("recommendation"),
         session_id: sessionID,
@@ -196,27 +261,36 @@ export default Plugin.define({
 
     await ctx.tool.hook("execute.after", async (event) => {
       const detected = await detectLoad(event)
-      if (!detected) return
-      emit(detected)
-      const detection = detected.detection as string | undefined
-      const skillName = detected.skill_name as string | undefined
-      const sessionID = (event.sessionID ?? detected.session_id ?? "unknown") as string
-      if (!skillName || !DEP_TRIGGER.has(detection ?? "")) return
+      if (!detected.length) return
+      const sessionID = (event.sessionID ?? "unknown") as string
+      for (const det of detected) {
+        emit(det)
+        const detection = det.detection as string | undefined
+        const skillName = det.skill_name as string | undefined
+        if (!skillName || !DEP_TRIGGER.has(detection ?? "")) continue
 
-      // Dependency lookup for the just-loaded skill (same contract as the
-      // shell adapters' skill-load mode).
-      const deps = await recommendNames(skillName, 5).catch(() => [])
-      const injected = deps.filter((d) => d.name !== skillName).slice(0, 3)
-      const names = injected.map((r) => r.name)
-      emit({
-        ...base("recommendation"),
-        session_id: sessionID,
-        trigger: "skill_load",
-        recommended: injected,
-        emitted: names.length > 0,
-        reason: names.length > 0 ? "recommended" : "no_recommendations",
-      })
-      if (names.length > 0) queue(sessionID, "deps", names)
+        // Dependency lookup for the just-loaded skill (same contract as
+        // the shell adapters' skill-load mode, including session-context
+        // continuity). recommended[] records exactly the injected set
+        // for funnel integrity.
+        const sessionNames = sessionCtx.get(sessionID) ?? []
+        const deps = await recommendNames(
+          skillName,
+          5,
+          sessionNames.join(" "),
+        ).catch(() => [])
+        const injected = deps.filter((d) => d.name !== skillName).slice(0, 3)
+        const names = injected.map((r) => r.name)
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: "skill_load",
+          recommended: injected,
+          emitted: names.length > 0,
+          reason: names.length > 0 ? "recommended" : "no_recommendations",
+        })
+        if (names.length > 0) queue(sessionID, "deps", names)
+      }
     })
 
     await ctx.session.hook("context", (event) => {
