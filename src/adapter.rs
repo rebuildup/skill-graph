@@ -521,19 +521,18 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     // {}, and tolerate an unreadable/missing overlay.
     if args.runtime == Runtime::ClaudeCode && args.scope == Scope::User {
         let overlay = dotfiles_overlay();
-        if overlay.exists() || overlay.is_symlink() {
-            if let Ok(mut config) = read_config(&overlay) {
-                if config.is_object() {
-                    strip_our_hooks(&mut config);
-                    if let Err(e) = write_json(&overlay, &config) {
-                        eprintln!(
-                            "warning: could not clean dotfiles overlay {}: {e}",
-                            overlay.display()
-                        );
-                    } else {
-                        println!("cleaned dotfiles overlay: {}", overlay.display());
-                    }
-                }
+        if (overlay.exists() || overlay.is_symlink())
+            && let Ok(mut config) = read_config(&overlay)
+            && config.is_object()
+        {
+            strip_our_hooks(&mut config);
+            if let Err(e) = write_json(&overlay, &config) {
+                eprintln!(
+                    "warning: could not clean dotfiles overlay {}: {e}",
+                    overlay.display()
+                );
+            } else {
+                println!("cleaned dotfiles overlay: {}", overlay.display());
             }
         }
     }
