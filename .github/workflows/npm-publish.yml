@@ -64,7 +64,8 @@ jobs:
           # release assets to appear.
           mkdir -p dist
           for i in $(seq 1 60); do
-            if gh release download "$RELEASE_TAG" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber 2>/dev/null; then
+            if gh release download "$RELEASE_TAG" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber 2>/dev/null \
+              && gh release download "$RELEASE_TAG" --pattern 'sha256sums.txt' --dir dist --clobber 2>/dev/null; then
               break
             fi
             if [ "$i" = "60" ]; then
