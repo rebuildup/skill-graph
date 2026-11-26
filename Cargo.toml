@@ -1,9 +1,12 @@
 [package]
 name = "skill-graph"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 description = "Agent-agnostic discovery, resolution, and recommendation for installed Agent Skills"
+repository = "https://github.com/rebuildup/skill-graph"
+keywords = ["agent-skills", "cli", "recommendation"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
