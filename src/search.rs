@@ -1,6 +1,7 @@
 use crate::model::{LinkKind, Recommendation};
 use crate::resolver::Graph;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 struct Evidence {
     direct: f64,
@@ -64,14 +65,14 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // substring they were derived from, so admission can tell independent
     // evidence from one substring's bigram+gloss cluster (#78).
     let query_tagged = terms_tagged(&query);
-    let query_tagged: Vec<(String, String)> =
+    let query_tagged: Vec<(String, Rc<str>)> =
         query_tagged.into_iter().take(MAX_RECOMMEND_TERMS).collect();
     let query_terms: Vec<String> = query_tagged.iter().map(|(t, _)| t.clone()).collect();
     let query_sources = term_sources(&query_tagged);
     // Context terms carry provenance too: a single CJK run's bigram
     // cluster must not satisfy context admission by itself, same rule
     // as description admission (#144 round-10).
-    let context_tagged: Vec<(String, String)> = terms_tagged(&context)
+    let context_tagged: Vec<(String, Rc<str>)> = terms_tagged(&context)
         .into_iter()
         .take(MAX_RECOMMEND_TERMS)
         .collect();
@@ -303,7 +304,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 .iter()
                 .chain(&info.description_hits)
                 .chain(&info.context_hits)
-                .map(String::as_str)
+                .map(|s| &**s)
         })
         .collect();
     let document_frequency = document_frequency(
@@ -330,8 +331,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     for (index, info) in infos.iter().enumerate() {
         // An exact name match is the strongest possible signal and admits
         // even names too short to survive term extraction (e.g. a 1-char
-        // ASCII name produces no query terms at all).
-        let exact_name = !query.is_empty() && skill_names[index] == query;
+        // ASCII name produces no query terms at all). Parse-error skills
+        // never admit on ANY path — otherwise a malformed skill could
+        // still seed requires-propagation (#144 r13).
+        let exact_name = !query.is_empty()
+            && graph.skills[index].parse_error.is_none()
+            && skill_names[index] == query;
         if exact_name
             || info.as_ref().is_some_and(|info| {
                 directly_admitted(
@@ -491,8 +496,8 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
 fn directly_admitted(
     info: &Evidence,
-    query_sources: &HashMap<String, String>,
-    context_sources: &HashMap<String, String>,
+    query_sources: &HashMap<String, Rc<str>>,
+    context_sources: &HashMap<String, Rc<str>>,
     document_frequency: &HashMap<String, usize>,
     df_bound: usize,
 ) -> bool {
@@ -522,7 +527,7 @@ fn directly_admitted(
         .map(|term| {
             query_sources
                 .get(term)
-                .map(String::as_str)
+                .map(|s| &**s)
                 .unwrap_or(term.as_str())
         })
         .collect();
@@ -538,7 +543,7 @@ fn directly_admitted(
         .map(|term| {
             context_sources
                 .get(term)
-                .map(String::as_str)
+                .map(|s| &**s)
                 .unwrap_or(term.as_str())
         })
         .collect();
@@ -851,8 +856,11 @@ fn terms(text: &str) -> Vec<String> {
 }
 
 // term -> provenance source. Glossary-derived terms share the CJK key they
-// came from; all other terms are their own source.
-fn term_sources(tagged: &[(String, String)]) -> HashMap<String, String> {
+// came from; all other terms are their own source. Sources are Rc-shared:
+// a 32K-char CJK run emits ~32K bigrams that all point at the SAME run/gap
+// source, so cloning the source string per term would be O(run²) memory
+// before MAX_RECOMMEND_TERMS ever applies (#144 r13).
+fn term_sources(tagged: &[(String, Rc<str>)]) -> HashMap<String, Rc<str>> {
     let mut sources = HashMap::new();
     for (term, source) in tagged {
         sources
@@ -862,15 +870,15 @@ fn term_sources(tagged: &[(String, String)]) -> HashMap<String, String> {
     sources
 }
 
-fn terms_tagged(text: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+fn terms_tagged(text: &str) -> Vec<(String, Rc<str>)> {
+    let mut out: Vec<(String, Rc<str>)> = Vec::new();
     let mut ascii_run = String::new();
     let mut cjk_run = String::new();
     let mut flush = |ascii: &mut String, cjk: &mut String| {
         if ascii.chars().count() >= 2 {
             let lower = ascii.to_lowercase();
             if !STOPWORDS.contains(&lower.as_str()) {
-                out.push((lower.clone(), lower));
+                out.push((lower.clone(), Rc::from(lower.as_str())));
             }
         }
         ascii.clear();
@@ -889,6 +897,9 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // distinct dictionary words or contentful gaps in one run
         // remain independent (#144).
         let run: String = cjk.chars().collect();
+        // Interned once per run: every bigram in a keyless run shares
+        // this single allocation instead of cloning ~96KB per term.
+        let run_src: Rc<str> = Rc::from(run.as_str());
         let gloss = gloss_terms(&run);
         // Coverage keys come from GLOSS membership, NOT from gloss_terms
         // output: term-level dedup can hide a key whose expansions were
@@ -959,7 +970,7 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // Each contentful gap is itself a single evidence unit, so
         // `不具合報告をトリアージして` yields key + gap = two sources.
         let mut gap_of = vec![usize::MAX; chars.len()];
-        let mut gap_text: Vec<String> = Vec::new();
+        let mut gap_text: Vec<Rc<str>> = Vec::new();
         let mut gap_contentful: Vec<bool> = Vec::new();
         {
             let mut i = 0;
@@ -979,7 +990,7 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
                     i += 1;
                 }
                 let id = gap_text.len();
-                gap_text.push(text);
+                gap_text.push(Rc::from(text.as_str()));
                 gap_contentful.push(contentful);
                 for slot in gap_of.iter_mut().take(i).skip(start) {
                     *slot = id;
@@ -997,11 +1008,11 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
                 && cover_key[w] == cover_key[w + 1]
                 && keys[cover_key[w] as usize].contains(bigram.as_str())
             {
-                out.push((bigram, keys[cover_key[w] as usize].to_string()));
+                out.push((bigram, Rc::from(keys[cover_key[w] as usize])));
             } else if keys.is_empty() {
                 // Only a run with NO recognized dictionary word falls
                 // back to run-level provenance.
-                out.push((bigram, run.clone()));
+                out.push((bigram, run_src.clone()));
             } else if cover_key[w] < 0
                 && cover_key[w + 1] < 0
                 && gap_of[w] == gap_of[w + 1]
@@ -1027,7 +1038,7 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
                     .get(key.as_str())
                     .map(|&ki| keys[effective_key[ki]])
                     .unwrap_or(key.as_str());
-                out.push((gloss, source.to_string()));
+                out.push((gloss, Rc::from(source)));
             }
         }
         cjk.clear();
@@ -1064,7 +1075,7 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         || lower.contains("pull-request")
         || lower.contains("pull_request")
     {
-        out.push(("pr".to_string(), "pull-request".to_string()));
+        out.push(("pr".to_string(), Rc::from("pull-request")));
     }
     // Repeated terms would inflate hit counts and scores; keep first
     // occurrence of each term. Provenance prefers an explicitly typed
@@ -1072,11 +1083,11 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
     // run expands to "bug" and the user also typed "bug", the literal
     // term is independent evidence and must keep its own source (#144).
     let mut index_of: HashMap<String, usize> = HashMap::new();
-    let mut deduped: Vec<(String, String)> = Vec::with_capacity(out.len());
+    let mut deduped: Vec<(String, Rc<str>)> = Vec::with_capacity(out.len());
     for (term, source) in out {
         if let Some(&i) = index_of.get(&term) {
-            if source == term {
-                deduped[i].1 = term.clone();
+            if source.as_ref() == term {
+                deduped[i].1 = Rc::from(term.as_str());
             }
             continue;
         }
@@ -1501,19 +1512,19 @@ mod tests {
         // stay independent. Boundary-spanning bigrams and pure-hiragana
         // gaps are dropped entirely — giving them run-level provenance
         // would recreate the `レビューする` self-admission hole.
-        assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
+        assert_eq!(sources.get("文章").map(|s| &**s), Some("文章"));
         assert_eq!(sources.get("章を"), None);
-        assert_eq!(sources.get("自然").map(String::as_str), Some("自然"));
+        assert_eq!(sources.get("自然").map(|s| &**s), Some("自然"));
         // A contentful gap is a single evidence unit: every bigram in
         // `報告をトリアージして` shares the gap text as its source.
         let tagged = terms_tagged("不具合報告をトリアージして");
         let gap_sources = term_sources(&tagged);
         let gap = "報告をトリアージして";
-        assert_eq!(gap_sources.get("報告").map(String::as_str), Some(gap));
-        assert_eq!(gap_sources.get("トリ").map(String::as_str), Some(gap));
-        assert_eq!(gap_sources.get("不具").map(String::as_str), Some("不具合"));
-        assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
-        assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
+        assert_eq!(gap_sources.get("報告").map(|s| &**s), Some(gap));
+        assert_eq!(gap_sources.get("トリ").map(|s| &**s), Some(gap));
+        assert_eq!(gap_sources.get("不具").map(|s| &**s), Some("不具合"));
+        assert_eq!(sources.get("prose").map(|s| &**s), Some("文章"));
+        assert_eq!(sources.get("natural").map(|s| &**s), Some("自然"));
     }
 
     /// #144 round-12 (CodeRabbit): a dictionary key fully contained in a
@@ -1527,16 +1538,16 @@ mod tests {
         let sources = term_sources(&tagged);
         // The bigram 原因 is covered by 根本原因; the gloss terms that
         // 原因 would emit (root, cause) must carry the SAME source.
-        assert_eq!(sources.get("原因").map(String::as_str), Some("根本原因"));
-        assert_eq!(sources.get("root").map(String::as_str), Some("根本原因"));
-        assert_eq!(sources.get("cause").map(String::as_str), Some("根本原因"));
+        assert_eq!(sources.get("原因").map(|s| &**s), Some("根本原因"));
+        assert_eq!(sources.get("root").map(|s| &**s), Some("根本原因"));
+        assert_eq!(sources.get("cause").map(|s| &**s), Some("根本原因"));
         // A standalone 原因 elsewhere in the run is a genuinely
         // independent dictionary word and keeps its own source.
         let tagged = terms_tagged("根本原因と原因");
         let sources = term_sources(&tagged);
-        assert_eq!(sources.get("原因").map(String::as_str), Some("原因"));
-        assert_eq!(sources.get("root").map(String::as_str), Some("原因"));
-        assert_eq!(sources.get("根本").map(String::as_str), Some("根本原因"));
+        assert_eq!(sources.get("原因").map(|s| &**s), Some("原因"));
+        assert_eq!(sources.get("root").map(|s| &**s), Some("原因"));
+        assert_eq!(sources.get("根本").map(|s| &**s), Some("根本原因"));
     }
 
     #[test]

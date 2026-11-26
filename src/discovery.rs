@@ -223,6 +223,11 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                         + skill.description.len()
                         + skill.keywords.iter().map(|k| k.len()).sum::<usize>()
                         + skill
+                            .metadata
+                            .iter()
+                            .map(|(k, v)| k.len() + v.len())
+                            .sum::<usize>()
+                        + skill
                             .links
                             .iter()
                             .map(|l| l.target.len() + 64)

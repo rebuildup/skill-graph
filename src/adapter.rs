@@ -127,7 +127,11 @@ fn extra_overlay() -> Option<PathBuf> {
     if p.is_empty() {
         return None;
     }
-    Some(PathBuf::from(p))
+    // Same absolute-path policy as HOME/XDG env vars: a relative value
+    // would resolve against whatever cwd `adapter` happens to run in
+    // and clean_extra_overlay would rewrite that file (#144 r13).
+    let path = PathBuf::from(p);
+    path.is_absolute().then_some(path)
 }
 
 /// Absolute path to the skill-graph binary to embed in hook commands.
@@ -277,37 +281,63 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// End index of the first shell word in `s`, honoring single quotes.
-/// Sufficient for commands we emit via `sh_quote` plus plain paths.
+/// End index of the first shell word in `s`, honoring single and
+/// double quotes. Sufficient for commands we emit via `sh_quote` plus
+/// hand-edited configs that quote the binary path either way.
 fn first_shell_word(s: &str) -> Option<&str> {
     let b = s.as_bytes();
     if b.is_empty() {
         return None;
     }
     let mut i = 0;
-    let mut in_quote = false;
+    // 0 = normal, 1 = single-quoted, 2 = double-quoted.
+    let mut quote = 0u8;
     while i < b.len() {
-        match b[i] {
-            b'\'' => {
-                in_quote = !in_quote;
+        let c = b[i];
+        match quote {
+            1 => {
+                if c == b'\'' {
+                    quote = 0;
+                }
                 i += 1;
             }
-            // A trailing unquoted backslash would skip past the end;
-            // clamp so `&s[..i]` never slices out of bounds.
-            b'\\' if !in_quote => i = usize::min(i + 2, b.len()),
-            c if c.is_ascii_whitespace() && !in_quote => break,
-            _ => i += 1,
+            2 => {
+                if c == b'"' {
+                    quote = 0;
+                    i += 1;
+                } else if c == b'\\' {
+                    // Inside double quotes `\"` does not end the word.
+                    i = usize::min(i + 2, b.len());
+                } else {
+                    i += 1;
+                }
+            }
+            _ => match c {
+                b'\'' => {
+                    quote = 1;
+                    i += 1;
+                }
+                b'"' => {
+                    quote = 2;
+                    i += 1;
+                }
+                // A trailing unquoted backslash would skip past the end;
+                // clamp so `&s[..i]` never slices out of bounds.
+                b'\\' => i = usize::min(i + 2, b.len()),
+                c if c.is_ascii_whitespace() => break,
+                _ => i += 1,
+            },
         }
     }
     if i == 0 { None } else { Some(&s[..i]) }
 }
 
-/// Inverse of `sh_quote` for a single shell word: strips single quotes
-/// and resolves the `'\''` escape sequence back to a literal `'`.
-/// Char-based so non-ASCII paths round-trip correctly.
+/// Inverse of `sh_quote` for a single shell word: strips single and
+/// double quotes and resolves backslash escapes. Char-based so
+/// non-ASCII paths round-trip correctly.
 fn unquote_shell(word: &str) -> String {
     let mut out = String::new();
-    let mut chars = word.chars();
+    let mut chars = word.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '\'' => {
@@ -316,6 +346,23 @@ fn unquote_shell(word: &str) -> String {
                         break;
                     }
                     out.push(c2);
+                }
+            }
+            '"' => {
+                while let Some(c2) = chars.next() {
+                    match c2 {
+                        '"' => break,
+                        // Inside double quotes backslash escapes only
+                        // $ ` " \ and newline; elsewhere it is literal.
+                        '\\' => match chars.peek() {
+                            Some(&n) if matches!(n, '"' | '\\' | '$' | '`') => {
+                                out.push(n);
+                                chars.next();
+                            }
+                            _ => out.push('\\'),
+                        },
+                        _ => out.push(c2),
+                    }
                 }
             }
             '\\' => {
@@ -365,7 +412,10 @@ fn v040_hook_parts(command: &str) -> Option<(String, bool)> {
     let cmd = command.trim_start();
     let word = first_shell_word(cmd)?;
     let rest = cmd[word.len()..].trim_start();
-    let t: Vec<&str> = rest.split_whitespace().collect();
+    // Quote-aware split: a hand-edited `hook "claude-code" prompt` must
+    // parse the same as the unquoted form we emit.
+    let words = shell_words(rest);
+    let t: Vec<&str> = words.iter().map(|w| w.text.as_str()).collect();
     let marked = match t.as_slice() {
         ["hook", rt, mode] if is_hook_runtime_mode(rt, mode) => false,
         ["hook", rt, mode, "#", "skill-graph-managed"] if is_hook_runtime_mode(rt, mode) => true,

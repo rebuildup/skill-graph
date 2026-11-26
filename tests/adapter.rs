@@ -1219,3 +1219,45 @@ fn invalid_utf8_config_is_rejected_not_rewritten() {
         "config must be untouched"
     );
 }
+
+/// Round-13: hand-edited configs may double-quote the binary path or
+/// hook arguments; ownership detection must still claim the command.
+#[test]
+fn double_quoted_v040_hook_command_is_ours() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"\"/x/bin/skill-graph\" hook \"claude-code\" prompt"}]}]}}"#;
+    std::fs::write(&path, body).unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    if path.exists() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("skill-graph"), "{text}");
+    }
+}
+
+/// Round-13: SKILL_GRAPH_EXTRA_OVERLAY must be absolute like the other
+/// env paths — a relative value resolves against the caller's cwd and
+/// must be ignored rather than rewritten.
+#[test]
+fn relative_extra_overlay_is_ignored() {
+    let f = Fixture::new();
+    f.seed("claude-code", "--user");
+    let overlay = f.proj.path().join("overlay.json");
+    std::fs::write(
+        &overlay,
+        r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"/x/bin/skill-graph hook claude-code prompt"}]}]}}"#,
+    )
+    .unwrap();
+    let (_, rc) = f.run_env(
+        &["adapter", "enable", "claude-code", "--user"],
+        &[("SKILL_GRAPH_EXTRA_OVERLAY", "overlay.json")],
+    );
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&overlay).unwrap();
+    assert!(
+        text.contains("skill-graph"),
+        "relative overlay path must be ignored: {text}"
+    );
+}

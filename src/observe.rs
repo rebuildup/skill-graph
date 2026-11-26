@@ -28,6 +28,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Serialize)]
@@ -40,7 +41,8 @@ pub struct Observation {
     pub loads: Vec<SkillLoad>,
     /// Normalized Skill Usage Events across all detected runtimes.
     pub events: Vec<SkillUsageEvent>,
-    /// skill_load event count per runtime (`claude-code`, `codex`, `opencode`).
+    /// Load-grade event count per runtime (`claude-code`, `codex`,
+    /// `opencode`); `mention`-level detections are excluded.
     pub runtimes: BTreeMap<String, usize>,
     /// Non-fatal per-file/per-table problems (missing tables, unreadable
     /// files, unsupported schema drift).
@@ -56,9 +58,13 @@ pub struct Observation {
     /// accurate; only retained detail is dropped past the budget.
     #[serde(skip)]
     pub retained_bytes: usize,
-    /// Byte length of the observable file currently being scanned —
-    /// SkillLoad.file is backfilled after the scan, so the retained-
-    /// bytes estimate charges this up front instead of undercounting.
+    /// Set once the skill_loads name-cardinality cap notices truncation.
+    #[serde(skip)]
+    pub skill_loads_truncated: bool,
+    /// Display length of the observable file path currently being
+    /// scanned — SkillLoad.file is backfilled after the scan, so the
+    /// retained-bytes estimate charges this up front instead of
+    /// undercounting.
     #[serde(skip)]
     pub current_file_len: usize,
 }
@@ -79,7 +85,7 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
     files.sort();
     let mut obs = Observation::default();
     obs.errors.extend(collect_errors);
-    let mut sessions = BTreeSet::new();
+    let mut sessions = SessionSet::default();
     for file in files {
         obs.files_scanned += 1;
         obs.current_file_len = file.display().to_string().len();
@@ -113,8 +119,42 @@ pub fn observe_path(path: &Path) -> Result<Observation, String> {
             load.file = file.display().to_string();
         }
     }
-    obs.sessions = sessions.len();
+    obs.sessions = sessions.hashes.len();
+    if sessions.truncated {
+        obs.errors
+            .push("distinct session ids truncated at cardinality cap".to_string());
+    }
     Ok(obs)
+}
+
+/// Distinct session-id counter behind the summary `sessions` field.
+/// Only distinctness matters, so ids are hashed rather than retained —
+/// a transcript line carrying a 200 MB sessionId must not pin that many
+/// bytes for the whole scan (#144 r13). Cardinality is capped: past the
+/// cap new ids are ignored and `truncated` is set.
+#[derive(Default)]
+struct SessionSet {
+    hashes: std::collections::HashSet<u64>,
+    truncated: bool,
+}
+
+const MAX_OBSERVE_SESSIONS: usize = 1_000_000;
+
+impl SessionSet {
+    fn insert(&mut self, id: &str) {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        id.hash(&mut h);
+        let h = h.finish();
+        if self.hashes.contains(&h) {
+            return;
+        }
+        if self.hashes.len() >= MAX_OBSERVE_SESSIONS {
+            self.truncated = true;
+            return;
+        }
+        self.hashes.insert(h);
+    }
 }
 
 /// Best-effort session identifier on any parsed record, used only for the
@@ -348,12 +388,42 @@ fn push_observable(
 /// anything beyond this into memory.
 const MAX_OBSERVE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Per-record JSON bound. `serde_json::Value` retains ~16-30x its input
+/// size, so the 256 MiB file cap alone would let ONE crafted line
+/// (`[0,0,…]` ≈ 134M elements) materialize gigabytes. Legitimate
+/// transcript records are KB-scale; oversized lines are skipped.
+const MAX_OBSERVE_LINE_BYTES: usize = 4 * 1024 * 1024;
+
 fn observe_jsonl(
     file: &Path,
     obs: &mut Observation,
-    sessions: &mut BTreeSet<String>,
+    sessions: &mut SessionSet,
 ) -> Result<(), String> {
-    let content = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    // The collect-time is_file()/size checks are TOCTOU: re-verify on
+    // the opened fd (O_NONBLOCK + O_NOFOLLOW so a FIFO swap cannot hang
+    // or redirect the read) and bound the read itself so a file that
+    // grows past the cap after metadata() cannot be slurped whole.
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let handle = opts
+        .open(file)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if !handle.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err(format!("{}: not a regular file", file.display()));
+    }
+    let mut content = String::new();
+    handle
+        .take(MAX_OBSERVE_FILE_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|e| format!("{}: {e}", file.display()))?;
+    if content.len() as u64 > MAX_OBSERVE_FILE_BYTES {
+        return Err(format!("{}: file too large", file.display()));
+    }
     let mut claude = ClaudeScan::default();
     let mut codex = CodexScan::default();
     for line in content.lines() {
@@ -361,12 +431,16 @@ fn observe_jsonl(
         if line.is_empty() {
             continue;
         }
+        if line.len() > MAX_OBSERVE_LINE_BYTES {
+            obs.lines_skipped += 1;
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<Value>(line) else {
             obs.lines_skipped += 1;
             continue;
         };
         if let Some(sid) = line_session_id(&value) {
-            sessions.insert(sid);
+            sessions.insert(&sid);
         }
         if try_passthrough_event(&value, obs) {
             continue;
@@ -560,6 +634,7 @@ fn event_retained_bytes(e: &SkillUsageEvent) -> usize {
         &e.skill_name,
         &e.skill_path,
         &e.skill_digest,
+        &e.tool,
     ] {
         n += s.as_deref().map_or(0, str::len);
     }
@@ -618,7 +693,21 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
             .entry(event.runtime.as_str().to_string())
             .or_default() += 1;
         if let Some(name) = &event.skill_name {
-            *obs.skill_loads.entry(name.clone()).or_default() += 1;
+            // The counter map keys on skill names that need not exist in
+            // any discovered corpus, so its cardinality is bounded
+            // separately from the retained detail: past the cap new
+            // names stop being counted (existing names still are) and a
+            // single latched notice records the truncation (#144 r13).
+            const MAX_OBSERVE_SKILL_NAMES: usize = 65_536;
+            if obs.skill_loads.contains_key(name) {
+                *obs.skill_loads.get_mut(name).unwrap() += 1;
+            } else if obs.skill_loads.len() < MAX_OBSERVE_SKILL_NAMES {
+                obs.skill_loads.insert(name.clone(), 1);
+            } else if !obs.skill_loads_truncated {
+                obs.skill_loads_truncated = true;
+                obs.errors
+                    .push("skill_loads name cardinality truncated".to_string());
+            }
             if under_cap(
                 obs.loads.len(),
                 MAX_OBSERVE_LOADS,
@@ -1069,6 +1158,13 @@ impl CodexScan {
                 text,
             ));
         }
+        // A captured tool output's frontmatter belongs to exactly one
+        // file: the first Read across ALL records sharing a call_id —
+        // pending and overflow alike — may claim it. Crafted rollouts
+        // can repeat call_ids; without this each would verify the same
+        // output into a separate file_read event (#144 r13).
+        let mut frontmatter_consumed: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         for pending in &self.pending {
             let output = self
                 .outputs
@@ -1082,9 +1178,11 @@ impl CodexScan {
             for (path, access) in &pending.accesses {
                 let c = match access {
                     events::Access::Read => {
-                        let verify = frontmatter_available;
+                        let verify = frontmatter_available
+                            && !frontmatter_consumed.contains(pending.call_id.as_str());
                         frontmatter_available = false;
                         if verify {
+                            frontmatter_consumed.insert(pending.call_id.as_str());
                             classify_with_output(path, output)
                         } else {
                             events::LoadClassification {
@@ -1120,8 +1218,10 @@ impl CodexScan {
         // funnel, and the retained-events budget treat them identically.
         for ov in &self.overflow {
             // Only the call's first Read may claim the captured output's
-            // frontmatter — same rule as the pending path.
-            let output = if ov.first_read {
+            // frontmatter — same rule as the pending path, shared across
+            // duplicate call_ids via `frontmatter_consumed`.
+            let may_claim = ov.first_read && !frontmatter_consumed.contains(ov.call_id.as_str());
+            let output = if may_claim {
                 self.outputs
                     .get(&ov.call_id)
                     .map(String::as_str)
@@ -1130,14 +1230,17 @@ impl CodexScan {
                 ""
             };
             let (name, detection, confidence) = match ov.access {
-                events::Access::Read if ov.first_read => match events::frontmatter_name(output) {
-                    Some(n) => (Some(n), Detection::FileRead, Confidence::High),
-                    None => (
-                        ov.name_hint.clone(),
-                        Detection::PathReference,
-                        Confidence::Medium,
-                    ),
-                },
+                events::Access::Read if may_claim => {
+                    frontmatter_consumed.insert(ov.call_id.as_str());
+                    match events::frontmatter_name(output) {
+                        Some(n) => (Some(n), Detection::FileRead, Confidence::High),
+                        None => (
+                            ov.name_hint.clone(),
+                            Detection::PathReference,
+                            Confidence::Medium,
+                        ),
+                    }
+                }
                 events::Access::Read => (
                     ov.name_hint.clone(),
                     Detection::PathReference,
@@ -1270,11 +1373,7 @@ fn parse_injected_recommendation(
 // OpenCode opencode.db (SQLite, read-only)
 // ---------------------------------------------------------------------------
 
-fn observe_db(
-    file: &Path,
-    obs: &mut Observation,
-    sessions: &mut BTreeSet<String>,
-) -> Result<(), String> {
+fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> Result<(), String> {
     let conn = open_sqlite_readonly(file)?;
     // Schema drift tolerance: the table may not exist in older/newer builds.
     let has_table: i64 = conn
@@ -1318,7 +1417,11 @@ fn observe_db(
             obs.lines_skipped += 1;
             continue;
         };
-        sessions.insert(session_id.clone());
+        sessions.insert(&session_id);
+        if data.len() > MAX_OBSERVE_LINE_BYTES {
+            obs.lines_skipped += 1;
+            continue;
+        }
         let Ok(value) = serde_json::from_str::<Value>(&data) else {
             obs.lines_skipped += 1;
             continue;
@@ -1775,6 +1878,13 @@ fn session_funnel(
             .push(li);
     }
     let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    // A recommendation with an unparseable timestamp sorts last but
+    // falls back to encounter-order eligibility (`li > ri`), which can
+    // still admit a load that timestamp-kills already discarded for
+    // earlier recs. When any rec lacks a timestamp, disable timestamp-
+    // based cursor kills for the whole session; consumed-load kills stay
+    // valid and the checks_left budget bounds the extra scans (#144 r13).
+    let mixed_ts = recs.iter().any(|&ri| timestamps[&ri].is_none());
     'recs: for &ri in &recs {
         if consumed.len() == loads.len() {
             break;
@@ -1798,13 +1908,16 @@ fn session_funnel(
             };
             // Advance the cursor past loads that are dead for this and
             // every later rec: consumed, or timestamped strictly before
-            // rec_ts (rec timestamps are non-decreasing).
+            // rec_ts (rec timestamps are non-decreasing). Timestamp
+            // kills are unsafe when the session mixes untimestamped
+            // recs — see `mixed_ts` above.
             while nl.cursor < nl.list.len() {
                 let li = nl.list[nl.cursor];
-                let dead = match (rec_ts, timestamps[&li]) {
-                    (Some(a), Some(b)) => b < a,
-                    _ => false,
-                };
+                let dead = !mixed_ts
+                    && match (rec_ts, timestamps[&li]) {
+                        (Some(a), Some(b)) => b < a,
+                        _ => false,
+                    };
                 if consumed.contains(&li) || dead {
                     nl.cursor += 1;
                 } else {

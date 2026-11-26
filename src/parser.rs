@@ -203,11 +203,27 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
         .description
         .map(|d| clean_description(&d))
         .unwrap_or_default();
-    let metadata: HashMap<String, String> = meta
-        .metadata
-        .into_iter()
-        .filter_map(|(k, v)| yaml_text(&v).map(|t| (k, t)))
-        .collect();
+    // metadata is untrusted frontmatter: a 1 MiB `metadata:` block of
+    // tiny scalars yields ~200K map entries (~10-20 MB retained) that the
+    // discovery byte budget never sees (#144 r13). Bound cardinality,
+    // per-value length, and total chars; only requires-* keys are ever
+    // consumed downstream, and legitimate values are far smaller.
+    const MAX_METADATA_ENTRIES: usize = 128;
+    const MAX_METADATA_VALUE_CHARS: usize = 1024;
+    const MAX_METADATA_TOTAL_CHARS: usize = 8 * 1024;
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    let mut metadata_budget = MAX_METADATA_TOTAL_CHARS;
+    for (k, v) in meta.metadata.into_iter() {
+        if metadata.len() >= MAX_METADATA_ENTRIES || metadata_budget == 0 {
+            break;
+        }
+        let Some(t) = yaml_text(&v) else {
+            continue;
+        };
+        let t: String = t.chars().take(MAX_METADATA_VALUE_CHARS).collect();
+        metadata_budget = metadata_budget.saturating_sub(k.len() + t.len());
+        metadata.insert(k, t);
+    }
 
     // Bound link-derived strings: targets flow verbatim into
     // Recommendation.reasons, so an unbounded dest_url would let one
@@ -410,6 +426,20 @@ mod tests {
         );
         let skill = parse_skill(&path, dir.path()).unwrap();
         assert_eq!(skill.keywords[0].chars().count(), 128);
+    }
+
+    #[test]
+    fn metadata_map_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        // ~200 tiny entries would retain ~200 map entries unbounded
+        // before the r13 cap; legitimate frontmatter stays far below.
+        let entries: String = (0..200).map(|i| format!("  k{i}: v{i}\n")).collect();
+        let path = write_skill(
+            &dir.path().join("meta-skill"),
+            &format!("name: meta-skill\ndescription: d\nmetadata:\n{entries}"),
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(skill.metadata.len() <= 128, "{}", skill.metadata.len());
     }
 
     #[test]

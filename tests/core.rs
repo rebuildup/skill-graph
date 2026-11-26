@@ -419,3 +419,32 @@ fn cjk_key_plus_particle_cannot_self_admit() {
         "independent second source should admit: {recs:?}"
     );
 }
+
+/// Round-13: a parse-error skill must never admit — including via the
+/// exact-name path — so it cannot seed requires-propagation for a
+/// dependency it declares.
+#[test]
+fn parse_error_skill_cannot_seed_requires() {
+    let temp = tempfile::tempdir().unwrap();
+    // Dir fallback yields the valid name "bad-deploy" while the
+    // frontmatter name violates the spec charset -> parse_error set.
+    let bad = temp.path().join("bad-deploy");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(
+        bad.join("SKILL.md"),
+        "---\nname: \"bad\\ndeploy\"\ndescription: d\nmetadata:\n  requires-skills: victim-skill\n---\n\nbody\n",
+    )
+    .unwrap();
+    write_skill_md(
+        &temp.path().join("victim-skill"),
+        "victim-skill",
+        "Use for victim work.",
+    );
+    let graph = build(discover(&[temp.path().to_path_buf()]));
+    assert!(graph.skills.iter().any(|s| s.parse_error.is_some()));
+    let recs = recommend(&graph, "bad-deploy", "", 5);
+    assert!(
+        recs.iter().all(|r| r.skill.name != "victim-skill"),
+        "parse-error skill must not admit its requires target: {recs:?}"
+    );
+}
