@@ -28,7 +28,7 @@
 ## 実装境界
 
 - 初期実装はオンメモリの Discovery / Parser / Resolver / Recommendation に限定する。
-- 永続キャッシュ、グラフDB、Embedding、常駐サービス、MCP Server は効果実証前に追加しない。
+- 永続キャッシュ、グラフDB、Embedding、常駐サービスは v1.0.0 spec §6 の判定により不採用。MCP Server は ADR-0005 / v1.0.0 spec §1 により read-only stdio server として採用済み。
 - CLI / Hook / Plugin は共通エンジンへの薄い入口として設計する。
 - PATH 登録、グローバルインストール、shell 起動ファイル変更を前提にしない。
 
