@@ -52,6 +52,10 @@ fn contract_schemas_are_valid_json() {
             "resolve-result",
             include_str!("../contracts/v1/resolve-result.schema.json"),
         ),
+        (
+            "skill-usage-event",
+            include_str!("../contracts/v1/skill-usage-event.schema.json"),
+        ),
     ] {
         let value: Value = serde_json::from_str(src).unwrap();
         assert!(
@@ -123,4 +127,100 @@ fn resolve_result_contract_covers_name_path_unresolved_and_ambiguity() {
     assert_eq!(ambiguous["kind"], "name");
     assert_eq!(ambiguous["ambiguous"], true);
     assert_eq!(ambiguous["skills"].as_array().unwrap().len(), 2);
+}
+
+// --- JSON Schema validation against contracts/v1/*.schema.json ---
+// The skill-* schemas reference skill-summary.schema.json by relative
+// $ref; the registry resolves it to the published $id base.
+
+const SKILL_SUMMARY_URI: &str = "https://skill-graph.local/contracts/v1/skill-summary.schema.json";
+
+fn assert_schema_valid(schema_src: &str, instance: &Value, label: &str) {
+    let schema: Value = serde_json::from_str(schema_src).unwrap();
+    let summary: Value =
+        serde_json::from_str(include_str!("../contracts/v1/skill-summary.schema.json")).unwrap();
+    let registry = jsonschema::Registry::new()
+        .add(SKILL_SUMMARY_URI, summary)
+        .expect("registry add")
+        .prepare()
+        .expect("registry prepare");
+    let validator = jsonschema::options()
+        .with_registry(&registry)
+        .build(&schema)
+        .unwrap_or_else(|e| panic!("{label}: schema compile failed: {e}"));
+    if let Err(errors) = validator.validate(instance) {
+        panic!("{label}: instance violates schema: {errors}");
+    }
+}
+
+#[test]
+fn contract_outputs_validate_against_schemas() {
+    let discovery = serde_json::to_value(output(&discover(&[fixture_root()]))).unwrap();
+    assert_schema_valid(
+        include_str!("../contracts/v1/discovery-output.schema.json"),
+        &discovery,
+        "discovery-output",
+    );
+
+    let graph = build(discover(&[fixture_root()]));
+    let recs = serde_json::to_value(recommend(&graph, "release notes changelog", "", 3)).unwrap();
+    assert_schema_valid(
+        include_str!("../contracts/v1/recommendation.schema.json"),
+        &recs,
+        "recommendation",
+    );
+
+    let resolved = serde_json::to_value(resolve_target(&graph, "alpha-skill")).unwrap();
+    assert_schema_valid(
+        include_str!("../contracts/v1/resolve-result.schema.json"),
+        &resolved,
+        "resolve-result",
+    );
+}
+
+#[test]
+fn skill_usage_events_validate_against_event_schema() {
+    use skill_graph::events::{
+        Confidence, Detection, ObservedVia, RecommendedSkill, Runtime, SkillUsageEvent, Trigger,
+    };
+    let schema = include_str!("../contracts/v1/skill-usage-event.schema.json");
+    let events = [
+        SkillUsageEvent::prompt_submit(
+            Runtime::ClaudeCode,
+            ObservedVia::Hook,
+            "s1",
+            "2026-01-01T00:00:00Z",
+            "hello",
+        ),
+        SkillUsageEvent::recommendation(
+            Runtime::Codex,
+            ObservedVia::Plugin,
+            "s1",
+            "2026-01-01T00:00:01Z",
+            None,
+            Trigger::SkillLoad,
+            vec![RecommendedSkill {
+                name: "alpha-skill".into(),
+                digest: Some("abc".into()),
+            }],
+            true,
+            "recommended",
+            Some(12),
+        ),
+        SkillUsageEvent::skill_load(
+            Runtime::Opencode,
+            ObservedVia::Transcript,
+            "s2",
+            "2026-01-01T00:00:02Z",
+            Some("Read".into()),
+            Some("beta-skill".into()),
+            Some("/x/SKILL.md".into()),
+            Detection::FileRead,
+            Confidence::High,
+        ),
+    ];
+    for e in &events {
+        let v = serde_json::to_value(e).unwrap();
+        assert_schema_valid(schema, &v, "skill-usage-event");
+    }
 }
