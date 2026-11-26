@@ -97,11 +97,14 @@ impl HookEnv {
             let _ = std::fs::rename(&self.event_log, rotated);
         }
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.event_log)
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut f) = opts.open(&self.event_log) {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -118,7 +121,14 @@ impl HookEnv {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::File::create(path);
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let _ = opts.open(path);
     }
 
     fn marker_path(&self, dedup_key: &str) -> PathBuf {
@@ -168,9 +178,32 @@ impl HookEnv {
         if let Some(parent) = self.recommended_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(self.recommended_path(), all.join("\n") + "\n");
+        if std::fs::write(self.recommended_path(), all.join("\n") + "\n").is_ok() {
+            restrict_perms(&self.recommended_path());
+        }
     }
 }
+
+/// Best-effort 0600 on files we create (event log, markers, session
+/// state). State lives under a shared TMPDIR, so it must not be
+/// world-readable even though contents are already minimized.
+#[cfg(unix)]
+fn restrict_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn restrict_perms(_path: &std::path::Path) {}
+
+#[cfg(unix)]
+fn restrict_dir_perms(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700));
+}
+
+#[cfg(not(unix))]
+fn restrict_dir_perms(_path: &std::path::Path) {}
 
 /// POSIX cksum (the algorithm the `cksum` command implements): MSB-first
 /// CRC, polynomial 0x04C11DB7, init 0; the input length is appended
@@ -365,18 +398,21 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     };
     let recommend_ms = start.elapsed().as_millis() as u64;
 
-    let names: Vec<&str> = recs
+    // recommended[] records exactly the set injected into context so
+    // observe --summary funnel counts stay truthful.
+    let injected: Vec<crate::model::Recommendation> = recs
         .iter()
-        .map(|r| r.skill.name.as_str())
-        .filter(|n| *n != skill_name.as_str())
+        .filter(|r| r.skill.name != skill_name)
         .take(3)
+        .cloned()
         .collect();
+    let names: Vec<&str> = injected.iter().map(|r| r.skill.name.as_str()).collect();
     if names.is_empty() {
         emit_recommendation(
             env,
             Trigger::SkillLoad,
             None,
-            &recs,
+            &[],
             false,
             "no_recommendations",
             Some(recommend_ms),
@@ -387,7 +423,7 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
         env,
         Trigger::SkillLoad,
         None,
-        &recs,
+        &injected,
         true,
         "recommended",
         Some(recommend_ms),
@@ -463,13 +499,16 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
     };
     let recommend_ms = start.elapsed().as_millis() as u64;
 
-    let names: Vec<&str> = recs.iter().take(3).map(|r| r.skill.name.as_str()).collect();
+    // recommended[] records exactly the injected top-3 so funnel counts
+    // in observe --summary match what the model actually saw.
+    let injected = &recs[..recs.len().min(3)];
+    let names: Vec<&str> = injected.iter().map(|r| r.skill.name.as_str()).collect();
     if names.is_empty() {
         emit_recommendation(
             env,
             Trigger::PromptSubmit,
             Some(phash.clone()),
-            &recs,
+            &[],
             false,
             "no_recommendations",
             Some(recommend_ms),
@@ -480,7 +519,7 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
         env,
         Trigger::PromptSubmit,
         Some(phash),
-        &recs,
+        injected,
         true,
         "recommended",
         Some(recommend_ms),
@@ -518,6 +557,7 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         // No state dir needed, but the event log is also skipped by log_event.
     } else {
         let _ = std::fs::create_dir_all(&env.state_dir);
+        restrict_dir_perms(&env.state_dir);
     }
 
     let response = match mode {
