@@ -70,13 +70,13 @@ if [ "$uninstall" = 1 ]; then
   tmp="$(mktemp_json)"
   # A config reduced to {} carries no information; remove it so uninstall
   # fully restores the pre-install state (no stray empty files).
-  finish_uninstall() {
-    if jq -e 'keys | length == 0' "$tmp" >/dev/null; then
-      rm -f "$hooks_file"
+  finish_uninstall() { # $1 = tmp file, $2 = target config file
+    if jq -e 'keys | length == 0' "$1" >/dev/null; then
+      rm -f "$2"
     else
-      mv "$tmp" "$hooks_file"
+      mv "$1" "$2"
     fi
-    rm -f "$tmp"
+    rm -f "$1"
   }
   if [ "$runtime" = opencode ]; then
     # Drop our plugin specifier, then prune an emptied plugins array.
@@ -84,7 +84,7 @@ if [ "$uninstall" = 1 ]; then
       .plugins = ((.plugins // []) | map(select(. != $p)))
       | if (.plugins | length) == 0 then del(.plugins) else . end
     ' "$hooks_file" > "$tmp"
-    finish_uninstall
+    finish_uninstall "$tmp" "$hooks_file"
     echo "uninstalled skill-graph plugin from $hooks_file"
     exit 0
   fi
@@ -97,8 +97,25 @@ if [ "$uninstall" = 1 ]; then
     ) | with_entries(select(.value | length > 0)))
     | if (.hooks | length) == 0 then del(.hooks) else . end
   ' "$hooks_file" > "$tmp"
-  finish_uninstall
+  finish_uninstall "$tmp" "$hooks_file"
   echo "uninstalled skill-graph hooks from $hooks_file"
+  # dotfiles-managed machines compose ~/.claude/settings.json from a
+  # machine-local overlay; hooks previously imported there would be
+  # regenerated on the next compose, so uninstall must clean it too.
+  if [ "$runtime" = claude-code ] && [ "$scope" = "--user" ]; then
+    overlay="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles/claude/settings.local.json"
+    if [ -f "$overlay" ]; then
+      tmp="$(mktemp_json)"
+      jq --arg m "$adapter_bin" '
+        .hooks = ((.hooks // {}) | with_entries(.value |=
+          map(.hooks = ((.hooks // []) | map(select(.command == null or ((.command | contains($m)) | not))))
+            | select((.hooks | length) > 0))
+        ) | with_entries(select(.value | length > 0)))
+        | if (.hooks | length) == 0 then del(.hooks) else . end
+      ' "$overlay" > "$tmp" && mv "$tmp" "$overlay" || rm -f "$tmp"
+      echo "uninstalled skill-graph hooks from $overlay"
+    fi
+  fi
   exit 0
 fi
 

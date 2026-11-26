@@ -19,6 +19,7 @@
 #   SKILL_GRAPH_EVENT_LOG  JSONL event log (default: ${TMPDIR}/skill-graph-events.jsonl)
 #   SKILL_GRAPH_HOOK_STATE dedup state dir (default: ${TMPDIR}/skill-graph-hook-state)
 #   SKILL_GRAPH_HOOK_NOSTATE=1  no-save mode: no markers, no event writes
+#   SKILL_GRAPH_EVENT_LOG_MAX   rotate event log above this many bytes (default 64MiB)
 set -uo pipefail
 
 mode="${1:-prompt}"
@@ -37,6 +38,10 @@ fi
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 session_id="$(printf '%s' "$input" | jq -r '.session_id // .sessionID // "unknown"' 2>/dev/null)"
 [ -n "$session_id" ] || session_id="unknown"
+# Session ids are runtime-provided strings; sanitize before using them in
+# marker filenames so a hostile id cannot escape the state dir.
+safe_sid="$(printf '%s' "$session_id" | tr -cd 'A-Za-z0-9._-' | cut -c1-128)"
+[ -n "$safe_sid" ] || safe_sid="unknown"
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -46,8 +51,20 @@ sha256() {
   fi
 }
 
+# Capacity bound: rotate the event log once it exceeds
+# SKILL_GRAPH_EVENT_LOG_MAX bytes (default 64 MiB). Single generation;
+# telemetry loss on rotation is acceptable (fail-open).
+event_log_max="${SKILL_GRAPH_EVENT_LOG_MAX:-67108864}"
+
 log_event() { # $1 = complete event JSON
   [ "$nostate" = "1" ] && return 0
+  local size=0
+  if [ -f "$event_log" ]; then
+    size="$(stat -c %s "$event_log" 2>/dev/null || stat -f %z "$event_log" 2>/dev/null || echo 0)"
+  fi
+  if [ "${size:-0}" -gt "$event_log_max" ] 2>/dev/null; then
+    mv -f "$event_log" "$event_log.1" 2>/dev/null || true
+  fi
   printf '%s\n' "$1" >> "$event_log" 2>/dev/null || true
 }
 
@@ -109,7 +126,7 @@ if [ "$mode" = "skill-load" ]; then
 
   # Dedup dependency recommendations per session+skill.
   dedup_key="skill:$skill_name"
-  marker="$state_dir/$session_id.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
+  marker="$state_dir/$safe_sid.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
   if [ "$nostate" != "1" ] && [ -e "$marker" ]; then
     emit_recommendation "skill_load" "" "[]" false "dedup_skip" 0
     exit 0
@@ -151,7 +168,7 @@ fi
 
 # Dedup: one emission per session+prompt-hash.
 dedup_key="prompt:$(printf '%s' "$query" | cksum | cut -d' ' -f1)"
-marker="$state_dir/$session_id.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
+marker="$state_dir/$safe_sid.$(printf '%s' "$dedup_key" | cksum | cut -d' ' -f1)"
 if [ "$nostate" != "1" ] && [ -e "$marker" ]; then
   emit_recommendation "prompt_submit" "$(sha256 "$query")" "[]" false "dedup_skip" 0
   exit 0
