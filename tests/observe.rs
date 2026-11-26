@@ -330,6 +330,53 @@ fn summary_computes_funnel_metrics() {
     assert!(v2["by_runtime"].get("claude-code").is_none());
 }
 
+/// Session ids are only unique within a runtime: the same id under
+/// claude-code and codex must not merge into one funnel session, and
+/// events with an empty session id count toward top-level counters but
+/// never join a session join (conversion/unnecessary).
+#[test]
+fn summary_isolates_sessions_across_runtimes() {
+    use skill_graph::events::Runtime;
+    use skill_graph::observe::{Observation, summary};
+
+    // claude-code "s1": emitted rec for alpha, then alpha loads -> converted.
+    // codex "s1": same ids but a load of beta with NO prior recommendation
+    // in that session -> unnecessary, and must not convert claude's rec.
+    let mut codex_load = load_event("s1", "2026-01-01T00:01:30Z", "beta");
+    codex_load.runtime = Runtime::Codex;
+    let obs = Observation {
+        events: vec![
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha"], true),
+            load_event("s1", "2026-01-01T00:01:00Z", "alpha"),
+            codex_load,
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["sessions"], 2, "runtime:session pairs are distinct");
+    assert_eq!(v["converted_recommendations"], 1);
+    assert_eq!(v["unnecessary_loads"], 1);
+    assert_eq!(
+        v["by_session"]["claude-code:s1"]["converted_recommendations"],
+        1
+    );
+    assert_eq!(v["by_session"]["codex:s1"]["unnecessary_loads"], 1);
+    assert_eq!(v["by_session"]["codex:s1"]["converted_recommendations"], 0);
+
+    // Empty session id: still counted at top level, absent from by_session.
+    let mut no_sid = load_event("", "2026-01-01T00:02:00Z", "gamma");
+    no_sid.session_id = String::new();
+    let obs2 = Observation {
+        events: vec![no_sid],
+        ..Default::default()
+    };
+    let v2 = summary(&obs2);
+    assert_eq!(v2["load_grade_loads"], 1);
+    assert_eq!(v2["sessions"], 0);
+    assert_eq!(v2["unnecessary_loads"], 0, "no session -> no join");
+    assert_eq!(v2["by_session"].as_object().unwrap().len(), 0);
+}
+
 #[cfg(unix)]
 #[test]
 fn observe_survives_symlink_cycle() {

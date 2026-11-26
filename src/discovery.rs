@@ -94,9 +94,10 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             continue;
         }
         let mut entries = WalkDir::new(&root).follow_links(false).into_iter();
-        let mut scanned = 0usize;
+        let mut consumed = 0usize;
         let mut walk_errors = 0usize;
         for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {
+            consumed += 1;
             if capacity_truncated {
                 break;
             }
@@ -118,7 +119,6 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                     continue;
                 }
             };
-            scanned += 1;
             if entry.file_type().is_symlink() || entry.file_name() != "SKILL.md" {
                 continue;
             }
@@ -147,7 +147,9 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 Err(err) => errors.push(err),
             }
         }
-        if scanned >= MAX_DISCOVER_ENTRIES && entries.next().is_some() {
+        // `consumed` counts every iterator item including walk errors;
+        // truncation is about consumed budget, not successfully read entries.
+        if consumed >= MAX_DISCOVER_ENTRIES && entries.next().is_some() {
             errors.push(format!(
                 "{}: entry scan truncated at {} entries",
                 root.display(),

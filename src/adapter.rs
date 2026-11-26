@@ -561,8 +561,12 @@ fn strip_our_plugins(config: &mut Value) {
         return;
     };
     if let Some(plugins) = obj.get_mut("plugins").and_then(Value::as_array_mut) {
+        let before = plugins.len();
         plugins.retain(|p| !is_our_plugin(p));
-        if plugins.is_empty() {
+        // Only drop the key when we actually removed our entries — a
+        // pre-existing empty `plugins: []` is foreign content (same
+        // invariant as strip_our_hooks).
+        if plugins.is_empty() && plugins.len() != before {
             obj.remove("plugins");
         }
     }
@@ -694,7 +698,6 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
 
     if args.runtime == Runtime::Opencode {
-        materialize_opencode_plugin()?;
         // Drop any prior skill-graph specifier (any generation), then append ours.
         strip_our_plugins(&mut config);
         let obj = config
@@ -704,6 +707,9 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         let arr = plugins
             .as_array_mut()
             .ok_or_else(|| format!("{}: \"plugins\" must be an array", path.display()))?;
+        // Materialize only after the config shape is validated — same
+        // resolve/validate-before-touch ordering as the hook path.
+        materialize_opencode_plugin()?;
         arr.push(json!(opencode_plugin_spec()));
     } else {
         strip_our_hooks(&mut config);

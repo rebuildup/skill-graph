@@ -634,7 +634,14 @@ pub fn extract_exec_commands(js: &str) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let bytes = js.as_bytes();
     let mut pos = 0usize;
-    while let Some(found) = find_subslice(&bytes[pos..], b"exec_command") {
+    // A payload can repeat `exec_command` millions of times; bound the
+    // number of occurrences inspected (events are capped separately).
+    const MAX_OCCURRENCES: usize = 256;
+    let mut occurrences = 0usize;
+    while occurrences < MAX_OCCURRENCES
+        && let Some(found) = find_subslice(&bytes[pos..], b"exec_command")
+    {
+        occurrences += 1;
         let base = pos + found;
         // Look for `cmd` then `:` then a quoted string within a window.
         let window_end = (base + 4096).min(bytes.len());
@@ -661,51 +668,57 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// by a single- or double-quoted string; return its unescaped contents.
 fn extract_cmd_param(window: &str) -> Option<String> {
     let bytes = window.as_bytes();
-    let mut pos = 0usize;
-    while pos + 3 < bytes.len() {
+    // Jump between `cmd` occurrences with memcmp-speed search instead of
+    // a per-byte scan; identifier-boundary checks run only on hits.
+    let mut search_from = 0usize;
+    while search_from + 3 <= bytes.len() {
+        let rel = find_subslice(&bytes[search_from..], b"cmd")?;
+        let pos = search_from + rel;
         // `cmd` must start at an identifier boundary so `{mycmd: ...}` or
         // `subcmd=` is not mistaken for the command parameter.
         let boundary = pos == 0
             || !(bytes[pos - 1].is_ascii_alphanumeric() || matches!(bytes[pos - 1], b'_' | b'$'));
-        if boundary && &bytes[pos..pos + 3] == b"cmd" {
-            let mut i = pos + 3;
+        if !boundary {
+            search_from = pos + 3;
+            continue;
+        }
+        let mut i = pos + 3;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'=') {
+            i += 1;
             while i < bytes.len() && (bytes[i] as char).is_whitespace() {
                 i += 1;
             }
-            if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'=') {
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
                 i += 1;
-                while i < bytes.len() && (bytes[i] as char).is_whitespace() {
-                    i += 1;
-                }
-                if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                    let quote = bytes[i];
-                    i += 1;
-                    let start = i;
-                    let mut result = String::new();
-                    while i < bytes.len() {
-                        let b = bytes[i];
-                        if b == quote {
-                            if start == i && result.is_empty() {
-                                return Some(String::new());
-                            }
-                            result.push_str(&window[start..i]);
-                            return Some(unescape_js(&result));
+                let start = i;
+                let mut result = String::new();
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b == quote {
+                        if start == i && result.is_empty() {
+                            return Some(String::new());
                         }
-                        if b == b'\\' && i + 1 < bytes.len() {
-                            // Keep escape sequences verbatim-ish: copy both
-                            // bytes; unescape_js handles common cases.
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
+                        result.push_str(&window[start..i]);
+                        return Some(unescape_js(&result));
                     }
-                    // Unterminated — take what we have.
-                    result.push_str(&window[start..i.min(bytes.len())]);
-                    return Some(unescape_js(&result));
+                    if b == b'\\' && i + 1 < bytes.len() {
+                        // Keep escape sequences verbatim-ish: copy both
+                        // bytes; unescape_js handles common cases.
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
                 }
+                // Unterminated — take what we have.
+                result.push_str(&window[start..i.min(bytes.len())]);
+                return Some(unescape_js(&result));
             }
         }
-        pos += 1;
+        search_from = pos + 3;
     }
     None
 }
@@ -786,6 +799,13 @@ pub fn detect_all_from_payload(
     observed_via: ObservedVia,
     payload: &Value,
 ) -> Vec<SkillUsageEvent> {
+    // A failed tool call never loaded the skill: payloads carrying an
+    // explicit error status/success flag produce no load events.
+    if payload.get("status").and_then(Value::as_str) == Some("error")
+        || payload.get("success").and_then(Value::as_bool) == Some(false)
+    {
+        return Vec::new();
+    }
     let tool = payload
         .get("tool_name")
         .or_else(|| payload.get("tool"))

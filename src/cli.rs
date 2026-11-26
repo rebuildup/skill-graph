@@ -81,7 +81,7 @@ enum Command {
     /// emits Skill Usage Events, and prints additionalContext injection.
     /// Always exits 0 (fail-open).
     Hook {
-        /// claude-code | codex
+        /// claude-code | codex | opencode
         runtime: String,
         /// prompt | skill-load
         mode: String,
@@ -255,14 +255,20 @@ pub fn run() -> Result<(), String> {
         }
         Command::Detect { runtime, via } => {
             use crate::events::{self, ObservedVia, Runtime};
-            let runtime =
-                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            // Callers pipe a payload unconditionally; drain stdin (bounded)
+            // before any early error exit so the writer never hits EPIPE.
+            let runtime = match Runtime::parse(&runtime) {
+                Some(r) => r,
+                None => return detect_arg_error(format!("unknown runtime: {runtime}")),
+            };
             let via = match via.as_str() {
                 "hook" => ObservedVia::Hook,
                 "plugin" => ObservedVia::Plugin,
                 "transcript" => ObservedVia::Transcript,
                 "db" => ObservedVia::Db,
-                other => return Err(format!("unknown observed_via: {other}")),
+                other => {
+                    return detect_arg_error(format!("unknown observed_via: {other}"));
+                }
             };
             let mut input = String::new();
             std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024 + 1)
@@ -290,6 +296,15 @@ pub fn run() -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Argument-validation failures on stdin-driven commands must still
+/// consume (bounded) stdin: the caller writes its payload before reading
+/// our exit status, and exiting early surfaces as EPIPE on their side.
+fn detect_arg_error(err: String) -> Result<(), String> {
+    let mut sink = Vec::new();
+    let _ = std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024).read_to_end(&mut sink);
+    Err(err)
 }
 
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {
