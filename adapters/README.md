@@ -52,11 +52,14 @@ adapters/install.sh <runtime> <scope> --uninstall
 ```
 
 - Merge is additive: existing hooks for the same event are preserved; re-running
-  install is idempotent (entries referencing the adapter are replaced, not
-  duplicated).
-- Uninstall removes only entries whose command references the adapter script
-  (or, for OpenCode, the plugin specifier) and prunes emptied groups; a config
-  reduced to `{}` is deleted so the pre-install state is fully restored.
+  install is idempotent. Entries are identified by adapter markers
+  (`skill-graph-recommend-hook` / the `/skill-graph` plugin specifier), not by
+  embedded paths, so installing from a different version directory replaces
+  prior entries instead of duplicating them.
+- Uninstall removes only entries carrying those markers and prunes emptied
+  groups; a config reduced to `{}` is deleted so the pre-install state is
+  fully restored. Uninstall is marker-based and does not require the binary
+  or adapter files to still exist.
 - OpenCode's extension point is a TS plugin, not shell hooks: `install.sh
   opencode` merges a `file://<abs path>/adapters/opencode/skill-graph`
   specifier into `opencode.json`'s `plugins` array.
@@ -65,7 +68,7 @@ adapters/install.sh <runtime> <scope> --uninstall
   for experiments only.
 - `test-install-roundtrip.sh` verifies install → reinstall → uninstall
   restores seeded config for every runtime/scope, including the dotfiles
-  compose-overlay case (see
+  compose-overlay case and versioned-path updates (see
   `docs/evidence/2026-11-26-w04-install-roundtrip.md` and
   `docs/evidence/2026-11-26-v030-release-verification.md`).
 - On dotfiles-managed machines, `install.sh claude-code --user` hooks are
@@ -73,16 +76,39 @@ adapters/install.sh <runtime> <scope> --uninstall
   `claude-settings compose`; `--uninstall` removes them from both the live
   settings and the overlay so they cannot be regenerated.
 
+## Runtime lifecycle
+
+Who owns each config, and how update / disable / restore work:
+
+| Runtime | Config owner | Enable | Disable | Restore |
+|---|---|---|---|---|
+| `claude-code` | `~/.claude/settings.json` (dotfiles machines: composed from `~/.config/dotfiles/claude/` baseline + `settings.local.json` overlay) | `install.sh claude-code --user` then `claude-settings compose` | `install.sh claude-code --user --uninstall` (cleans live file and overlay) | re-run install; compose regenerates from baseline |
+| `codex` | `~/.codex/hooks.json` (`$CODEX_HOME` override respected) | `install.sh codex --user`, then trust once via `/hooks` in the Codex TUI | `install.sh codex --user --uninstall`; trusted entries remain listed but inert | re-run install; trust persists while command strings are unchanged |
+| `opencode` | `~/.config/opencode/opencode.json` (`$XDG_CONFIG_HOME` respected) | `install.sh opencode --user` | `install.sh opencode --user --uninstall` | re-run install |
+
+### Versioned updates and Codex trust
+
+Codex pins hook trust by hashing the hook definition, including the command
+string. To keep trust valid across upgrades, the root `install.sh` installs
+payloads under `~/.local/share/skill-graph/<version>/` and points a stable
+`current` symlink at the active version; hook commands embed
+`current/...` paths, so upgrading flips the symlink without changing any
+config entry. The same layout is recommended for manual bundle installs:
+reference adapters through a version-independent path.
+
+`adapters/install.sh` marker matching makes updates safe regardless: entries
+from any prior version directory are removed before the new ones are added,
+so no duplicate hooks accumulate and uninstall removes all generations.
+
 ## Distribution layout
 
-A release archive should contain:
+GitHub Releases ship per-target `skill-graph-<target>.tar.gz` (the `skill-graph`
+binary) plus `skill-graph-adapters.tar.gz` (`adapters/` + `contracts/` +
+`plugins/`) and `sha256sums.txt`. The root `install.sh` downloads, verifies,
+and lays these out under `~/.local/share/skill-graph/<version>/` with a
+`current` symlink — see the repository README for the one-command flow.
 
-```
-bin/skill-graph                    # CLI binary
-adapters/install.sh
-adapters/<runtime>/...             # per-runtime adapter payloads
-sha256sums.txt
-```
-
-Users extract anywhere, set `SKILL_GRAPH_BIN`/`SKILL_GRAPH_HOME` if the binary
-is not on `PATH`, and run `install.sh`. Nothing else on the system is touched.
+For manual installs, extract the binary and adapter bundle anywhere, set
+`SKILL_GRAPH_BIN`/`SKILL_GRAPH_HOME` if the binary is not on `PATH`, and run
+`adapters/install.sh`. Prefer a version-independent path (symlink) for
+`SKILL_GRAPH_HOME` so upgrades do not require re-installing hooks.

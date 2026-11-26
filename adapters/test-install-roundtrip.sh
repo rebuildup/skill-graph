@@ -109,4 +109,31 @@ else
 fi
 rm -rf "$d"
 
+# versioned-path update: installing from a different adapter directory
+# (simulating ~/.local/share/skill-graph/<ver>/) must REPLACE, not duplicate,
+# prior skill-graph entries; uninstall must remove them all.
+d=$(mktemp -d)
+mkdir -p "$d/v1/adapters" "$d/v2/adapters" "$d/home/.claude" "$d/proj"
+cp -r "$here/claude-code" "$here/codex" "$here/opencode" "$here/install.sh" "$d/v1/adapters/" 2>/dev/null || true
+cp -r "$d/v1/adapters/." "$d/v2/adapters/"
+seed_hooks "$d/home/.claude/settings.json"
+HOME="$d/home" SKILL_GRAPH_BIN="$bin" bash "$d/v1/adapters/install.sh" claude-code --user >/dev/null
+HOME="$d/home" SKILL_GRAPH_BIN="$bin" bash "$d/v2/adapters/install.sh" claude-code --user >/dev/null
+n=$(jq '[.hooks[][]?.hooks[]? | select(.command != null and (.command | contains("skill-graph-recommend-hook")))] | length' \
+      "$d/home/.claude/settings.json")
+if [ "$n" -eq 2 ]; then
+  echo "PASS claude-code --user: versioned-path update dedups (2 entries)"
+else
+  echo "FAIL claude-code --user: versioned-path update dedups (got $n entries)"; fail=1
+fi
+HOME="$d/home" SKILL_GRAPH_BIN="$bin" bash "$d/v2/adapters/install.sh" claude-code --user --uninstall >/dev/null
+n=$(jq '[.hooks[][]?.hooks[]? | select(.command != null and (.command | contains("skill-graph-recommend-hook")))] | length' \
+      "$d/home/.claude/settings.json")
+if [ "$n" -eq 0 ]; then
+  echo "PASS claude-code --user: versioned-path uninstall removes all"
+else
+  echo "FAIL claude-code --user: versioned-path uninstall removes all (got $n)"; fail=1
+fi
+rm -rf "$d"
+
 exit "$fail"

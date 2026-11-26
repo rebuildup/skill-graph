@@ -73,6 +73,8 @@ jobs:
           cd dist
           sha256sum skill-graph-* > ../sha256sums.txt
           cat ../sha256sums.txt
+      - name: Stage installer
+        run: cp install.sh dist/install.sh
       - name: GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
