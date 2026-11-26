@@ -4,6 +4,7 @@ pub mod discovery;
 pub mod eval;
 pub mod events;
 pub mod hook;
+pub mod mcp;
 pub mod model;
 pub mod observe;
 pub mod parser;
