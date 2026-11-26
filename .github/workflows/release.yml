@@ -12,7 +12,20 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -86,6 +99,12 @@ jobs:
           tag="$RELEASE_TAG"
           notes="docs/release/${tag}.md"
           [ -f "$notes" ] || notes=""
-          gh release create "$tag" dist/*.tar.gz sha256sums.txt \
-            --title "skill-graph $tag" \
-            ${notes:+--notes-file "$notes"} --verify-tag
+          # Idempotent on workflow_dispatch reruns: upload --clobber when a
+          # release already exists for the tag.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/*.tar.gz sha256sums.txt --clobber
+          else
+            gh release create "$tag" dist/*.tar.gz sha256sums.txt \
+              --title "skill-graph $tag" \
+              ${notes:+--notes-file "$notes"} --verify-tag
+          fi

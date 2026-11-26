@@ -48,7 +48,7 @@ impl SkillGraphMcp {
         }
     }
 
-    fn entry_for(&self, roots: &[PathBuf]) -> Arc<CacheEntry> {
+    fn entry_for(cache: &GraphCache, roots: &[PathBuf]) -> Arc<CacheEntry> {
         // JSON array encoding is injective — no separator collision.
         let key = serde_json::to_string(
             &roots
@@ -57,7 +57,7 @@ impl SkillGraphMcp {
                 .collect::<Vec<_>>(),
         )
         .unwrap_or_default();
-        let mut guard = self.graph_cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((k, entry)) = guard.as_ref()
             && *k == key
         {
@@ -208,50 +208,65 @@ impl ServerHandler for SkillGraphMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let args = request.arguments.clone().unwrap_or_default();
-        let result = match request.name.as_ref() {
-            "recommend" => {
-                let Some(query) = arg_str(&args, "query") else {
-                    return Ok(tool_error("missing required argument: query"));
-                };
-                let roots = tool_roots(args.get("roots"));
-                let entry = self.entry_for(&roots);
-                let recs = recommend(
-                    &entry.graph,
-                    query,
-                    arg_str(&args, "context").unwrap_or(""),
-                    arg_usize(&args, "max", 3),
-                );
-                tool_result(&json!(recs))
-            }
-            "discover" => {
-                let roots = tool_roots(args.get("roots"));
-                let entry = self.entry_for(&roots);
-                let mut output = discovery_output(&entry.discovery);
-                if output.skills.len() > MAX_DISCOVER_SKILLS {
-                    output.skills.truncate(MAX_DISCOVER_SKILLS);
-                    output.errors.push(format!(
-                        "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
-                    ));
-                }
-                tool_result(&json!(output))
-            }
-            "resolve" => {
-                let Some(target) = arg_str(&args, "target") else {
-                    return Ok(tool_error("missing required argument: target"));
-                };
-                let roots = tool_roots(args.get("roots"));
-                let entry = self.entry_for(&roots);
-                tool_result(&json!(crate::cli::resolve_target(&entry.graph, target)))
-            }
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("unknown tool: {other}"),
-                    None,
+        let name = request.name.clone();
+        let cache = self.graph_cache.clone();
+        // Discovery/recommend/resolve do synchronous filesystem scans and
+        // CPU-bound scoring; run them on the blocking pool so a slow or
+        // huge corpus cannot stall the stdio server's async runtime.
+        tokio::task::spawn_blocking(move || compute_tool(&cache, name.as_ref(), &args))
+            .await
+            .map_err(|e| McpError::internal_error(format!("tool task failed: {e}"), None))?
+    }
+}
+
+fn compute_tool(
+    cache: &GraphCache,
+    name: &str,
+    args: &JsonObject,
+) -> Result<CallToolResponse, McpError> {
+    let result = match name {
+        "recommend" => {
+            let Some(query) = arg_str(args, "query") else {
+                return Ok(tool_error("missing required argument: query"));
+            };
+            let roots = tool_roots(args.get("roots"));
+            let entry = SkillGraphMcp::entry_for(cache, &roots);
+            let recs = recommend(
+                &entry.graph,
+                query,
+                arg_str(args, "context").unwrap_or(""),
+                arg_usize(args, "max", 3),
+            );
+            tool_result(&json!(recs))
+        }
+        "discover" => {
+            let roots = tool_roots(args.get("roots"));
+            let entry = SkillGraphMcp::entry_for(cache, &roots);
+            let mut output = discovery_output(&entry.discovery);
+            if output.skills.len() > MAX_DISCOVER_SKILLS {
+                output.skills.truncate(MAX_DISCOVER_SKILLS);
+                output.errors.push(format!(
+                    "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
                 ));
             }
-        };
-        Ok(result)
-    }
+            tool_result(&json!(output))
+        }
+        "resolve" => {
+            let Some(target) = arg_str(args, "target") else {
+                return Ok(tool_error("missing required argument: target"));
+            };
+            let roots = tool_roots(args.get("roots"));
+            let entry = SkillGraphMcp::entry_for(cache, &roots);
+            tool_result(&json!(crate::cli::resolve_target(&entry.graph, target)))
+        }
+        other => {
+            return Err(McpError::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            ));
+        }
+    };
+    Ok(result)
 }
 
 /// Entry point for `skill-graph mcp`. Runs the stdio server until the

@@ -229,15 +229,25 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
         obs.lines_skipped += 1;
         return true;
     }
-    // recommended[] items must carry a non-empty name (schema minLength).
-    if event.kind == EventKind::Recommendation
-        && event
-            .recommended
-            .iter()
-            .any(|r| r.name.is_empty() || !crate::parser::valid_skill_name(&r.name))
-    {
-        obs.lines_skipped += 1;
-        return true;
+    // `recommended` item constraints apply whenever the field is present,
+    // not only on recommendation events (schema property-level rule).
+    // Names must be non-empty valid skill names; items may carry only
+    // name/digest (schema additionalProperties:false).
+    if let Some(items) = value.get("recommended").and_then(Value::as_array) {
+        let bad_item = items.iter().any(|item| {
+            let name_ok = item
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|n| !n.is_empty() && crate::parser::valid_skill_name(n));
+            let keys_ok = item
+                .as_object()
+                .is_some_and(|o| o.keys().all(|k| k == "name" || k == "digest"));
+            !name_ok || !keys_ok
+        });
+        if bad_item {
+            obs.lines_skipped += 1;
+            return true;
+        }
     }
     record_event(event, obs);
     true
@@ -267,8 +277,15 @@ fn looks_like_claude_transcript(value: &Value) -> bool {
 
 fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
     // The contract requires skill_name on skill_load; unattributable
-    // observations are dropped rather than emitted schema-invalid.
-    if event.kind == EventKind::SkillLoad && event.skill_name.is_none() {
+    // observations are dropped rather than emitted schema-invalid. An
+    // empty string is equally unattributable.
+    if event.kind == EventKind::SkillLoad
+        && event
+            .skill_name
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
         return;
     }
     if event.counts_as_load() {
@@ -687,7 +704,7 @@ fn parse_injected_recommendation(
     let names: Vec<RecommendedSkill> = names_str
         .split(',')
         .map(|n| n.trim())
-        .filter(|n| !n.is_empty())
+        .filter(|n| !n.is_empty() && crate::parser::valid_skill_name(n))
         .map(|n| RecommendedSkill {
             name: n.to_string(),
             digest: None,
@@ -836,9 +853,30 @@ fn open_sqlite_readonly(path: &Path) -> Result<rusqlite::Connection, String> {
         Ok(conn) => Ok(conn),
         Err(first) => {
             // WAL-mode databases may refuse a pure read-only open when the
-            // -shm/-wal sidecars are absent. A normal open still only issues
-            // SELECTs below; it does not modify rows.
-            rusqlite::Connection::open(path).map_err(|e| format!("open db: {first}; retry: {e}"))
+            // -shm/-wal sidecars are absent. Retry through a `mode=ro` URI:
+            // it still forbids writes to the database file itself (no WAL
+            // recovery or journal writes), unlike a plain read-write open.
+            // SQLite may still create -shm/-wal sidecars, which is inherent
+            // to reading a live WAL database and modifies no stored rows.
+            // Percent-encode the path portion: spaces, `?`, `#`, `%` are
+            // legal in filesystem paths but meaningful in a URI.
+            let encoded: String = path
+                .to_string_lossy()
+                .chars()
+                .flat_map(|c| match c {
+                    '%' => "%25".chars().collect::<Vec<_>>(),
+                    '?' => "%3F".chars().collect(),
+                    '#' => "%23".chars().collect(),
+                    ' ' => "%20".chars().collect(),
+                    c => vec![c],
+                })
+                .collect();
+            let uri = format!("file:{encoded}?mode=ro");
+            rusqlite::Connection::open_with_flags(
+                &uri,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .map_err(|e| format!("open db: {first}; retry: {e}"))
         }
     }
 }
@@ -870,6 +908,29 @@ pub fn summary(obs: &Observation) -> Value {
         }
     }
     out["by_runtime"] = Value::Object(by_runtime);
+    // Spec §2: funnel metrics aggregate per runtime AND per session.
+    // Sessions with an empty id are excluded (unattributable); the map is
+    // capped so a huge log cannot produce unbounded output.
+    const MAX_SUMMARY_SESSIONS: usize = 500;
+    let mut by_session_map = serde_json::Map::new();
+    let mut session_events: std::collections::BTreeMap<&str, Vec<&crate::events::SkillUsageEvent>> =
+        std::collections::BTreeMap::new();
+    for e in &all {
+        if !e.session_id.is_empty() {
+            session_events
+                .entry(e.session_id.as_str())
+                .or_default()
+                .push(*e);
+        }
+    }
+    let total_sessions = session_events.len();
+    for (session_id, events) in session_events.into_iter().take(MAX_SUMMARY_SESSIONS) {
+        by_session_map.insert(session_id.to_string(), funnel_for(&events).into_json());
+    }
+    out["by_session"] = Value::Object(by_session_map);
+    if total_sessions > MAX_SUMMARY_SESSIONS {
+        out["by_session_omitted"] = json!(total_sessions - MAX_SUMMARY_SESSIONS);
+    }
     out["events"] = json!(obs.events.len());
     out["files_scanned"] = json!(obs.files_scanned);
     out["lines_skipped"] = json!(obs.lines_skipped);

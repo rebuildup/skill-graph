@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, closeSync, fchmodSync, mkdirSync, openSync, renameSync, statSync, writeSync } from "node:fs"
+import { appendFileSync, closeSync, constants, fchmodSync, lstatSync, mkdirSync, openSync, renameSync, writeSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { createHash } from "node:crypto"
@@ -51,18 +51,36 @@ function validSkillName(name: string): boolean {
   return /^[a-z0-9-]{1,64}$/.test(name) && !name.startsWith("-") && !name.endsWith("-")
 }
 
+// Mirror hook.rs's session-id sanitizer: runtime-supplied ids are
+// untrusted — bound charset and length before they reach persistent
+// events or in-memory map keys.
+function safeSessionID(id: unknown): string {
+  const s = typeof id === "string" ? id : ""
+  const safe = s.replace(/[^A-Za-z0-9._-]/g, "").slice(0, 128)
+  return safe || "unknown"
+}
+
 function emit(event: Record<string, unknown>) {
   if (NOSTATE) return
   try {
     mkdirSync(dirname(EVENT_LOG), { recursive: true })
     try {
-      if (statSync(EVENT_LOG).size > EVENT_LOG_MAX) {
+      // lstat: a symlinked log must not be rotated through (the open
+      // below refuses it anyway via O_NOFOLLOW).
+      const st = lstatSync(EVENT_LOG)
+      if (!st.isSymbolicLink() && st.size > EVENT_LOG_MAX) {
         renameSync(EVENT_LOG, EVENT_LOG + ".1")
       }
     } catch {}
     // Open with mode 0600 so a freshly created log is owner-only, matching
-    // the Rust hook's permissions.
-    const fd = openSync(EVENT_LOG, "a", 0o600)
+    // the Rust hook's permissions. O_NOFOLLOW refuses a pre-planted
+    // symlink in the shared TMPDIR — parity with the Rust hook's open(2)
+    // hardening; ELOOP lands in the catch and the emit is skipped.
+    const fd = openSync(
+      EVENT_LOG,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
+      0o600,
+    )
     try {
       // mode only applies at creation; tighten pre-existing logs too.
       fchmodSync(fd, 0o600)
@@ -83,6 +101,34 @@ function base(kind: string) {
     observed_via: "plugin",
     timestamp: new Date().toISOString(),
   }
+}
+
+// The plugin lives inside the long-lived OpenCode server: a wedged
+// skill-graph child (stalled FS, huge corpus, hung wrapper) must not stall
+// prompt handling or accumulate processes. Read stdout fully (avoids
+// pipe-buffer deadlock), but kill the child after PROC_TIMEOUT_MS — the
+// kill closes stdout so the read resolves with whatever arrived.
+const PROC_TIMEOUT_MS = 20_000
+
+async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
+  const readAll = new Response(proc.stdout).text()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      proc.exited,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          try { proc.kill() } catch {}
+          reject(new Error("skill-graph timed out"))
+        }, PROC_TIMEOUT_MS)
+      }),
+    ])
+  } catch {
+    // timed out and killed; fall through to collect partial output
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+  return readAll
 }
 
 async function recommendNames(
@@ -108,8 +154,7 @@ async function recommendNames(
   })
   proc.stdin.write(query)
   proc.stdin.end()
-  const out = await new Response(proc.stdout).text()
-  await proc.exited
+  const out = await collectProc(proc).catch(() => "")
   try {
     const recs = JSON.parse(out) as { skill: { name: string; digest?: string } }[]
     return recs.map((r) => ({ name: r.skill.name, digest: r.skill.digest }))
@@ -152,7 +197,7 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     tool_name: tool,
     tool_input: input,
     tool_response: resultText(event.result),
-    session_id: event.sessionID ?? "",
+    session_id: safeSessionID(event.sessionID),
   }
   try {
     const proc = Bun.spawn(
@@ -161,8 +206,7 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     )
     proc.stdin.write(JSON.stringify(payload))
     proc.stdin.end()
-    const out = await new Response(proc.stdout).text()
-    await proc.exited
+    const out = await collectProc(proc).catch(() => "")
     const trimmed = out.trim()
     if (!trimmed) return []
     // `detect` emits one JSON object per line (a payload may touch
@@ -228,7 +272,7 @@ export default Plugin.define({
 
     await ctx.session.hook("prompt", async (event) => {
       const text = event.prompt?.text ?? ""
-      const sessionID = event.sessionID ?? "unknown"
+      const sessionID = safeSessionID(event.sessionID)
       if (text) {
         emit({
           ...base("prompt_submit"),
@@ -285,7 +329,7 @@ export default Plugin.define({
     await ctx.tool.hook("execute.after", async (event) => {
       const detected = await detectLoad(event)
       if (!detected.length) return
-      const sessionID = (event.sessionID ?? "unknown") as string
+      const sessionID = safeSessionID(event.sessionID)
       for (const det of detected) {
         emit(det)
         const detection = det.detection as string | undefined
@@ -329,9 +373,10 @@ export default Plugin.define({
     })
 
     await ctx.session.hook("context", (event) => {
-      const list = pending.get(event.sessionID)
+      const sessionID = safeSessionID(event.sessionID)
+      const list = pending.get(sessionID)
       if (!list?.length) return
-      pending.delete(event.sessionID)
+      pending.delete(sessionID)
       for (const entry of list) {
         const text =
           entry.kind === "deps"

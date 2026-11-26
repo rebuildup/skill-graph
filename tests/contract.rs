@@ -325,3 +325,113 @@ fn plugin_manifest_version_matches_crate() {
         serde_json::from_str(include_str!("../plugins/skill-graph/plugin.json")).unwrap();
     assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
 }
+
+/// The OpenCode plugin hand-constructs event objects in TypeScript and
+/// appends them to the shared JSONL log, bypassing every Rust emit path.
+/// Guard the contract: every top-level key written inside `emit({...})`
+/// literals (and the `base()` helper) must be a declared schema property,
+/// so a future edit cannot ship `additionalProperties: false` violations
+/// that `observe` would silently drop.
+#[test]
+fn opencode_plugin_emit_shapes_stay_within_event_schema() {
+    let src = include_str!("../src/assets/opencode-plugin.ts");
+    let schema_src = include_str!("../contracts/v1/skill-usage-event.schema.json");
+    let schema: Value = serde_json::from_str(schema_src).unwrap();
+    let allowed: std::collections::HashSet<String> = schema["properties"]
+        .as_object()
+        .expect("event schema properties")
+        .keys()
+        .cloned()
+        .collect();
+
+    // Brace-match each `emit({...})` literal and the object returned by
+    // base(); collect `ident:` keys at depth 1 of each.
+    let mut opens: Vec<usize> = src
+        .match_indices("emit({")
+        .map(|(i, _)| i + "emit(".len())
+        .collect();
+    if let Some(f) = src.find("function base")
+        && let Some(r) = src[f..].find("return {")
+    {
+        opens.push(f + r + "return ".len());
+    }
+    assert!(!opens.is_empty(), "no emit() literals found in plugin.ts");
+
+    let bytes = src.as_bytes();
+    let mut keys = std::collections::HashSet::new();
+    for open in opens {
+        // `open` is the byte offset of the object's `{`.
+        let mut depth = 0i32;
+        let mut j = open;
+        let mut in_str = false;
+        let mut str_ch = b'\0';
+        while j < bytes.len() {
+            let c = bytes[j];
+            if in_str {
+                if c == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if c == str_ch {
+                    in_str = false;
+                }
+            } else if c == b'"' || c == b'\'' || c == b'`' {
+                in_str = true;
+                str_ch = c;
+            } else if c == b'{' {
+                depth += 1;
+            } else if c == b'}' {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        let body = &src[open + 1..j];
+        // Top-level `ident:` keys (depth 1 inside this object).
+        let bb = body.as_bytes();
+        let mut d = 1i32;
+        let mut k = 0usize;
+        while k < bb.len() {
+            let c = bb[k];
+            if c == b'"' || c == b'\'' || c == b'`' {
+                let q = c;
+                k += 1;
+                while k < bb.len() && bb[k] != q {
+                    k += if bb[k] == b'\\' { 2 } else { 1 };
+                }
+            } else if c == b'{' || c == b'[' || c == b'(' {
+                d += 1;
+            } else if c == b'}' || c == b']' || c == b')' {
+                d -= 1;
+            } else if d == 1 && (c.is_ascii_alphabetic() || c == b'_') {
+                // Byte offsets inside `body` may not be char boundaries;
+                // accumulate the ident on bytes instead.
+                let start = k;
+                while k < bb.len() && (bb[k].is_ascii_alphanumeric() || bb[k] == b'_') {
+                    k += 1;
+                }
+                let ident = std::str::from_utf8(&bb[start..k]).unwrap();
+                if body[k..].trim_start().starts_with(':') {
+                    keys.insert(ident.to_string());
+                }
+                continue;
+            }
+            k += 1;
+        }
+    }
+
+    for key in &keys {
+        assert!(
+            allowed.contains(key),
+            "plugin emits key `{key}` not declared in skill-usage-event schema"
+        );
+    }
+    // base() uses a `kind` shorthand (no colon); the fixed base fields
+    // must all be present.
+    assert!(src.contains("kind,"), "base() must set kind");
+    for f in ["schema_version", "runtime", "observed_via", "timestamp"] {
+        assert!(keys.contains(f), "base() field `{f}` not found");
+    }
+}

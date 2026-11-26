@@ -70,6 +70,9 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
                 "--format",
                 "json",
             ])
+            // resolve_roots gives SKILL_GRAPH_ROOTS precedence over
+            // --root; a set env var would silently measure the wrong corpus.
+            .env_remove("SKILL_GRAPH_ROOTS")
             .output()
             .map_err(|err| format!("spawn perf cli: {err}"))?;
         if !output.status.success() {

@@ -33,6 +33,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - name: Verify tag passes tests
+        run: cargo test --locked
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -101,7 +106,12 @@ jobs:
             chmod +x "$pkg/bin/skill-graph"
             rm -rf /tmp/sg-pkg
             if [ "$target" = "linux-x64" ]; then
-              "$pkg/bin/skill-graph" --version
+              got="$("$pkg/bin/skill-graph" --version)"
+              want="${RELEASE_TAG#v}"
+              [[ "$got" == *"$want"* ]] || {
+                echo "version mismatch: binary reports '$got', expected $want" >&2
+                exit 1
+              }
             else
               # cross-compiled binaries cannot exec on this runner
               file "$pkg/bin/skill-graph" | grep -q .
