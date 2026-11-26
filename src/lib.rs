@@ -1,12 +1,13 @@
+pub mod adapter;
 pub mod cli;
 pub mod discovery;
 pub mod eval;
 pub mod events;
+pub mod hook;
+pub mod mcp;
 pub mod model;
 pub mod observe;
 pub mod parser;
 pub mod perf;
 pub mod resolver;
 pub mod search;
-pub mod x02;
-pub mod x03;

@@ -1,0 +1,37 @@
+{
+  "name": "@rebuildup/skill-graph",
+  "version": "0.4.0",
+  "description": "Agent Skills discovery and recommendation CLI with runtime hooks for Claude Code, Codex, and OpenCode",
+  "license": "MIT",
+  "homepage": "https://github.com/rebuildup/skill-graph",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rebuildup/skill-graph.git"
+  },
+  "bin": {
+    "skill-graph": "bin/skill-graph.js"
+  },
+  "files": [
+    "bin/",
+    "plugin/",
+    "contracts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=14.18"
+  },
+  "optionalDependencies": {
+    "@rebuildup/skill-graph-linux-x64": "0.4.0",
+    "@rebuildup/skill-graph-linux-arm64": "0.4.0",
+    "@rebuildup/skill-graph-darwin-x64": "0.4.0",
+    "@rebuildup/skill-graph-darwin-arm64": "0.4.0"
+  },
+  "keywords": [
+    "agent-skills",
+    "claude-code",
+    "codex",
+    "opencode",
+    "cli"
+  ]
+}

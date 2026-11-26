@@ -1,8 +1,0 @@
-{
-  "name": "skill-graph",
-  "version": "0.1.0",
-  "description": "Recommend installed Agent Skills relevant to the current prompt via skill-graph. Opt-in: loads only when this plugin is installed for the session.",
-  "author": {
-    "name": "rebuildup"
-  }
-}

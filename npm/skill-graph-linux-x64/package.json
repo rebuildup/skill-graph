@@ -1,0 +1,24 @@
+{
+  "name": "@rebuildup/skill-graph-linux-x64",
+  "version": "0.4.0",
+  "description": "skill-graph native binary for linux/x64",
+  "license": "MIT",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin/skill-graph",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rebuildup/skill-graph.git"
+  },
+  "libc": [
+    "glibc"
+  ]
+}

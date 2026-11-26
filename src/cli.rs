@@ -68,6 +68,35 @@ enum Command {
         path: PathBuf,
         #[arg(long, default_value = "json")]
         format: String,
+        /// Print funnel/summary metrics instead of the raw observation.
+        #[arg(long)]
+        summary: bool,
+    },
+    /// Runtime hook entry point: reads one hook payload JSON on stdin,
+    /// emits Skill Usage Events, and prints additionalContext injection.
+    /// Always exits 0 (fail-open).
+    Hook {
+        /// claude-code | codex
+        runtime: String,
+        /// prompt | skill-load
+        mode: String,
+    },
+    /// stdio MCP server exposing read-only skill tools (recommend,
+    /// discover, resolve). See ADR-0005.
+    Mcp,
+    /// Manage runtime adapter hooks/plugins in native configs.
+    /// enable|disable|status <claude-code|codex|opencode> [--user|--project]
+    Adapter {
+        action: String,
+        /// claude-code | codex | opencode
+        runtime: String,
+        #[arg(long)]
+        user: bool,
+        #[arg(long)]
+        project: bool,
+        /// Explicit skill-graph binary path to embed in hook commands
+        #[arg(long)]
+        bin: Option<String>,
     },
     /// Normalize a single runtime hook/plugin payload (stdin JSON) into a
     /// Skill Usage Event. Prints the event JSON, or nothing when the
@@ -127,9 +156,71 @@ pub fn run() -> Result<(), String> {
             );
             Ok(())
         }
-        Command::Observe { path, format } => {
+        Command::Observe {
+            path,
+            format,
+            summary,
+        } => {
             let obs = observe::observe_path(&path)?;
+            if summary {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&observe::summary(&obs))
+                        .map_err(|e| e.to_string())?
+                );
+                return Ok(());
+            }
             print_result(json!(obs), &format)
+        }
+        Command::Hook { runtime, mode } => {
+            use crate::events::Runtime;
+            use std::io::Read;
+            // Hooks must fail open: unusable arguments still exit 0.
+            // Drain stdin first so the caller never hits EPIPE writing a
+            // payload to a process that already exited.
+            let parsed = Runtime::parse(&runtime);
+            let valid_mode = matches!(mode.as_str(), "prompt" | "skill-load");
+            match parsed {
+                Some(runtime) if valid_mode => crate::hook::run_hook(runtime, &mode),
+                _ => {
+                    let mut sink = Vec::new();
+                    let _ = std::io::stdin().read_to_end(&mut sink);
+                    if parsed.is_none() {
+                        eprintln!("skill-graph: unknown runtime: {runtime}");
+                    } else {
+                        eprintln!("skill-graph: unknown hook mode: {mode}");
+                    }
+                    Ok(())
+                }
+            }
+        }
+        Command::Mcp => crate::mcp::run(),
+        Command::Adapter {
+            action,
+            runtime,
+            user,
+            project,
+            bin,
+        } => {
+            use crate::adapter::{AdapterArgs, Scope};
+            use crate::events::Runtime;
+            let runtime =
+                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            let action = match action.as_str() {
+                "enable" => crate::adapter::Action::Enable,
+                "disable" => crate::adapter::Action::Disable,
+                "status" => crate::adapter::Action::Status,
+                other => return Err(format!("unknown adapter action: {other}")),
+            };
+            if user && project {
+                return Err("--user and --project are mutually exclusive".to_string());
+            }
+            crate::adapter::run_adapter(&AdapterArgs {
+                runtime,
+                scope: if project { Scope::Project } else { Scope::User },
+                action,
+                bin,
+            })
         }
         Command::Detect { runtime, via } => {
             use crate::events::{self, ObservedVia, Runtime};
