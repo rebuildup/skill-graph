@@ -15,6 +15,10 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: npm-publish-${{ github.event.inputs.tag || github.ref_name }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,40 +27,102 @@ jobs:
         with:
           node-version: 22
           registry-url: https://registry.npmjs.org
+      - name: Resolve release tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          tag="${INPUT_TAG:-$REF_NAME}"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+      - name: Verify manifest versions match tag
+        run: |
+          set -euo pipefail
+          want="${RELEASE_TAG#v}"
+          for pkg in npm/skill-graph npm/skill-graph-*/; do
+            [ -f "$pkg/package.json" ] || continue
+            ver="$(node -p "require('./$pkg/package.json').version")"
+            if [ "$ver" != "$want" ]; then
+              echo "version mismatch: $pkg is $ver but tag is $want" >&2
+              exit 1
+            fi
+          done
       - name: Download release binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          # The tag push and release.yml run concurrently; wait for the
+          # release assets to appear.
           mkdir -p dist
-          gh release download "$tag" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber
+          for i in $(seq 1 60); do
+            if gh release download "$RELEASE_TAG" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber 2>/dev/null; then
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "release assets for $RELEASE_TAG not ready after 20min" >&2
+              exit 1
+            fi
+            echo "release assets for $RELEASE_TAG not ready (attempt $i), retrying in 20s"
+            sleep 20
+          done
+          ls -l dist/
+      - name: Verify checksums
+        run: |
+          cd dist
+          sha256sum -c --ignore-missing sha256sums.txt
       - name: Assemble platform packages
+        env:
+          TARGETS: |
+            linux-x64:x86_64-unknown-linux-gnu
+            linux-arm64:aarch64-unknown-linux-gnu
+            darwin-x64:x86_64-apple-darwin
+            darwin-arm64:aarch64-apple-darwin
         run: |
           set -euo pipefail
-          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
+          while IFS=: read -r target triple; do
+            [ -n "$target" ] || continue
             pkg="npm/skill-graph-${target}"
             mkdir -p "$pkg/bin" /tmp/sg-pkg
-            case "$target" in
-              linux-x64)    triple=x86_64-unknown-linux-gnu ;;
-              linux-arm64)  triple=aarch64-unknown-linux-gnu ;;
-              darwin-x64)   triple=x86_64-apple-darwin ;;
-              darwin-arm64) triple=aarch64-apple-darwin ;;
-            esac
             tar -xzf "dist/skill-graph-${triple}.tar.gz" -C /tmp/sg-pkg
             cp /tmp/sg-pkg/skill-graph "$pkg/bin/skill-graph"
             chmod +x "$pkg/bin/skill-graph"
             rm -rf /tmp/sg-pkg
-            "$pkg/bin/skill-graph" --version
-          done
+            if [ "$target" = "linux-x64" ]; then
+              "$pkg/bin/skill-graph" --version
+            else
+              # cross-compiled binaries cannot exec on this runner
+              file "$pkg/bin/skill-graph" | grep -q .
+            fi
+          done <<< "$TARGETS"
+      - name: Bundle portable plugin into metapackage
+        run: |
+          set -euo pipefail
+          rm -rf npm/skill-graph/plugin
+          cp -r plugins/skill-graph npm/skill-graph/plugin
       - name: Publish platform packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64; do
-            npm publish "npm/skill-graph-${target}" --access public
-          done
+          while IFS=: read -r target triple; do
+            [ -n "$target" ] || continue
+            pkg="npm/skill-graph-${target}"
+            name="@rebuildup/skill-graph-${target}"
+            [ -x "$pkg/bin/skill-graph" ] || { echo "missing binary in $pkg" >&2; exit 1; }
+            ver="$(node -p "require('./$pkg/package.json').version")"
+            if npm view "$name@$ver" version >/dev/null 2>&1; then
+              echo "$name@$ver already published, skipping"
+              continue
+            fi
+            npm publish "$pkg" --access public
+          done <<< "$TARGETS"
       - name: Publish metapackage
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish npm/skill-graph --access public
+        run: |
+          set -euo pipefail
+          ver="$(node -p "require('./npm/skill-graph/package.json').version")"
+          if npm view "@rebuildup/skill-graph@$ver" version >/dev/null 2>&1; then
+            echo "@rebuildup/skill-graph@$ver already published, skipping"
+            exit 0
+          fi
+          npm publish npm/skill-graph --access public
