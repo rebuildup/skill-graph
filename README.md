@@ -88,10 +88,10 @@ skill-graph bench <dataset> / perf                       # 評価・性能ハー
 ```
 
 既定の探索 root: `~/.claude/skills`、`~/.agents/skills`、`./skills`、
-`./.claude/skills`、`./.agents/skills` 等。CLI サブコマンドは `--root`
-で上書き可能。`SKILL_GRAPH_ROOTS`（colon 区切り）は hook / OpenCode
-plugin / MCP server が参照する root 上書きであり、CLI の
-`discover`/`search`/`recommend`/`resolve` は現状 `--root` のみを使う。
+`./.claude/skills`、`./.agents/skills` 等。root の解決は全入口で共通:
+`SKILL_GRAPH_ROOTS`（colon 区切り）が設定されていれば **常に最優先**
+（`--root` や MCP tool の `roots` より優先される）→ 明示引数 →
+既定 root の順。`--root` は env 未設定時の上書きとして使う。
 永続キャッシュ・daemon・PATH 変更は行わない。
 
 ## MCP server
@@ -147,7 +147,10 @@ skill-graph adapter disable claude-code   # 追加エントリのみ除去・完
 
 hook コマンドには enable 時に PATH 解決した `skill-graph` の絶対パスを
 埋め込む。mise shim・npm global bin・brew のいずれのパスでも動作する。
-明示指定は `--bin <path>`。
+明示指定は `--bin <path>`（opencode は plugin が `SKILL_GRAPH_BIN` /
+PATH で解決するため `--bin` は使えない）。PATH 上の候補は `hook`
+サブコマンド対応を実際に probe するため、v0.3.x の古いバイナリが
+先に見つかっても埋め込まれない。
 
 ### 挙動
 
@@ -165,11 +168,12 @@ hook コマンドには enable 時に PATH 解決した `skill-graph` の絶対�
   `SKILL_GRAPH_EVENT_LOG` で保存先変更、`SKILL_GRAPH_HOOK_NOSTATE=1`
   で全書き込み無効化（state marker も生成しない no-save mode）、
   `SKILL_GRAPH_EVENT_LOG_MAX`（既定 64MiB）でローテーション。
-- **例外**: OpenCode plugin は `SKILL_GRAPH_EVENT_LOG`（保存先）と
-  `SKILL_GRAPH_ROOTS` のみを参照する。`SKILL_GRAPH_HOOK_NOSTATE` と
-  `SKILL_GRAPH_EVENT_LOG_MAX`（ローテーション）は **適用されない**
-  （plugin は無制限 append のまま。no-save が必要な場合は hook
-  経路を使うか `SKILL_GRAPH_EVENT_LOG` を使い捨てパスに向ける）。
+- OpenCode plugin も `SKILL_GRAPH_EVENT_LOG`・`SKILL_GRAPH_ROOTS`・
+  `SKILL_GRAPH_BIN`・`SKILL_GRAPH_HOOK_NOSTATE`・
+  `SKILL_GRAPH_EVENT_LOG_MAX` を hook と同じ規約で参照する
+  （NOSTATE で全イベント書き込み停止、上限超過で `.1` へ
+  ローテーション）。recommend の query は stdin 経由
+  （`--query-stdin`）で、prompt 本文は argv に載らない。
 
 ## Update / Uninstall
 
@@ -179,10 +183,11 @@ hook コマンドには enable 時に PATH 解決した `skill-graph` の絶対�
   adapter の再 enable は不要。パスが変わった場合は
   `adapter disable && adapter enable` で張り替える。
 - **無効化（一時）**: `SKILL_GRAPH_HOOK_NOSTATE=1` でイベント書き込み停止
-  （`skill-graph hook` 経路のみ。OpenCode plugin には適用されない）。
+  （`skill-graph hook` と OpenCode plugin の両経路に適用される）。
 - **adapter のみ無効化**: `skill-graph adapter disable <rt>`。
   追加したエントリのみ除去し、他の hook/plugin・設定は保持。
-  `{}` まで減った設定ファイルは削除される。
+  `{}` まで減った設定ファイルは削除される（symlink 管理の設定は
+  リンクを残して target に `{}` を書き込む）。
 - **完全削除**: パッケージマネージャの uninstall に加え、事前に
   `adapter disable` を実行して hook/plugin 参照を除去する
   （残っても fail-open だが、設定を清潔に保つため推奨）。
@@ -220,6 +225,11 @@ Codex の `/hooks` trust はコマンド文字列の hash-pin のため、移行
   （shim が正しい arch を選択するため動作上の問題はない）。
 - 永続キャッシュ・Embedding・グラフDB は意図的に未実装（v1.0.0 spec で
   非採用を確定。MCP server は実装済み）。
+- マーカー（`# skill-graph-managed`）を持たない `hook <rt> <mode>`
+  形式のコマンドは、bin 名が `skill-graph` の場合のみ自動認識される。
+  手動編集や開発版で書かれた独自名バイナリの hook は `status` で
+  disabled と表示されるため、手動除去するか marker 付きで
+  `adapter enable` を再実行する。
 
 ## Development
 

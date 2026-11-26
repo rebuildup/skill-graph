@@ -83,7 +83,12 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|n| valid_skill_name(n))
-            .unwrap_or_else(|| "invalid-oversized".to_string());
+            // Include a path hash so unrelated oversized files don't
+            // collapse onto one ambiguous name.
+            .unwrap_or_else(|| {
+                let h = hex_digest(path.to_string_lossy().as_bytes());
+                format!("invalid-oversized-{}", &h[..8])
+            });
         return Ok(Skill {
             name: dir_name,
             description: String::new(),
@@ -190,9 +195,16 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
 }
 
 fn split_frontmatter(text: &str) -> (&str, &str) {
+    // Tolerate a UTF-8 BOM and leading blank lines before the fence.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let text = text.trim_start_matches(['\n', '\r']);
     let Some(rest) = text.strip_prefix("---") else {
         return ("", text);
     };
+    // The opening fence must be `---` alone on its line.
+    if !(rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n")) {
+        return ("", text);
+    }
     let Some(end) = rest.find("\n---") else {
         return ("", text);
     };

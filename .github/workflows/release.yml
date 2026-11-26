@@ -39,7 +39,6 @@ jobs:
         run: |
           bin="target/${{ matrix.target }}/release/skill-graph"
           strip "$bin" 2>/dev/null || true
-          cp "$bin" "skill-graph-${{ matrix.target }}"
           mkdir -p pkg
           cp "$bin" pkg/skill-graph
           tar -czf "skill-graph-${{ matrix.target }}.tar.gz" -C pkg skill-graph
@@ -47,9 +46,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: skill-graph-${{ matrix.target }}
-          path: |
-            skill-graph-${{ matrix.target }}
-            skill-graph-${{ matrix.target }}.tar.gz
+          path: skill-graph-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
@@ -79,7 +76,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum skill-graph-* > ../sha256sums.txt
+          sha256sum *.tar.gz > ../sha256sums.txt
           cat ../sha256sums.txt
       - name: GitHub Release
         env:
@@ -89,6 +86,6 @@ jobs:
           tag="$RELEASE_TAG"
           notes="docs/release/${tag}.md"
           [ -f "$notes" ] || notes=""
-          gh release create "$tag" dist/* sha256sums.txt \
+          gh release create "$tag" dist/*.tar.gz sha256sums.txt \
             --title "skill-graph $tag" \
             ${notes:+--notes-file "$notes"} --verify-tag

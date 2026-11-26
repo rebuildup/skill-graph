@@ -345,12 +345,12 @@ pub fn is_skill_md_path(path: &str) -> bool {
 }
 
 /// Skill name implied by a SKILL.md path: the parent directory name.
+/// Returns `None` when the directory name violates the Agent Skills
+/// spec charset — an unvalidated path-derived name must never reach
+/// events or LLM-facing context (prompt-injection vector).
 pub fn skill_name_from_path(path: &str) -> Option<String> {
-    Path::new(path)
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
+    let name = Path::new(path).parent()?.file_name()?.to_string_lossy();
+    crate::parser::valid_skill_name(&name).then(|| name.into_owned())
 }
 
 /// Raw `...SKILL.md` path candidates occurring in free text, in order.
@@ -439,10 +439,18 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
             Access::Reference
         };
         for path in skill_md_paths(segment) {
-            if !is_skill_md_path(&path) || out.iter().any(|(p, _)| *p == path) {
+            if !is_skill_md_path(&path) {
                 continue;
             }
-            out.push((path, access));
+            // Same path seen earlier: keep the stronger access so
+            // `ls x/SKILL.md && cat x/SKILL.md` still counts as a Read.
+            match out.iter_mut().find(|(p, _)| *p == path) {
+                Some((_, a)) if access == Access::Read && *a == Access::Reference => {
+                    *a = Access::Read;
+                }
+                Some(_) => {}
+                None => out.push((path, access)),
+            }
         }
     }
     out

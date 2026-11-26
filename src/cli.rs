@@ -39,7 +39,11 @@ enum Command {
         format: String,
     },
     Recommend {
-        query: String,
+        /// Query text. Use --query-stdin to read it from stdin instead —
+        /// keeps prompts beginning with `-` and prompt bodies off argv.
+        query: Option<String>,
+        #[arg(long)]
+        query_stdin: bool,
         #[arg(long)]
         context: Option<String>,
         #[arg(long)]
@@ -99,8 +103,8 @@ enum Command {
         #[arg(long)]
         bin: Option<String>,
     },
-    /// Normalize a single runtime hook/plugin payload (stdin JSON) into a
-    /// Skill Usage Event. Prints the event JSON, or nothing when the
+    /// Normalize runtime hook/plugin payloads (stdin JSON) into Skill
+    /// Usage Events — one JSON object per line. Prints nothing when a
     /// payload carries no skill-load signal. Detection only — never runs
     /// recommendation or corpus analysis.
     Detect {
@@ -131,11 +135,28 @@ pub fn run() -> Result<(), String> {
         }
         Command::Recommend {
             query,
+            query_stdin,
             context,
             root,
             max,
             format,
         } => {
+            let query = match (query, query_stdin) {
+                (Some(q), false) => q,
+                (None, true) => {
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut buf)
+                        .map_err(|e| format!("failed to read --query-stdin: {e}"))?;
+                    buf
+                }
+                (Some(_), true) => {
+                    return Err("pass either a query argument or --query-stdin, not both".into());
+                }
+                (None, false) => {
+                    return Err("recommend requires a query argument or --query-stdin".into());
+                }
+            };
             let graph = graph_for(roots_or_default(root))?;
             let recs = recommend(&graph, &query, context.as_deref().unwrap_or(""), max);
             print_result(json!(recs), &format)

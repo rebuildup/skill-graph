@@ -316,3 +316,12 @@ fn contract_schemas_reject_invalid_instances() {
         "resolve-name-missing-ambiguous",
     );
 }
+
+#[test]
+fn plugin_manifest_version_matches_crate() {
+    // plugins/skill-graph is bundled verbatim into the npm package; its
+    // manifest version must track the product release (spec §distribution).
+    let manifest: Value =
+        serde_json::from_str(include_str!("../plugins/skill-graph/plugin.json")).unwrap();
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+}

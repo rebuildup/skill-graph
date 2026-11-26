@@ -130,8 +130,18 @@ fn collect_observables_inner(
     for entry in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
         let entry = entry.map_err(|e| e.to_string())?;
         let p = entry.path();
-        // Never recurse through symlinked directories.
         if entry.file_type().map(|t| t.is_symlink()).unwrap_or(false) {
+            // Never recurse through symlinked directories (unbounded
+            // scan risk), but a symlinked .jsonl/.db file is a single
+            // bounded read and is followed.
+            if p.is_file()
+                && matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("jsonl") | Some("db")
+                )
+            {
+                out.push(p);
+            }
             continue;
         }
         if p.is_dir() {
@@ -200,6 +210,17 @@ fn try_passthrough_event(value: &Value, obs: &mut Observation) -> bool {
         return true;
     };
     if event.schema_version != events::SCHEMA_VERSION {
+        obs.lines_skipped += 1;
+        return true;
+    }
+    // Enforce the schema's kind-conditional required fields; the Rust
+    // struct cannot distinguish "missing" from "empty" for Vec fields.
+    let required: &[&str] = match event.kind {
+        EventKind::PromptSubmit => &["prompt_hash"],
+        EventKind::Recommendation => &["recommended", "emitted", "reason", "trigger"],
+        EventKind::SkillLoad => &["skill_name", "detection", "confidence"],
+    };
+    if required.iter().any(|k| value.get(*k).is_none()) {
         obs.lines_skipped += 1;
         return true;
     }
@@ -457,12 +478,27 @@ impl CodexScan {
                     if accesses.is_empty() && input.contains("SKILL.md") {
                         accesses.extend(events::classify_command(input));
                     }
-                    if !accesses.is_empty() {
+                    // Dedup by path keeping the stronger access so one
+                    // call touching the same SKILL.md twice counts once.
+                    let mut deduped: Vec<(String, events::Access)> = Vec::new();
+                    for (path, access) in accesses {
+                        match deduped.iter_mut().find(|(p, _)| *p == path) {
+                            Some((_, a))
+                                if access == events::Access::Read
+                                    && *a == events::Access::Reference =>
+                            {
+                                *a = events::Access::Read;
+                            }
+                            Some(_) => {}
+                            None => deduped.push((path, access)),
+                        }
+                    }
+                    if !deduped.is_empty() {
                         self.pending.push(PendingCall {
                             call_id,
                             session_id: self.session_id.clone(),
                             timestamp: timestamp.clone(),
-                            accesses,
+                            accesses: deduped,
                         });
                     }
                 }
@@ -673,11 +709,20 @@ fn observe_db(
     if has_table == 0 {
         return Err("session_message table not found; skipped".to_string());
     }
-    let mut stmt = conn
-        .prepare(
-            "SELECT session_id, type, data, time_created FROM session_message ORDER BY session_id, seq",
-        )
-        .map_err(|e| format!("prepare: {e}"))?;
+    // `seq` exists in current opencode.db builds but is not contractual;
+    // fall back to rowid so schema drift doesn't skip the whole DB.
+    let has_seq: bool = conn
+        .prepare("PRAGMA table_info(session_message)")
+        .and_then(|mut s| {
+            Ok(s.query_map([], |r| r.get::<_, String>(1))?
+                .any(|c| c.map(|n| n == "seq").unwrap_or(false)))
+        })
+        .unwrap_or(false);
+    let order_col = if has_seq { "seq" } else { "rowid" };
+    let sql = format!(
+        "SELECT session_id, type, data, time_created FROM session_message ORDER BY session_id, {order_col}"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
         .query_map([], |row| {
             Ok((
@@ -914,7 +959,7 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
                 _ => {}
             }
         }
-        session_funnel(&mut f, events, &recs, &loads);
+        session_funnel(&mut f, events, idxs, &recs, &loads);
     }
     f
 }
@@ -924,9 +969,14 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent]) -> Funnel {
 fn session_funnel(
     f: &mut Funnel,
     events: &[&crate::events::SkillUsageEvent],
+    idxs: &[usize],
     recs: &[usize],
     loads: &[usize],
 ) {
+    // Positions within the timestamp-sorted session order; the no-
+    // timestamp fallback must compare order positions, not raw indices.
+    let pos: std::collections::HashMap<usize, usize> =
+        idxs.iter().enumerate().map(|(p, &i)| (i, p)).collect();
     // recommended names from emitted recommendations only — loads of
     // names we never surfaced count as unnecessary per the pilot def.
     let mut recommended_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -971,7 +1021,7 @@ fn session_funnel(
             let load_ts = rfc3339_secs(&load.timestamp);
             let after = match (rec_ts, load_ts) {
                 (Some(a), Some(b)) => b >= a,
-                _ => li > ri,
+                _ => pos.get(&li).zip(pos.get(&ri)).is_some_and(|(l, r)| l > r),
             };
             if !after {
                 continue;

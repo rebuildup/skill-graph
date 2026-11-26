@@ -147,10 +147,16 @@ fn run_case(runtime: &str, scope: &str) {
         "--user"
     };
     let bin = f.bin_arg();
+    // opencode resolves the binary via PATH/plugin env; --bin is rejected.
+    let args: Vec<&str> = if runtime == "opencode" {
+        vec!["adapter", "enable", runtime, scope_flag]
+    } else {
+        vec!["adapter", "enable", runtime, "--bin", &bin, scope_flag]
+    };
 
     // enable twice (idempotent), then disable
     for _ in 0..2 {
-        let (out, rc) = f.run(&["adapter", "enable", runtime, "--bin", &bin, scope_flag]);
+        let (out, rc) = f.run(&args);
         assert_eq!(rc, 0, "{runtime} {scope} enable: {out}");
     }
     let installed = f.config(runtime, scope).expect("config after enable");
@@ -238,8 +244,7 @@ fn status_reports_disabled_and_missing_file() {
 #[test]
 fn opencode_enable_materializes_plugin() {
     let f = Fixture::new();
-    let bin = f.bin_arg();
-    let (out, rc) = f.run(&["adapter", "enable", "opencode", "--bin", &bin, "--user"]);
+    let (out, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
     assert_eq!(rc, 0, "{out}");
     let plugin = f
         .home
@@ -277,8 +282,7 @@ fn opencode_foreign_plugin_names_preserved() {
         r#"{"plugins":["file:///x/my-skill-graph-utils","npm:skill-graph-extra","other-plugin"]}"#,
     )
     .unwrap();
-    let bin = f.bin_arg();
-    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--bin", &bin, "--user"]);
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
     assert_eq!(rc, 0);
     let cfg = f.config("opencode", "--user").unwrap();
     let plugins = cfg["plugins"].as_array().unwrap();
@@ -310,8 +314,7 @@ fn opencode_legacy_plugin_detected_by_status() {
     assert!(out.contains("enabled"), "{out}");
     assert!(out.contains("legacy"), "{out}");
     // enable migrates it to the materialized path
-    let bin = f.bin_arg();
-    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--bin", &bin, "--user"]);
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
     assert_eq!(rc, 0);
     let cfg = f.config("opencode", "--user").unwrap();
     let spec = cfg["plugins"][0].as_str().unwrap();
@@ -456,4 +459,87 @@ fn project_scope_uses_cwd() {
     assert_eq!(rc, 0, "{out}");
     assert!(f.proj.path().join(".codex/hooks.json").is_file());
     assert!(!f.home.path().join(".codex/hooks.json").exists());
+}
+
+#[test]
+fn opencode_rejects_bin_flag() {
+    let f = Fixture::new();
+    let bin = f.bin_arg();
+    let (_, err, rc) = f.run_full(&["adapter", "enable", "opencode", "--bin", &bin, "--user"]);
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("--bin"), "{err}");
+}
+
+#[test]
+fn stale_bin_without_hook_is_rejected() {
+    let f = Fixture::new();
+    // A pre-0.4.0 style binary: executable but no `hook` subcommand.
+    let stale = f.home.path().join("bin/stale-skill-graph");
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, "#!/bin/sh\nexit 1\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (_, err, rc) = f.run_full(&[
+        "adapter",
+        "enable",
+        "claude-code",
+        "--bin",
+        &stale.to_string_lossy(),
+        "--user",
+    ]);
+    assert_ne!(rc, 0, "{err}");
+    assert!(err.contains("does not support"), "{err}");
+    assert!(!f.home.path().join(".claude/settings.json").exists());
+}
+
+#[test]
+fn foreign_empty_hook_group_is_preserved() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"hooks":{"UserPromptSubmit":[{"matcher":"X","hooks":[]},{"hooks":[{"type":"command","command":"/bin/echo hi"}]}]}}"#,
+    )
+    .unwrap();
+    let bin = f.bin_arg();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--bin", &bin, "--user"]);
+    assert_eq!(rc, 0);
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    // The foreign group with a pre-existing empty hooks array must survive.
+    assert!(text.contains(r#""matcher": "X""#), "{text}");
+    assert!(text.contains("/bin/echo hi"), "{text}");
+}
+
+#[test]
+fn opencode_disable_keeps_plugin_dir_while_other_scope_references_it() {
+    let f = Fixture::new();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--project"]);
+    assert_eq!(rc, 0);
+    let plugin = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin/index.ts");
+    assert!(plugin.is_file());
+    // Disabling project scope must not remove the payload the user
+    // config still references.
+    let (_, rc) = f.run(&["adapter", "disable", "opencode", "--project"]);
+    assert_eq!(rc, 0);
+    assert!(
+        plugin.is_file(),
+        "plugin dir removed while user scope active"
+    );
+    let (_, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    assert!(
+        !plugin.exists(),
+        "plugin dir should be removed after last ref"
+    );
 }

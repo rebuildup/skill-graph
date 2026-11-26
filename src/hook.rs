@@ -105,6 +105,8 @@ impl HookEnv {
             opts.mode(0o600);
         }
         if let Ok(mut f) = opts.open(&self.event_log) {
+            // mode(0o600) only applies at creation; tighten pre-existing logs.
+            restrict_perms(&self.event_log);
             let _ = writeln!(f, "{line}");
         }
     }
@@ -178,8 +180,16 @@ impl HookEnv {
         if let Some(parent) = self.recommended_path().parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(self.recommended_path(), all.join("\n") + "\n").is_ok() {
-            restrict_perms(&self.recommended_path());
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        if let Ok(mut f) = opts.open(self.recommended_path()) {
+            use std::io::Write;
+            let _ = f.write_all((all.join("\n") + "\n").as_bytes());
         }
     }
 }
@@ -317,7 +327,7 @@ fn skill_load_prefilter(payload: &Value) -> bool {
         .or_else(|| payload.get("name"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if tool == "Skill" {
+    if tool.eq_ignore_ascii_case("skill") {
         return true;
     }
     let input = payload
@@ -345,8 +355,9 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     }
     // One payload may load several SKILL.md files; every access is logged
     // and each load-grade skill gets its own dependency recommendation.
+    // Discovery+graph build happens once per payload, not per skill.
     let mut contexts = Vec::new();
-    let mut roots_cache: Option<Vec<PathBuf>> = None;
+    let mut graph_cache: Option<crate::resolver::Graph> = None;
     for mut event in detected {
         // Normalize to the sanitized session id so all events agree.
         event.session_id = env.session_id.clone();
@@ -360,10 +371,25 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
         let Some(skill_name) = event.skill_name.clone() else {
             continue;
         };
-        let roots = roots_cache.get_or_insert_with(|| {
-            crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime))
+        let graph = graph_cache.get_or_insert_with(|| {
+            let roots =
+                crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime));
+            build(discover(&roots))
         });
-        if let Some(ctx) = skill_load_context(env, &skill_name, roots) {
+        if graph.skills.is_empty() {
+            // No skills discovered: emit no_roots once and stop.
+            emit_recommendation(
+                env,
+                Trigger::SkillLoad,
+                None,
+                &[],
+                false,
+                "no_roots",
+                Some(0),
+            );
+            return None;
+        }
+        if let Some(ctx) = skill_load_context(env, &skill_name, graph) {
             contexts.push(ctx);
         }
     }
@@ -376,7 +402,11 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
 /// Dependency-recommendation flow for one loaded skill. Emits the
 /// `recommendation` event for every outcome and returns the injection
 /// text only when there is something to surface.
-fn skill_load_context(env: &HookEnv, skill_name: &str, roots: &[PathBuf]) -> Option<String> {
+fn skill_load_context(
+    env: &HookEnv,
+    skill_name: &str,
+    graph: &crate::resolver::Graph,
+) -> Option<String> {
     let dedup_key = format!("skill:{skill_name}");
     if env.marker_exists(&dedup_key) {
         emit_recommendation(
@@ -392,38 +422,11 @@ fn skill_load_context(env: &HookEnv, skill_name: &str, roots: &[PathBuf]) -> Opt
     }
     env.touch_marker(&dedup_key);
 
-    if roots.is_empty() {
-        emit_recommendation(
-            env,
-            Trigger::SkillLoad,
-            None,
-            &[],
-            false,
-            "no_roots",
-            Some(0),
-        );
-        return None;
-    }
-
     // Session continuity (issue #128): names this session's prompt mode
     // already surfaced become recommendation context.
     let session_ctx = env.session_recommended().join(" ");
     let start = Instant::now();
-    let recs = match recommend_names(skill_name, &session_ctx, 5, roots) {
-        Ok(r) => r,
-        Err(_) => {
-            emit_recommendation(
-                env,
-                Trigger::SkillLoad,
-                None,
-                &[],
-                false,
-                "recommender_error",
-                Some(0),
-            );
-            return None;
-        }
-    };
+    let recs = recommend(graph, skill_name, &session_ctx, 5);
     let recommend_ms = start.elapsed().as_millis() as u64;
 
     // recommended[] records exactly the set injected into context so
@@ -479,8 +482,13 @@ fn run_prompt(env: &HookEnv, payload: &Value) -> Option<String> {
         ));
     }
     let phash = events::prompt_hash(&query);
+    // Empty prompts carry no signal; exit before emitting events so
+    // degenerate submits cannot spam the event log.
+    if query.is_empty() {
+        return None;
+    }
     let roots = crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime));
-    if query.is_empty() || roots.is_empty() {
+    if roots.is_empty() {
         emit_recommendation(
             env,
             Trigger::PromptSubmit,
