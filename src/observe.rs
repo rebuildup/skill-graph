@@ -45,6 +45,12 @@ pub struct Observation {
     /// Non-fatal per-file/per-table problems (missing tables, unreadable
     /// files, unsupported schema drift).
     pub errors: Vec<String>,
+    /// Set once the retained-events cap notices truncation; further
+    /// rejections stay silent so `errors` cannot grow with input size.
+    #[serde(skip)]
+    pub events_truncated: bool,
+    #[serde(skip)]
+    pub loads_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -445,12 +451,20 @@ const MAX_OBSERVE_EVENTS: usize = 1_000_000;
 const MAX_OBSERVE_LOADS: usize = 1_000_000;
 
 /// Returns true while `len` is below `max`; emits one truncation notice
-/// at the boundary.
-fn under_cap(len: usize, max: usize, what: &str, errors: &mut Vec<String>) -> bool {
+/// per collection via `noted`, which latches so post-cap rejections do
+/// not grow `errors` with input size.
+fn under_cap(
+    len: usize,
+    max: usize,
+    what: &str,
+    noted: &mut bool,
+    errors: &mut Vec<String>,
+) -> bool {
     if len < max {
         return true;
     }
-    if len == max {
+    if !*noted {
+        *noted = true;
         errors.push(format!("{what} truncated at {max}"));
     }
     false
@@ -475,7 +489,13 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
             .or_default() += 1;
         if let Some(name) = &event.skill_name {
             *obs.skill_loads.entry(name.clone()).or_default() += 1;
-            if under_cap(obs.loads.len(), MAX_OBSERVE_LOADS, "loads", &mut obs.errors) {
+            if under_cap(
+                obs.loads.len(),
+                MAX_OBSERVE_LOADS,
+                "loads",
+                &mut obs.loads_truncated,
+                &mut obs.errors,
+            ) {
                 obs.loads.push(SkillLoad {
                     session_id: event.session_id.clone(),
                     skill: name.clone(),
@@ -495,6 +515,7 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
         obs.events.len(),
         MAX_OBSERVE_EVENTS,
         "events",
+        &mut obs.events_truncated,
         &mut obs.errors,
     ) {
         obs.events.push(event);
