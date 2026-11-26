@@ -13,10 +13,12 @@ dedup verified. Injection *visibility* to the model and `prompt.skills`
 direct selection remain open — see
 `docs/evidence/2026-11-25-v020-opencode-live-verification.md`.
 
-`index.ts` is written against the documented plugin API but has not been run
-against a live OpenCode server. See
-`docs/evidence/2026-11-25-v020-opencode-adapter-feasibility.md` for the design
-basis and the verification checklist.
+Skill-load detection is now implemented: `tool.hook("execute.after")` feeds
+SKILL.md-touching tool calls (early-excluded otherwise) through
+`skill-graph detect --runtime opencode --via plugin`, and the result is
+emitted as a `skill_load` Skill Usage Event to the shared JSONL log.
+`prompt.skills` selections are emitted as `inferred` events. See
+`docs/specs/contracts.md` for the event contract.
 
 ## Design
 

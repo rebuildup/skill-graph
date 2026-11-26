@@ -89,7 +89,7 @@ case "$runtime" in
       UserPromptSubmit: [{hooks: [{type: "command",
         command: ("SKILL_GRAPH_BIN=" + ($sg | @sh) + " " + ($h | @sh) + " prompt"),
         statusMessage: "Recommending skills"}]}],
-      PostToolUse: [{matcher: "Skill", hooks: [{type: "command",
+      PostToolUse: [{matcher: "Bash", hooks: [{type: "command",
         command: ("SKILL_GRAPH_BIN=" + ($sg | @sh) + " " + ($h | @sh) + " skill-load"),
         statusMessage: "Resolving skill dependencies"}]}]
       }

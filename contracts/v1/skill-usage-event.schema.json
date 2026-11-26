@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://skill-graph.local/contracts/v1/skill-usage-event.schema.json",
+  "title": "SkillUsageEvent",
+  "description": "Runtime-neutral normalized observation event. One JSON object per line in event logs; `observe` emits the same shape for transcript/db-derived events. Never contains conversation bodies, command lines, or tool output — prompts are represented by prompt_hash (SHA-256 hex) only.",
+  "type": "object",
+  "required": ["schema_version", "kind", "runtime", "observed_via"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "kind": { "enum": ["prompt_submit", "recommendation", "skill_load"] },
+    "runtime": { "enum": ["claude-code", "codex", "opencode"] },
+    "session_id": { "type": "string" },
+    "timestamp": { "type": "string", "description": "RFC 3339 preferred; may be empty when the source record lacks one" },
+    "observed_via": { "enum": ["hook", "plugin", "transcript", "db"] },
+    "prompt_hash": { "type": "string", "description": "SHA-256 hex of the prompt text; never the text itself" },
+    "trigger": { "enum": ["prompt_submit", "skill_load"], "description": "What caused a recommendation event" },
+    "recommended": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "digest": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "emitted": { "type": "boolean", "description": "Whether the recommendation reached the model/context" },
+    "reason": { "type": "string", "description": "Machine-readable reason when emitted=false or for diagnostics" },
+    "recommend_ms": { "type": "integer", "description": "Recommendation latency in milliseconds (hook/plugin telemetry)" },
+    "skill_name": { "type": "string" },
+    "skill_path": { "type": "string" },
+    "skill_digest": { "type": "string", "description": "SHA-256 of SKILL.md content when a full read was verified" },
+    "detection": {
+      "enum": ["native_invocation", "file_read", "path_reference", "inferred", "mention", "applied"],
+      "description": "native_invocation: runtime-native skill mechanism fired; file_read: SKILL.md content read with corroborating evidence; path_reference: SKILL.md path referenced by a read-like access, content unverified; inferred: weaker heuristic (e.g. runtime skill-selection list); mention: name/path referenced without read evidence; applied: reserved for explicit application confirmation"
+    },
+    "confidence": { "enum": ["high", "medium", "low"] },
+    "tool": { "type": "string", "description": "Runtime tool name that produced the observation" }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "prompt_submit" } }, "required": ["kind"] },
+      "then": { "required": ["prompt_hash"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "recommendation" } }, "required": ["kind"] },
+      "then": { "required": ["recommended", "emitted", "reason", "trigger"] }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "skill_load" } }, "required": ["kind"] },
+      "then": { "required": ["skill_name", "detection", "confidence"] }
+    }
+  ]
+}

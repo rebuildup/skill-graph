@@ -1,0 +1,938 @@
+//! Skill Usage Event — the common normalized observation contract shared by
+//! runtime hooks, plugins, and the read-only `observe` normalizer.
+//!
+//! Canonical schema: `contracts/v1/skill-usage-event.schema.json`.
+//! Events never carry conversation bodies, command lines, or tool output;
+//! prompts are represented by `prompt_hash` (SHA-256 hex) only.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    PromptSubmit,
+    Recommendation,
+    SkillLoad,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Runtime {
+    ClaudeCode,
+    Codex,
+    Opencode,
+}
+
+impl Runtime {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "claude-code" => Some(Self::ClaudeCode),
+            "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::Opencode),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Opencode => "opencode",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedVia {
+    Hook,
+    Plugin,
+    Transcript,
+    Db,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    PromptSubmit,
+    SkillLoad,
+}
+
+/// How strongly the observation supports "the skill was loaded".
+/// Ordered weakest→strongest is NOT the declaration order; rank via
+/// `load_rank` where needed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Detection {
+    /// Runtime-native skill mechanism fired (e.g. Claude `Skill` tool).
+    NativeInvocation,
+    /// SKILL.md content was read; identity corroborated by frontmatter.
+    FileRead,
+    /// A SKILL.md path was referenced by a read-like access, but the
+    /// content could not be verified.
+    PathReference,
+    /// Weaker heuristic signal (e.g. runtime skill-selection list).
+    Inferred,
+    /// Name/path mentioned without read evidence. Emitted by `observe`
+    /// only; hooks do not produce this.
+    Mention,
+    /// Reserved: explicit confirmation that the skill was applied.
+    /// No emitter produces this yet.
+    Applied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecommendedSkill {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SkillUsageEvent {
+    pub schema_version: u32,
+    pub kind: EventKind,
+    pub runtime: Runtime,
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub timestamp: String,
+    pub observed_via: ObservedVia,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<Trigger>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recommended: Vec<RecommendedSkill>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emitted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommend_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detection: Option<Detection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<Confidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+}
+
+impl SkillUsageEvent {
+    pub fn prompt_submit(
+        runtime: Runtime,
+        observed_via: ObservedVia,
+        session_id: &str,
+        timestamp: &str,
+        prompt: &str,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            kind: EventKind::PromptSubmit,
+            runtime,
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            observed_via,
+            prompt_hash: Some(sha256_hex(prompt.as_bytes())),
+            trigger: None,
+            recommended: Vec::new(),
+            emitted: None,
+            reason: None,
+            recommend_ms: None,
+            skill_name: None,
+            skill_path: None,
+            skill_digest: None,
+            detection: None,
+            confidence: None,
+            tool: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn recommendation(
+        runtime: Runtime,
+        observed_via: ObservedVia,
+        session_id: &str,
+        timestamp: &str,
+        prompt_hash: Option<String>,
+        trigger: Trigger,
+        names: Vec<RecommendedSkill>,
+        emitted: bool,
+        reason: &str,
+        recommend_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            kind: EventKind::Recommendation,
+            runtime,
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            observed_via,
+            prompt_hash,
+            trigger: Some(trigger),
+            recommended: names,
+            emitted: Some(emitted),
+            reason: Some(reason.to_string()),
+            recommend_ms,
+            skill_name: None,
+            skill_path: None,
+            skill_digest: None,
+            detection: None,
+            confidence: None,
+            tool: None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn skill_load(
+        runtime: Runtime,
+        observed_via: ObservedVia,
+        session_id: &str,
+        timestamp: &str,
+        tool: Option<String>,
+        skill_name: Option<String>,
+        skill_path: Option<String>,
+        detection: Detection,
+        confidence: Confidence,
+    ) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            kind: EventKind::SkillLoad,
+            runtime,
+            session_id: session_id.to_string(),
+            timestamp: timestamp.to_string(),
+            observed_via,
+            prompt_hash: None,
+            trigger: None,
+            recommended: Vec::new(),
+            emitted: None,
+            reason: None,
+            recommend_ms: None,
+            skill_name,
+            skill_path,
+            skill_digest: None,
+            detection: Some(detection),
+            confidence: Some(confidence),
+            tool,
+        }
+    }
+
+    /// True when the event counts as a load signal for funnel metrics.
+    /// `mention` is a reference, not a load.
+    pub fn counts_as_load(&self) -> bool {
+        self.kind == EventKind::SkillLoad && self.detection != Some(Detection::Mention)
+    }
+}
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+pub fn prompt_hash(text: &str) -> String {
+    sha256_hex(text.as_bytes())
+}
+
+/// Current time as RFC 3339 (UTC, second precision). Implemented without
+/// external datetime crates to keep the dependency surface small.
+pub fn rfc3339_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    unix_secs_to_rfc3339(secs)
+}
+
+/// Milliseconds since epoch → RFC 3339.
+pub fn epoch_ms_to_rfc3339(ms: i64) -> String {
+    unix_secs_to_rfc3339(ms.div_euclid(1000).max(0) as u64)
+}
+
+fn unix_secs_to_rfc3339(secs: u64) -> String {
+    // civil-from-days (Howard Hinnant's algorithm).
+    let days = (secs / 86_400) as i64;
+    let sod = secs % 86_400;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
+}
+
+/// Extract the `name:` field from a YAML frontmatter block, wherever it
+/// appears in `text` (tool output may carry a prefix such as `Output:`).
+pub fn frontmatter_name(text: &str) -> Option<String> {
+    let mut rest = text;
+    loop {
+        let start = rest.find("---")?;
+        // The opening fence must be at a line boundary.
+        let line_start =
+            start == 0 || rest[..start].ends_with('\n') || rest[..start].ends_with("\r\n");
+        if !line_start {
+            rest = &rest[start + 3..];
+            continue;
+        }
+        let after = &rest[start + 3..];
+        let end_rel = find_line_fence(after)?;
+        let block = &after[..end_rel];
+        for line in block.lines() {
+            let line = line.trim_end();
+            if let Some(value) = line.strip_prefix("name:") {
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        return None;
+    }
+}
+
+/// Find the offset of the next line that is exactly `---` (the closing
+/// fence), relative to `text` which starts just after the opening fence.
+fn find_line_fence(text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed == "---" {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Whether `path` points at a file named exactly `SKILL.md`.
+pub fn is_skill_md_path(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n == "SKILL.md")
+}
+
+/// Skill name implied by a SKILL.md path: the parent directory name.
+pub fn skill_name_from_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+}
+
+/// Raw `...SKILL.md` path candidates occurring in free text, in order.
+/// Candidates are maximal non-delimiter runs ending at `SKILL.md`; callers
+/// must still validate with `is_skill_md_path`.
+pub fn skill_md_paths(text: &str) -> Vec<String> {
+    const NEEDLE: &[u8] = b"SKILL.md";
+    fn is_path_byte(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'.'
+                    | b'_'
+                    | b'-'
+                    | b'~'
+                    | b'$'
+                    | b'{'
+                    | b'}'
+                    | b'%'
+                    | b'*'
+                    | b'?'
+                    | b'+'
+                    | b':'
+                    | b'@'
+                    | b'='
+                    | b','
+            )
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + NEEDLE.len() <= bytes.len() {
+        if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
+            pos += 1;
+            continue;
+        }
+        let end = pos + NEEDLE.len();
+        let mut start = pos;
+        while start > 0 && is_path_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        // Trim a leading run that cannot begin a path (e.g. `foo=bar/SKILL.md`
+        // keeps `bar/SKILL.md` only if `=` were allowed — it is, so instead we
+        // accept the whole run; `is_skill_md_path` filters non-SKILL.md names).
+        if let Ok(candidate) = std::str::from_utf8(&bytes[start..end])
+            && !candidate.is_empty()
+            && !out.iter().any(|p| p == candidate)
+        {
+            out.push(candidate.to_string());
+        }
+        pos = end;
+    }
+    out
+}
+
+/// How a shell command segment treats a SKILL.md reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    /// A read-like verb accesses the file (content likely enters context).
+    Read,
+    /// Non-read reference (grep/find/ls/copy/edit/etc.).
+    Reference,
+}
+
+const READ_VERBS: &[&str] = &[
+    "bat", "batcat", "cat", "head", "tail", "less", "more", "most", "sed", "awk", "gawk", "mawk",
+    "nawk", "perl", "ruby", "python", "python2", "python3", "node", "bun", "deno", "php", "lua",
+    "julia", "R", "bash", "sh", "zsh", "fish", "jq", "yq", "xxd", "od", "hexdump", "strings",
+    "sort", "uniq", "cut", "tr", "fold", "fmt", "nl", "column", "tac", "rev", "view", "splain",
+];
+
+const TRANSPARENT_PREFIXES: &[&str] = &[
+    "sudo", "env", "time", "nice", "nohup", "command", "builtin", "xargs", "exec", "doas",
+];
+
+/// Classify how `command` accesses SKILL.md files. Returns `None` when no
+/// SKILL.md path is referenced at all.
+pub fn classify_command(command: &str) -> Option<(String, Access)> {
+    let paths: Vec<String> = skill_md_paths(command)
+        .into_iter()
+        .filter(|p| is_skill_md_path(p))
+        .collect();
+    let path = paths.into_iter().next()?;
+    let access = if command_has_read_verb(command) {
+        Access::Read
+    } else {
+        Access::Reference
+    };
+    Some((path, access))
+}
+
+fn command_has_read_verb(command: &str) -> bool {
+    command
+        .split(['&', ';', '|', '\n'])
+        .any(segment_has_read_verb)
+}
+
+fn segment_has_read_verb(segment: &str) -> bool {
+    let mut words = segment.split_whitespace().peekable();
+    let verb = loop {
+        // Skip leading VAR=value assignments.
+        while let Some(w) = words.peek() {
+            let w = w.trim_matches(|c| c == '"' || c == '\'');
+            if w.contains('=') && !w.starts_with('=') {
+                words.next();
+            } else {
+                break;
+            }
+        }
+        let w = match words.next() {
+            Some(w) => w.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == '`'),
+            None => return false,
+        };
+        // Skip transparent wrappers (sudo, env, xargs, ...); `xargs cat`
+        // style still resolves to the inner verb.
+        if TRANSPARENT_PREFIXES.contains(&w) {
+            continue;
+        }
+        break w.rsplit('/').next().unwrap_or(w);
+    };
+    READ_VERBS.contains(&verb)
+}
+
+/// `true` when the tool looks like it reads file content rather than
+/// executing a shell command. Used to decide whether `input.path`-style
+/// fields should be treated as reads.
+fn is_read_tool(tool: &str) -> bool {
+    matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "read" | "view" | "notebook_read" | "read_file"
+    )
+}
+
+fn is_command_tool(tool: &str) -> bool {
+    matches!(
+        tool.to_ascii_lowercase().as_str(),
+        "bash" | "shell" | "exec" | "exec_command" | "run_terminal_cmd" | "terminal" | "powershell"
+    )
+}
+
+/// Classify a structured tool access (hook payload or transcript tool item),
+/// gated on the tool name so that e.g. a `Write` to SKILL.md is not a load.
+///
+/// `tool` is the runtime tool name; `input` its arguments object; `output`
+/// the captured tool output text when available (may be empty).
+/// Returns `None` when the access is not skill-related at all.
+pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<LoadClassification> {
+    let lower = tool.to_ascii_lowercase();
+    if lower == "skill" {
+        let raw = input
+            .get("skill")
+            .or_else(|| input.get("name"))
+            .or_else(|| input.get("skill_name"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return Some(LoadClassification {
+            skill_name: normalize_skill_name(raw),
+            skill_path: None,
+            detection: Detection::NativeInvocation,
+            confidence: Confidence::High,
+        });
+    }
+    if is_read_tool(&lower) {
+        for key in ["path", "file_path", "notebook_path"] {
+            if let Some(path) = input.get(key).and_then(Value::as_str)
+                && is_skill_md_path(path)
+            {
+                return Some(classify_file_read(path, output));
+            }
+        }
+        return None;
+    }
+    if is_command_tool(&lower) {
+        for key in ["command", "cmd", "input"] {
+            if let Some(command) = input.get(key).and_then(Value::as_str)
+                && let Some((path, access)) = classify_command(command)
+            {
+                return Some(match access {
+                    Access::Read => classify_file_read(&path, output),
+                    Access::Reference => LoadClassification {
+                        skill_name: skill_name_from_path(&path),
+                        skill_path: Some(path),
+                        detection: Detection::Mention,
+                        confidence: Confidence::Low,
+                    },
+                });
+            }
+        }
+    }
+    None
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadClassification {
+    pub skill_name: Option<String>,
+    pub skill_path: Option<String>,
+    pub detection: Detection,
+    pub confidence: Confidence,
+}
+
+fn classify_file_read(path: &str, output: &str) -> LoadClassification {
+    let dir_name = skill_name_from_path(path);
+    if let Some(name) = frontmatter_name(output) {
+        LoadClassification {
+            skill_name: Some(name),
+            skill_path: Some(path.to_string()),
+            detection: Detection::FileRead,
+            confidence: Confidence::High,
+        }
+    } else {
+        LoadClassification {
+            skill_name: dir_name,
+            skill_path: Some(path.to_string()),
+            detection: Detection::PathReference,
+            confidence: Confidence::Medium,
+        }
+    }
+}
+
+/// Normalize a skill name: strip namespace/path prefixes (`plugin:foo/bar`
+/// -> `bar`).
+pub fn normalize_skill_name(raw: &str) -> Option<String> {
+    raw.rsplit(['/', ':'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extract `exec_command({cmd: "..."})` command strings from Codex `exec`
+/// tool JS source. Falls back to treating recognizable shell-looking
+/// fragments conservatively (returns empty when nothing parses).
+pub fn extract_exec_commands(js: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = js.as_bytes();
+    let mut pos = 0usize;
+    while let Some(found) = find_subslice(&bytes[pos..], b"exec_command") {
+        let base = pos + found;
+        // Look for `cmd` then `:` then a quoted string within a window.
+        let window_end = (base + 4096).min(bytes.len());
+        let Some(window) = js.get(base..window_end) else {
+            pos = base + "exec_command".len();
+            continue;
+        };
+        if let Some(cmd) = extract_cmd_param(window)
+            && !cmd.trim().is_empty()
+            && !out.contains(&cmd)
+        {
+            out.push(cmd);
+        }
+        pos = base + "exec_command".len();
+    }
+    out
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Within a window starting at `exec_command`, find `cmd:`/`cmd =` followed
+/// by a single- or double-quoted string; return its unescaped contents.
+fn extract_cmd_param(window: &str) -> Option<String> {
+    let bytes = window.as_bytes();
+    let mut pos = 0usize;
+    while pos + 3 < bytes.len() {
+        if &bytes[pos..pos + 3] == b"cmd" {
+            let mut i = pos + 3;
+            while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'=') {
+                i += 1;
+                while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+                    i += 1;
+                }
+                if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                    let quote = bytes[i];
+                    i += 1;
+                    let start = i;
+                    let mut result = String::new();
+                    while i < bytes.len() {
+                        let b = bytes[i];
+                        if b == quote {
+                            if start == i && result.is_empty() {
+                                return Some(String::new());
+                            }
+                            result.push_str(&window[start..i]);
+                            return Some(unescape_js(&result));
+                        }
+                        if b == b'\\' && i + 1 < bytes.len() {
+                            // Keep escape sequences verbatim-ish: copy both
+                            // bytes; unescape_js handles common cases.
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                    }
+                    // Unterminated — take what we have.
+                    result.push_str(&window[start..i.min(bytes.len())]);
+                    return Some(unescape_js(&result));
+                }
+            }
+        }
+        pos += 1;
+    }
+    None
+}
+
+fn unescape_js(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('\'') => out.push('\''),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Pull displayable text out of a tool_response / tool result payload.
+/// Handles plain strings, `{content|stdout|output|text}` objects, and
+/// arrays of `{type:"text",text}` items (Codex rollout output shape).
+pub fn response_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                Value::String(s) => s.clone(),
+                other => other
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(map) => {
+            for key in ["content", "stdout", "output", "text", "result"] {
+                if let Some(v) = map.get(key) {
+                    let text = response_text(v);
+                    if !text.is_empty() {
+                        return text;
+                    }
+                }
+            }
+            String::new()
+        }
+        _ => String::new(),
+    }
+}
+
+/// Normalize a runtime hook/plugin payload into a `skill_load` event.
+///
+/// Accepts the union of shapes emitted by the shell-hook adapters
+/// (`tool_name`/`tool_input`/`tool_response`/`session_id`) and the OpenCode
+/// plugin (`tool`/`input`/`result`/`sessionID`). Returns `None` when the
+/// payload carries no skill-load signal — callers use this for cheap early
+/// exclusion before doing any recommendation work.
+pub fn detect_from_payload(
+    runtime: Runtime,
+    observed_via: ObservedVia,
+    payload: &Value,
+) -> Option<SkillUsageEvent> {
+    let tool = payload
+        .get("tool_name")
+        .or_else(|| payload.get("tool"))
+        .or_else(|| payload.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let input = payload
+        .get("tool_input")
+        .or_else(|| payload.get("input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let output_value = payload
+        .get("tool_response")
+        .or_else(|| payload.get("result"))
+        .or_else(|| payload.get("output"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let output = response_text(&output_value);
+    let session_id = payload
+        .get("session_id")
+        .or_else(|| payload.get("sessionID"))
+        .or_else(|| payload.get("sessionId"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    // Codex `exec` tool: input is JS source, not a shell command. Extract
+    // exec_command cmd strings and classify each; emit the strongest signal.
+    if tool.eq_ignore_ascii_case("exec") {
+        let js = input.as_str().unwrap_or("");
+        let mut best: Option<LoadClassification> = None;
+        for cmd in extract_exec_commands(js) {
+            if let Some((path, access)) = classify_command(&cmd) {
+                let c = match access {
+                    Access::Read => classify_file_read(&path, &output),
+                    Access::Reference => LoadClassification {
+                        skill_name: skill_name_from_path(&path),
+                        skill_path: Some(path),
+                        detection: Detection::Mention,
+                        confidence: Confidence::Low,
+                    },
+                };
+                if best.as_ref().is_none_or(|b| rank(&c) > rank(b)) {
+                    best = Some(c);
+                }
+            }
+        }
+        if js.contains("SKILL.md")
+            && best.is_none()
+            && let Some((path, access)) = classify_command(js)
+        {
+            best = Some(match access {
+                Access::Read => classify_file_read(&path, &output),
+                Access::Reference => LoadClassification {
+                    skill_name: skill_name_from_path(&path),
+                    skill_path: Some(path),
+                    detection: Detection::Mention,
+                    confidence: Confidence::Low,
+                },
+            });
+        }
+        return best.map(|c| {
+            SkillUsageEvent::skill_load(
+                runtime,
+                observed_via,
+                session_id,
+                &rfc3339_now(),
+                Some(tool.to_string()),
+                c.skill_name,
+                c.skill_path,
+                c.detection,
+                c.confidence,
+            )
+        });
+    }
+
+    classify_tool_access(tool, &input, &output)
+        .filter(|c| c.skill_name.is_some())
+        .map(|c| {
+            SkillUsageEvent::skill_load(
+                runtime,
+                observed_via,
+                session_id,
+                &rfc3339_now(),
+                Some(tool.to_string()),
+                c.skill_name,
+                c.skill_path,
+                c.detection,
+                c.confidence,
+            )
+        })
+}
+
+fn rank(c: &LoadClassification) -> u8 {
+    match c.detection {
+        Detection::NativeInvocation | Detection::FileRead | Detection::Applied => 4,
+        Detection::PathReference => 3,
+        Detection::Inferred => 2,
+        Detection::Mention => 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn frontmatter_name_finds_name_line() {
+        assert_eq!(
+            frontmatter_name("---\nname: alpha-skill\ndescription: x\n---\nbody"),
+            Some("alpha-skill".to_string())
+        );
+        assert_eq!(
+            frontmatter_name("Output:\n{\"output\":\"---\\nname: beta\\n---\\n\"}"),
+            None // escaped JSON is not raw frontmatter
+        );
+        assert_eq!(frontmatter_name("no frontmatter"), None);
+    }
+
+    #[test]
+    fn skill_md_paths_extracts_candidates() {
+        let paths = skill_md_paths("cat .agents/skills/alpha-skill/SKILL.md now");
+        assert_eq!(paths, vec![".agents/skills/alpha-skill/SKILL.md"]);
+        assert!(skill_md_paths("ls skills/").is_empty());
+        assert!(is_skill_md_path("a/b/SKILL.md"));
+        assert!(!is_skill_md_path("a/b/MYSKILL.md"));
+        assert!(!is_skill_md_path("a/b/SKILL.mdx"));
+    }
+
+    #[test]
+    fn classify_command_distinguishes_read_and_reference() {
+        let (p, a) = classify_command("cat .agents/skills/x/SKILL.md").unwrap();
+        assert_eq!(p, ".agents/skills/x/SKILL.md");
+        assert_eq!(a, Access::Read);
+        let (_, a) = classify_command("grep foo .agents/skills/x/SKILL.md").unwrap();
+        assert_eq!(a, Access::Reference);
+        let (_, a) = classify_command("find . -name SKILL.md").unwrap();
+        assert_eq!(a, Access::Reference);
+        let (_, a) = classify_command("sed -n '1,5p' x/SKILL.md | head").unwrap();
+        assert_eq!(a, Access::Read);
+        assert!(classify_command("ls .agents/skills").is_none());
+        let (_, a) = classify_command("sudo cat /tmp/sg/SKILL.md").unwrap();
+        assert_eq!(a, Access::Read);
+    }
+
+    #[test]
+    fn classify_tool_access_verifies_frontmatter() {
+        let input = json!({"command": "cat .agents/skills/x/SKILL.md"});
+        let out = "---\nname: real-name\n---\nbody";
+        let c = classify_tool_access("Bash", &input, out).unwrap();
+        assert_eq!(c.detection, Detection::FileRead);
+        assert_eq!(c.confidence, Confidence::High);
+        assert_eq!(c.skill_name.as_deref(), Some("real-name"));
+
+        let c = classify_tool_access("Bash", &input, "command failed").unwrap();
+        assert_eq!(c.detection, Detection::PathReference);
+        assert_eq!(c.confidence, Confidence::Medium);
+        assert_eq!(c.skill_name.as_deref(), Some("x"));
+
+        let input = json!({"command": "grep foo x/SKILL.md"});
+        let c = classify_tool_access("shell", &input, "").unwrap();
+        assert_eq!(c.detection, Detection::Mention);
+        assert_eq!(c.confidence, Confidence::Low);
+
+        // Write tool to SKILL.md is not a load.
+        let input = json!({"file_path": "x/SKILL.md", "content": "new"});
+        assert!(classify_tool_access("Write", &input, "").is_none());
+        let input = json!({"path": "x/SKILL.md"});
+        let c = classify_tool_access("Read", &input, out).unwrap();
+        assert_eq!(c.detection, Detection::FileRead);
+    }
+
+    #[test]
+    fn native_skill_tool_is_high_confidence() {
+        let input = json!({"skill": "plugin:ns/alpha-skill"});
+        let c = classify_tool_access("Skill", &input, "").unwrap();
+        assert_eq!(c.detection, Detection::NativeInvocation);
+        assert_eq!(c.skill_name.as_deref(), Some("alpha-skill"));
+    }
+
+    #[test]
+    fn extract_exec_commands_parses_js() {
+        let js = "text(await tools.exec_command({cmd:\"cat .agents/skills/x/SKILL.md\"}))\n";
+        let cmds = extract_exec_commands(js);
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].contains("SKILL.md"));
+        assert!(extract_exec_commands("text(1+1)").is_empty());
+    }
+
+    #[test]
+    fn response_text_handles_shapes() {
+        assert_eq!(response_text(&json!("plain")), "plain");
+        assert_eq!(
+            response_text(
+                &json!([{"type":"input_text","text":"a"},{"type":"input_text","text":"b"}])
+            ),
+            "a\nb"
+        );
+        assert_eq!(
+            response_text(&json!({"output":[{"text":"inner"}]})),
+            "inner"
+        );
+    }
+
+    #[test]
+    fn rfc3339_conversion() {
+        assert_eq!(unix_secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch_ms_to_rfc3339(1793321018917), "2026-10-30T00:43:38Z");
+    }
+}

@@ -22,7 +22,9 @@ Verified against the Codex hooks documentation (2026-11):
 
 - `hooks.json` — template. `${SKILL_GRAPH_HOOK_BIN}` must be replaced with the
   absolute path of `bin/skill-graph-recommend-hook` at install time (Codex does
-  not expand plugin-root variables).
+  not expand plugin-root variables). `PostToolUse` uses matcher `Bash` because
+  Codex has no native skill tool — SKILL.md reads surface as Bash commands
+  and are classified by `skill-graph detect`.
 - `bin/skill-graph-recommend-hook` — the hook entrypoint (same contract as the
   Claude Code adapter; default skill roots include `~/.codex/skills`,
   `~/.agents/skills`, and `$PWD`-relative `.codex`/`.agents`/`skills` dirs).
