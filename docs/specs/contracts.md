@@ -23,7 +23,11 @@ text content の両方で返す。
 | `resolve` | `resolve --format json` | `resolve-result.schema.json` |
 
 引数 `roots` は tool ごとに optional。未指定時は `SKILL_GRAPH_ROOTS`
-→ 既定 root の順で解決する（hook/plugin と同一規則）。tool は event
+→ 既定 root の順で解決する（hook/plugin と同一規則）。`roots` を
+明示した場合は配列であることが必須（非配列は `invalid_params`）。
+配列が存在する場合、その配列が探索範囲を定義する: `[]` や全要素が
+非文字列・32 件超過で落ちた場合でも既定 root へは拡大せず、
+診断付きの空の走査に縮退する（#177 と同一規則）。tool は event
 log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 （`observed_via` に `mcp` は存在しない）。
 
@@ -51,11 +55,15 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   `skill_path` 1024、`tool`/`skill_name`/`recommended[].name` 256、
   `reason` 1024、`prompt_hash`/`skill_digest`/`recommended[].digest` 128、
   `timestamp` 64 文字。`recommended` は最大 32 件
-  （`MAX_RECOMMENDED`）で打ち切られる。charset 違反のみで構成される
-  `session_id` は `unknown-<hash>` に正規化され、互いに異なる不正 id が
-  同一 funnel session に merge されない。`recommended[].name` は schema の
-  `minLength: 1` より厳しく valid skill name を要求する — schema 適合でも
-  観測側の join キーにならない名前は `lines_skipped` に計上される。
+  （`MAX_RECOMMENDED`）で打ち切られる。`skill_load.skill_name` は
+  `recommended[].name` と同じ valid skill name 規則を要求し、違反行は
+  `lines_skipped` に計上される（constructor が emit し得ない名前を
+  funnel join キーに流入させない）。charset フィルタで除去される
+  文字を含む `session_id` は merge されうる（例: `a:b` と `ab` は
+  共に `ab`）— これは sanitize の定義済み動作。`recommended[].name` は
+  schema の `minLength: 1` より厳しく valid skill name を要求する —
+  schema 適合でも観測側の join キーにならない名前は `lines_skipped`
+  に計上される。
 - `detect` は 1 payload あたり最大 64 event を emit する
   （`MAX_EVENTS_PER_PAYLOAD`）。超過分は打ち切られ、通知はない。
 - dedup event の記録は adapter 固有: Rust hook は repeat を
@@ -79,13 +87,23 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   持たない unattributable load は率から除外される（`load_grade_loads` との差が
   帰属不能分）。`loads_per_session` は全 load-grade load を session 数で
   割る top-level 指標であり、帰属不能 load を含む。
-- `observe` の保持量には集約上限がある: 入力ファイル数 4096、ファイル毎
-  256 MiB（`.db` は `-wal` 込み）、retained events/loads 各 1,000,000。
-  超過時は `errors` に打ち切り通知が入り、`runtimes`/`skill_loads` の
-  集計カウンタは正確なまま維持される。
+- `observe` の保持量には集約上限がある: 入力ファイル数 4096、
+  ディレクトリ再帰深さ 64、走査エラー 1024 件、ファイル毎 256 MiB
+  （`.db` は `-wal` 込み）、retained events/loads 各 1,000,000、
+  retained detail 合計 64 MiB（イベント/ロードの推定バイト数 —
+  count 上限だけでは contract 適合の巨大イベントでメモリを
+  尽くしうるため）。超過時は `errors` に打ち切り通知が入り、
+  `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される。
+- `observe --summary` の conversion 集計は決定的に制限される:
+  name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
+  欠落時の encounter-order fallback は rec×load の組合せ検査を
+  最大 8,000,000 回で打ち切る（超過後の rec は convert しない。
+  rec 順序は固定なので結果は決定的）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
-  丸め）で rec→load の差分を取る。不正 timestamp は "unknown time"
-  扱いで timeliness から除外される。
+  丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
+  `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
+  ため受理する。offset なし・コロンなし offset・暦上不正な値は
+  "unknown time" 扱いで timeliness から除外される。
 
 ## Skill Usage Event（v1）
 

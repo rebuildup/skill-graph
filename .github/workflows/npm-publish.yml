@@ -114,11 +114,22 @@ jobs:
               }
             else
               # cross-compiled binaries cannot exec on this runner;
-              # verify the object format matches the target rather than
-              # trusting any non-empty `file` output.
+              # verify the object format AND architecture match the
+              # target rather than trusting any non-empty `file` output —
+              # an x86-64 ELF inside linux-arm64 still contains 'ELF'.
               case "$target" in
-                linux-*) file "$pkg/bin/skill-graph" | grep -q 'ELF' ;;
-                darwin-*) file "$pkg/bin/skill-graph" | grep -q 'Mach-O' ;;
+                linux-x64)
+                  file "$pkg/bin/skill-graph" | grep -q 'ELF' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'x86-64' ;;
+                linux-arm64)
+                  file "$pkg/bin/skill-graph" | grep -q 'ELF' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'aarch64' ;;
+                darwin-x64)
+                  file "$pkg/bin/skill-graph" | grep -q 'Mach-O' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'x86_64' ;;
+                darwin-arm64)
+                  file "$pkg/bin/skill-graph" | grep -q 'Mach-O' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'arm64' ;;
                 *) echo "unknown npm target: $target" >&2; exit 1 ;;
               esac
             fi

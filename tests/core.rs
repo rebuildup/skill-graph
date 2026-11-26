@@ -392,3 +392,30 @@ fn resolver_mentions_are_capped_per_skill() {
         .count();
     assert_eq!(mentions, 64, "mention cap should engage deterministically");
 }
+
+/// #144 round-11: a CJK run that contains a recognized dictionary word
+/// plus uncovered characters (particles/suffixes like する) must still
+/// count as ONE evidence unit. Previously the uncovered bigrams fell
+/// back to run-level provenance, giving the same utterance a second
+/// source (`{key, run}`) and letting `レビューする` self-admit — the
+/// hole the key-scoped bigram fix was meant to close.
+#[test]
+fn cjk_key_plus_particle_cannot_self_admit() {
+    let graph = build(discover(&[fixture_root()]));
+
+    // One run = glossary key レビュー + uncovered する: only the key's
+    // provenance survives, so description admission (needs 2 sources)
+    // must fail.
+    let recs = recommend(&graph, "レビューする", "", 5);
+    assert!(
+        !recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "key+particle run self-admitted: {recs:?}"
+    );
+
+    // Two independent runs still admit.
+    let recs = recommend(&graph, "レビューする テスト", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "independent second source should admit: {recs:?}"
+    );
+}

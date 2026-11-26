@@ -425,25 +425,52 @@ fn shell_words(command: &str) -> Vec<String> {
     words
 }
 
-/// True when some shell word is the v0.3.x
-/// `skill-graph-recommend-hook` binary (matched by file name, so a
-/// foreign command merely mentioning the string is not claimed).
+/// A word is a `NAME=value` environment assignment when the name is a
+/// valid shell identifier and `=` is not the first character.
+fn is_env_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
+    let name = &word[..eq];
+    !name.is_empty()
+        && name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit()))
+}
+
+/// Index of the shell command word: skips leading `NAME=value`
+/// assignments and `env` prefixes — legacy hooks embed
+/// `SKILL_GRAPH_BIN=…` before the binary, so the marker must be the
+/// command word, not merely an argument (`echo /x/skill-graph-recommend-hook`
+/// is a foreign mention and must not be claimed).
+fn command_word_index(words: &[String]) -> Option<usize> {
+    let mut i = 0;
+    while i < words.len() {
+        if is_env_assignment(&words[i]) || words[i] == "env" {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    (i < words.len()).then_some(i)
+}
+
+/// The word is a legacy v0.3.x hook binary path: contains a `/` (legacy
+/// hooks always embedded a path, so a bare marker word is a foreign
+/// mention) and its file name is the marker. URLs are excluded — a
+/// curl|sh one-liner merely ending in the marker filename is not ours.
+fn is_legacy_bin_word(tok: &str) -> bool {
+    !tok.contains("://")
+        && tok.contains('/')
+        && Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
+}
+
+/// True when the command word is the v0.3.x
+/// `skill-graph-recommend-hook` binary.
 fn has_legacy_hook_bin(command: &str) -> bool {
-    shell_words(command).iter().any(|tok| {
-        // A URL merely ending in the marker filename (e.g. a curl|sh
-        // one-liner) must not be claimed for deletion.
-        if tok.contains("://") {
-            return false;
-        }
-        // Legacy hooks always embedded an absolute/relative PATH to the
-        // binary — a bare `skill-graph-recommend-hook` word (e.g. in
-        // `echo skill-graph-recommend-hook`) is a foreign mention, not
-        // an invocation, and must not be claimed.
-        if !tok.contains('/') {
-            return false;
-        }
-        Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
-    })
+    let words = shell_words(command);
+    command_word_index(&words).is_some_and(|i| is_legacy_bin_word(&words[i]))
 }
 
 /// A hook command is ours when it carries a legacy marker, our ownership
@@ -548,7 +575,18 @@ fn read_config(path: &Path) -> Result<Value, String> {
 /// gets a unique name created with O_EXCL so a pre-planted symlink or a
 /// concurrent writer cannot redirect the write.
 fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
-    let target = if path.is_symlink() {
+    write_text_atomic_mode(path, text, true)
+}
+
+/// `resolve_final_symlink` selects dotfiles semantics (write THROUGH a
+/// final symlink to its target) vs managed-payload semantics (rename
+/// REPLACES the symlink itself, never writing through it).
+fn write_text_atomic_mode(
+    path: &Path,
+    text: &str,
+    resolve_final_symlink: bool,
+) -> Result<(), String> {
+    let target = if resolve_final_symlink && path.is_symlink() {
         std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?
     } else {
         path.to_path_buf()
@@ -710,11 +748,17 @@ fn strip_our_hooks(config: &mut Value) {
             any_pruned = true;
             // Prune the group only if stripping emptied it; groups that
             // never had a `hooks` array are foreign shapes and stay.
-            group
-                .get("hooks")
-                .and_then(Value::as_array)
-                .map(|l| !l.is_empty())
-                .unwrap_or(true)
+            // An emptied group is dropped only when nothing foreign
+            // remains: sibling keys ("note", extra matchers) are user
+            // data and must survive — keep the group with its empty
+            // hooks array rather than deleting them.
+            match group.get("hooks").and_then(Value::as_array) {
+                Some(list) if list.is_empty() => group
+                    .as_object()
+                    .map(|o| o.keys().any(|k| k != "hooks" && k != "matcher"))
+                    .unwrap_or(false),
+                _ => true,
+            }
         });
         // Drop the event key only when our stripping emptied it; a
         // pre-existing empty array is foreign content and stays.
@@ -795,6 +839,7 @@ fn count_legacy_plugin_entries(config: &Value) -> usize {
 fn opencode_plugin_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
         .unwrap_or_else(|| home().join(".local/share"));
     base.join("skill-graph/opencode-plugin")
 }
@@ -825,9 +870,22 @@ const OPENCODE_PLUGIN_TS: &str = include_str!("assets/opencode-plugin.ts");
 
 fn materialize_opencode_plugin() -> Result<PathBuf, String> {
     let dir = opencode_plugin_dir();
+    // The payload is skill-graph-managed, not user dotfiles: a symlink
+    // at the payload dir or file would redirect the write into an
+    // unrelated file. Replace-mode rename swaps the link itself, and
+    // the pre-checks turn the common case into a clear error.
+    if std::fs::symlink_metadata(&dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "{}: refusing to write through a symlinked plugin directory",
+            dir.display()
+        ));
+    }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("index.ts");
-    write_text_atomic(&file, OPENCODE_PLUGIN_TS)?;
+    write_text_atomic_mode(&file, OPENCODE_PLUGIN_TS, false)?;
     Ok(dir)
 }
 
@@ -957,6 +1015,10 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         }
     }
 
+    // Re-verify project containment immediately before the write: the
+    // check at entry can be invalidated while resolve_bin probes ran,
+    // and write_text_atomic resolves symlinks at write time.
+    check_project_symlink(path, args.scope)?;
     write_config(path, &config)?;
     outln!(
         "enabled skill-graph ({}, {}) -> {}",
@@ -1002,6 +1064,9 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         // foreign-only config would churn formatting for no reason
         // (same no-op guard as clean_extra_overlay).
         if config != before {
+            // Same TOCTOU re-check as enable: strip_our_hooks/read_config
+            // took time, and the write resolves symlinks.
+            check_project_symlink(path, args.scope)?;
             write_config(path, &config)?;
         }
         outln!(
@@ -1189,12 +1254,11 @@ fn legacy_hook_bins(config: &Value) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     hook_commands(config)
         .iter()
-        .flat_map(|c| shell_words(c))
-        .filter(|tok| {
-            !tok.contains("://")
-                && tok.contains('/')
-                && Path::new(tok).file_name().and_then(|n| n.to_str()) == Some(LEGACY_HOOK_MARKER)
+        .filter_map(|c| {
+            let words = shell_words(c);
+            command_word_index(&words).map(|i| words[i].clone())
         })
+        .filter(|tok| is_legacy_bin_word(tok))
         .filter(|b| seen.insert(b.clone()))
         .collect()
 }

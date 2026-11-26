@@ -59,6 +59,7 @@ impl HookEnv {
         let session_id = payload
             .get("session_id")
             .or_else(|| payload.get("sessionID"))
+            .or_else(|| payload.get("sessionId"))
             .and_then(Value::as_str)
             .unwrap_or("");
         let event_session_id = events::sanitize_session_id(session_id);

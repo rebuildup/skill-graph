@@ -982,3 +982,68 @@ fn status_reports_broken_for_quoted_legacy_bin_with_spaces() {
     assert!(out.contains("broken"), "{out}");
     assert!(out.contains("not found"), "{out}");
 }
+
+/// #144 round-11: legacy-hook ownership is command-position, not
+/// any-word — `echo /x/…/skill-graph-recommend-hook` merely mentions
+/// the binary path and must survive enable/disable untouched, while a
+/// real env-prefixed legacy invocation is still claimed.
+#[test]
+fn legacy_marker_as_argument_is_not_ours() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"echo migrating from /x/0.3.0/bin/skill-graph-recommend-hook"}]}]}}"#;
+    std::fs::write(&path, body).unwrap();
+    let (_, rc) = f.run(&["adapter", "enable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.contains("echo migrating from /x/0.3.0/bin/skill-graph-recommend-hook"),
+        "{text}"
+    );
+}
+
+/// The env-assignment prefix used by real v0.3.x hooks must not hide
+/// the legacy binary from ownership detection.
+#[test]
+fn env_prefixed_legacy_invocation_is_ours() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let body = r#"{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"SKILL_GRAPH_BIN='/x/shims/skill-graph' '/x/0.3.0/bin/skill-graph-recommend-hook' prompt"}]}]}}"#;
+    std::fs::write(&path, body).unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    // The config held only our hook, so disable restores the
+    // pre-install state by removing the file entirely; a surviving
+    // file must not contain the marker.
+    if path.exists() {
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("skill-graph-recommend-hook"), "{text}");
+    }
+}
+
+/// #144 round-11: disable must not delete foreign sibling keys when it
+/// prunes a group whose hooks array our strip emptied.
+#[test]
+fn disable_preserves_foreign_sibling_keys() {
+    let f = Fixture::new();
+    let path = f.home.path().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // A foreign group that happens to contain our v0.4.x hook shape plus
+    // a foreign sibling key: stripping our hook empties `hooks` but the
+    // group and its `note` must survive.
+    let bin = f.bin_arg();
+    let body = format!(
+        r#"{{"hooks":{{"UserPromptSubmit":[{{"matcher":"X","note":"keep","hooks":[{{"type":"command","command":"{bin} hook claude-code prompt"}}]}}]}}}}"#
+    );
+    std::fs::write(&path, &body).unwrap();
+    let (_, rc) = f.run(&["adapter", "disable", "claude-code", "--user"]);
+    assert_eq!(rc, 0);
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"note\": \"keep\""), "{text}");
+    assert!(text.contains("\"matcher\": \"X\""), "{text}");
+    assert!(!text.contains("hook claude-code prompt"), "{text}");
+}

@@ -28,14 +28,17 @@ const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
 // NOSTATE suppresses debug output too: no diagnostics are persisted.
 const DBG = process.env.SKILL_GRAPH_DEBUG === "1" && !NOSTATE
 const dbg = (m: string) => { if (DBG) try { console.error(`[skill-graph] ${m}`) } catch {} }
-// Mirror the Rust hook's env parsing: `parse::<u64>()` accepts only
-// decimal digits, so anything else — floats, hex, exponents, signs,
-// whitespace — falls back to the default on both entry points.
+// Mirror the Rust hook's env parsing: `parse::<u64>()` accepts an
+// optional leading '+' and the full u64 range, so anything else —
+// floats, hex, exponents, whitespace, negatives — falls back to the
+// default on both entry points. Values above 2^53-1 saturate: file
+// sizes never approach that, so precision loss cannot change behavior.
 function envUint(name: string, fallback: number): number {
   const raw = process.env[name]
-  if (raw === undefined || !/^[0-9]+$/.test(raw)) return fallback
-  const n = Number(raw)
-  return Number.isSafeInteger(n) && n >= 0 ? n : fallback
+  if (raw === undefined || !/^\+?[0-9]+$/.test(raw)) return fallback
+  const n = BigInt(raw)
+  if (n > 0xffffffffffffffffn) return fallback
+  return n > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(n)
 }
 const EVENT_LOG_MAX = envUint("SKILL_GRAPH_EVENT_LOG_MAX", 64 * 1024 * 1024)
 // Bound in-memory state: this plugin lives for the whole OpenCode server
@@ -44,8 +47,15 @@ const MAX_EMITTED = 10_000
 const MAX_PENDING_SESSIONS = 200
 const MAX_SESSION_CTX = 200
 const MAX_SESSION_NAMES = 32
+// detectLoad spawns one `skill-graph detect` subprocess per
+// SKILL.md-touching tool call; bound the count per session so a
+// pathological session cannot churn unbounded subprocesses. Legit
+// sessions stay far below this; past it detection fails open (no
+// events) rather than hanging the event loop.
+const MAX_DETECT_PER_SESSION = 512
 const emitted = new Set<string>()
 const sessionCtx = new Map<string, string[]>()
+const detectCounts = new Map<string, number>()
 
 function sha256(text: string): string {
   return createHash("sha256").update(text, "utf8").digest("hex")
@@ -88,19 +98,23 @@ function emit(event: Record<string, unknown>): boolean {
     } catch {}
     // Open with mode 0600 so a freshly created log is owner-only, matching
     // the Rust hook's permissions. O_NOFOLLOW refuses a pre-planted
-    // symlink in the shared TMPDIR — parity with the Rust hook's open(2)
-    // hardening; ELOOP lands in the catch and the emit is skipped.
+    // symlink in the shared TMPDIR and O_NONBLOCK keeps a planted FIFO
+    // from blocking this synchronous open forever (open fails ENXIO
+    // with no reader) — parity with the Rust hook's open(2) hardening;
+    // failures land in the catch and the emit is skipped.
     const fd = openSync(
       EVENT_LOG,
-      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW,
+      constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
       0o600,
     )
     try {
       // A pre-existing log owned by another user (planted 0666 file in a
       // shared TMPDIR) must not receive our events: the open succeeds and
       // fchmod would fail, but the append would still land in a file we
-      // do not own. Skip the write unless the file is ours.
+      // do not own. Skip the write unless the file is ours. Non-regular
+      // files (FIFO/socket that slipped past O_NONBLOCK) are refused too.
       const st = fstatSync(fd)
+      if (!st.isFile()) return false
       if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false
       // mode only applies at creation; tighten pre-existing logs too.
       // Isolated: on filesystems where fchmod fails post-open, the event
@@ -397,9 +411,16 @@ export default Plugin.define({
       // never loaded, so it must not emit skill_load or queue dependency
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
+      const sessionID = safeSessionID(event.sessionID)
+      const detects = detectCounts.get(sessionID) ?? 0
+      if (detects >= MAX_DETECT_PER_SESSION) return
+      if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sessionID)) {
+        const oldest = detectCounts.keys().next().value
+        if (oldest !== undefined) detectCounts.delete(oldest)
+      }
+      detectCounts.set(sessionID, detects + 1)
       const detected = await detectLoad(event)
       if (!detected.length) return
-      const sessionID = safeSessionID(event.sessionID)
       // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call
       // touching many SKILL.md files must not spawn a recommend process
       // per skill — each spawn is a full corpus scan.

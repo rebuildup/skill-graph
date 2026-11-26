@@ -147,6 +147,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
     let mut match_work = 0usize;
+    let mut budget_noted = false;
 
     for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
@@ -167,6 +168,23 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             .saturating_add(link_bytes);
         match_work = match_work.saturating_add(skill_work);
         if match_work > MAX_MATCH_TERM_WORK {
+            // An exact name match is the strongest possible signal and
+            // must not be silently dropped by budget exhaustion: admit
+            // it with minimal evidence instead of scanning fields. Only
+            // skills whose whole name equals the query qualify, so the
+            // number of exemptions is bounded by duplicate-name copies.
+            if !query.is_empty() && skill_names[index] == query {
+                infos[index] = Some(Evidence {
+                    direct: 20.0,
+                    reasons: vec!["exact name match".to_string()],
+                    ..Evidence::empty()
+                });
+            } else if !budget_noted {
+                budget_noted = true;
+                crate::cli::write_stderr_line(
+                    "skill-graph: match work budget exhausted; remaining skills skipped",
+                );
+            }
             continue;
         }
         let name_lower = &skill_names[index];
@@ -846,26 +864,99 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
         // plus English glossary terms for known dev vocabulary so queries
         // can reach English-only skill text (#78). Provenance is scoped
         // to the evidence unit: a bigram inside a recognized dictionary
-        // word shares that word's source, bigrams outside every key (and
-        // spanning key boundaries) share the whole run, and gloss
-        // expansions keep their key. One CJK word's literal bigrams and
-        // its gloss expansion are therefore ONE evidence unit and cannot
-        // satisfy the two-independent-sources admission rule by
-        // themselves; distinct dictionary words in one run (e.g.
-        // 不具合…再現) remain independent (#144).
+        // word shares that word's source, bigrams inside a contentful
+        // uncovered gap (kanji/katakana present) share that gap as ONE
+        // source, pure-hiragana gaps (particles, する) and boundary-
+        // spanning bigrams are dropped, and gloss expansions keep their
+        // key. One CJK word's literal bigrams and its gloss expansion
+        // are therefore ONE evidence unit and cannot satisfy the
+        // two-independent-sources admission rule by themselves;
+        // distinct dictionary words or contentful gaps in one run
+        // remain independent (#144).
         let run: String = cjk.chars().collect();
         let gloss = gloss_terms(&run);
         let keys: Vec<&str> = gloss.iter().map(|(_, key)| key.as_str()).collect();
         let chars: Vec<char> = run.chars().collect();
-        for window in chars.windows(2) {
+        // Mark characters covered by a recognized dictionary key so
+        // uncovered bigrams can be attributed to their gap segment.
+        // Work is bounded by total key-match length, not run length.
+        let mut covered = vec![false; chars.len()];
+        if !keys.is_empty() {
+            // Byte offset -> char index; match_indices only yields
+            // char-boundary starts, so interior bytes are never read.
+            let mut byte_to_char = vec![0usize; run.len() + 1];
+            for (ci, (b, _)) in run.char_indices().enumerate() {
+                byte_to_char[b] = ci;
+            }
+            for key in &keys {
+                for (b, _) in run.match_indices(key) {
+                    let start = byte_to_char[b];
+                    let end = (start + key.chars().count()).min(chars.len());
+                    for slot in covered.iter_mut().take(end).skip(start) {
+                        *slot = true;
+                    }
+                }
+            }
+        }
+        // Gap segments: maximal runs of uncovered chars. A gap is
+        // "contentful" when it contains a non-hiragana CJK char (kanji
+        // or katakana) — pure-hiragana stretches are particles and
+        // okurigana, i.e. grammatical filler that must not become an
+        // independent evidence unit (`レビューする` stays ONE source).
+        // Each contentful gap is itself a single evidence unit, so
+        // `不具合報告をトリアージして` yields key + gap = two sources.
+        let mut gap_of = vec![usize::MAX; chars.len()];
+        let mut gap_text: Vec<String> = Vec::new();
+        let mut gap_contentful: Vec<bool> = Vec::new();
+        {
+            let mut i = 0;
+            while i < chars.len() {
+                if covered[i] {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                let mut contentful = false;
+                let mut text = String::new();
+                while i < chars.len() && !covered[i] {
+                    text.push(chars[i]);
+                    if !is_hiragana(chars[i]) {
+                        contentful = true;
+                    }
+                    i += 1;
+                }
+                let id = gap_text.len();
+                gap_text.push(text);
+                gap_contentful.push(contentful);
+                for slot in gap_of.iter_mut().take(i).skip(start) {
+                    *slot = id;
+                }
+            }
+        }
+        for (w, window) in chars.windows(2).enumerate() {
             let bigram: String = window.iter().collect();
-            let source = keys
+            if let Some(key) = keys
                 .iter()
                 .filter(|key| key.contains(bigram.as_str()))
                 .min_by_key(|key| key.len())
-                .map(|key| (*key).to_string())
-                .unwrap_or_else(|| run.clone());
-            out.push((bigram, source));
+            {
+                out.push((bigram, (*key).to_string()));
+            } else if keys.is_empty() {
+                // Only a run with NO recognized dictionary word falls
+                // back to run-level provenance.
+                out.push((bigram, run.clone()));
+            } else if !covered[w]
+                && !covered[w + 1]
+                && gap_of[w] == gap_of[w + 1]
+                && gap_contentful[gap_of[w]]
+            {
+                // Both chars sit inside the same contentful gap: the
+                // whole gap is one evidence unit.
+                out.push((bigram, gap_text[gap_of[w]].clone()));
+            }
+            // else: bigram inside a keyed run that is covered, spans a
+            // key/gap boundary, or sits in a pure-hiragana gap —
+            // dropped so it cannot mint an independent source.
         }
         for (gloss, key) in gloss {
             if !STOPWORDS.contains(&gloss.as_str()) {
@@ -933,6 +1024,13 @@ fn is_cjk(c: char) -> bool {
         c as u32,
         0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0x1100..=0x11FF
     )
+}
+
+/// Hiragana (U+3040–U+309F): particles, okurigana, and inflectional
+/// endings. A CJK gap made only of these is grammatical filler, not a
+/// content word, so it must not count as independent evidence.
+fn is_hiragana(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x309F)
 }
 
 // Minimal Japanese↔English dev glossary for #78. This is deliberately
@@ -1287,10 +1385,18 @@ mod tests {
 
     #[test]
     fn cjk_query_produces_bigrams() {
+        // A run with no glossary key still emits every bigram with
+        // run-level provenance.
+        let t = terms("あいうえおかきくけこ");
+        assert!(t.iter().any(|x| x == "あい"), "{t:?}");
+        assert!(t.iter().any(|x| x == "けこ"), "{t:?}");
+        // Inside a keyed run, bigrams inside a contentful uncovered gap
+        // survive (shared gap provenance) while pure-hiragana filler
+        // like する is dropped so it cannot mint an independent source.
         let t = terms("不具合報告をトリアージして");
-        eprintln!("terms={t:?}");
-        assert!(t.iter().any(|x| x == "不具"), "{t:?}");
         assert!(t.iter().any(|x| x == "報告"), "{t:?}");
+        let t = terms("レビューする");
+        assert!(!t.iter().any(|x| x == "する"), "{t:?}");
     }
 
     #[test]
@@ -1306,15 +1412,24 @@ mod tests {
     fn cjk_provenance_splits_bigrams_from_gloss_keys() {
         let tagged = terms_tagged("文章を自然にしたい");
         let sources = term_sources(&tagged);
-        // Round-10: provenance is scoped to the evidence unit — a bigram
-        // inside a recognized dictionary word shares that word's source
-        // (so the word's literal bigrams and its gloss expansion count as
-        // ONE evidence unit), bigrams outside every key share the run,
-        // and distinct words in one run stay independent.
-        let run = "文章を自然にしたい";
+        // Round-10/11: provenance is scoped to the evidence unit — a
+        // bigram inside a recognized dictionary word shares that word's
+        // source (so the word's literal bigrams and its gloss expansion
+        // count as ONE evidence unit), and distinct words in one run
+        // stay independent. Boundary-spanning bigrams and pure-hiragana
+        // gaps are dropped entirely — giving them run-level provenance
+        // would recreate the `レビューする` self-admission hole.
         assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
-        assert_eq!(sources.get("章を").map(String::as_str), Some(run));
+        assert_eq!(sources.get("章を"), None);
         assert_eq!(sources.get("自然").map(String::as_str), Some("自然"));
+        // A contentful gap is a single evidence unit: every bigram in
+        // `報告をトリアージして` shares the gap text as its source.
+        let tagged = terms_tagged("不具合報告をトリアージして");
+        let gap_sources = term_sources(&tagged);
+        let gap = "報告をトリアージして";
+        assert_eq!(gap_sources.get("報告").map(String::as_str), Some(gap));
+        assert_eq!(gap_sources.get("トリ").map(String::as_str), Some(gap));
+        assert_eq!(gap_sources.get("不具").map(String::as_str), Some("不具合"));
         assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
         assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
     }
