@@ -1,6 +1,6 @@
 # Evaluation dataset schema
 
-`cases.jsonl` is the canonical evaluation dataset for `skill-graph bench`. Each line is one JSON object. The harness reads the file from top to bottom and evaluates `recommend(graph, query, context, max=5)` against the labels below.
+`cases.jsonl` is the canonical evaluation dataset for `skill-graph bench`. Each line is one JSON object. The harness reads the file from top to bottom and evaluates `recommend(graph, query, context, max)` against the labels below. The primary cutoff is `--max` (default 3), matching the top-N the hook/plugin actually inject; the summary additionally reports `required_recall_at3` and `required_recall_at5` from the same ranking.
 
 ## Fields
 
@@ -33,6 +33,7 @@ Unknown fields are ignored by the harness, but new fields should be added here f
 - Do not commit conversation transcripts, user prompts from real sessions, secrets, or machine-local paths.
 - Cases may be derived from real task shapes, but text is rewritten into minimal task/context strings.
 - `skill_root` must stay inside the repository. Absolute paths and `..` segments are not allowed in committed cases.
+- Holdout cases use `holdout-` id prefixes. Their `query`/`context` must be phrased as a natural user task and must not contain skill names or vocabulary lifted from the target skill's description, so reverse-lookup bias cannot inflate recall.
 
 ## Coverage
 

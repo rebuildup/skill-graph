@@ -29,7 +29,11 @@ struct Case {
     case_kind: Option<String>,
 }
 
-pub fn run(dataset: &Path) -> Result<Value, String> {
+/// `max` is the primary recommendation cutoff scored by `required_recall`.
+/// It defaults to the top-N the runtime actually injects (hook/plugin
+/// surface top-3); recall@3 and recall@5 are additionally reported from
+/// the same `recommend` pass so metric drift stays visible.
+pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
     let text =
         fs::read_to_string(dataset).map_err(|e| format!("read {}: {e}", dataset.display()))?;
     let mut cases = Vec::new();
@@ -61,6 +65,8 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     let mut totals = json!({
         "cases": cases.len(),
         "required_hits": 0,
+        "required_hits_at3": 0,
+        "required_hits_at5": 0,
         "required_total": 0,
         "forbidden_hits": 0,
         "optional_hits": 0,
@@ -68,6 +74,7 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         "recommended_total": 0,
         "empty_recommendations": 0,
         "elapsed_ms": 0,
+        "max": max,
     });
     let started = Instant::now();
 
@@ -85,25 +92,42 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         let graph = graphs
             .get(&root)
             .ok_or_else(|| "missing graph".to_string())?;
-        let recs = recommend(graph, &case.query, &case.context, 5);
-        let names: Vec<String> = recs.iter().map(|r| r.skill.name.clone()).collect();
+        // One recommend() pass deep enough for the primary cutoff and the
+        // diagnostic recall@3/recall@5 cutoffs; ranking is a prefix, so
+        // slicing names_all reproduces each cutoff exactly.
+        let fetch = max.max(5);
+        let recs = recommend(graph, &case.query, &case.context, fetch);
+        let names_all: Vec<String> = recs.iter().map(|r| r.skill.name.clone()).collect();
+        let names: Vec<String> = names_all.iter().take(max).cloned().collect();
+        let hits_at = |cutoff: usize| -> usize {
+            case.expected_required
+                .iter()
+                .filter(|n| names_all.iter().take(cutoff).any(|m| m == *n))
+                .count()
+        };
         let required_hits = case
             .expected_required
             .iter()
             .filter(|n| names.contains(n))
             .count();
+        let required_hits_at3 = hits_at(3);
+        let required_hits_at5 = hits_at(5);
         let forbidden_hits = case.forbidden.iter().filter(|n| names.contains(n)).count();
         let optional_hits = case
             .expected_optional
             .iter()
             .filter(|n| names.contains(n))
             .count();
-        if recs.is_empty() {
+        if names.is_empty() {
             totals["empty_recommendations"] =
                 json!(totals["empty_recommendations"].as_u64().unwrap_or(0) + 1);
         }
         totals["required_hits"] =
             json!(totals["required_hits"].as_u64().unwrap_or(0) + required_hits as u64);
+        totals["required_hits_at3"] =
+            json!(totals["required_hits_at3"].as_u64().unwrap_or(0) + required_hits_at3 as u64);
+        totals["required_hits_at5"] =
+            json!(totals["required_hits_at5"].as_u64().unwrap_or(0) + required_hits_at5 as u64);
         totals["required_total"] = json!(
             totals["required_total"].as_u64().unwrap_or(0) + case.expected_required.len() as u64
         );
@@ -122,6 +146,8 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
             "recommended": names,
             "recommended_count": recommended_count,
             "required_hits": required_hits,
+            "required_hits_at3": required_hits_at3,
+            "required_hits_at5": required_hits_at5,
             "required_total": case.expected_required.len(),
             "forbidden_hits": forbidden_hits,
             "optional_hits": optional_hits,
@@ -139,6 +165,16 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     } else {
         required_hits as f64 / required_total as f64
     });
+    for cutoff in [3usize, 5usize] {
+        let hits = totals[format!("required_hits_at{cutoff}")]
+            .as_u64()
+            .unwrap_or(0);
+        totals[format!("required_recall_at{cutoff}")] = json!(if required_total == 0 {
+            1.0
+        } else {
+            hits as f64 / required_total as f64
+        });
+    }
     let recommended_total = totals["recommended_total"].as_u64().unwrap_or(0);
     let optional_hits = totals["optional_hits"].as_u64().unwrap_or(0);
     totals["precision_required"] = json!(if recommended_total == 0 {
