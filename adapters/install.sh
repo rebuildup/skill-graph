@@ -35,10 +35,6 @@ command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 here="$(cd "$(dirname "$0")" && pwd)"
 home="${SKILL_GRAPH_HOME:-$(cd "$here/.." && pwd)}"
-bin="${SKILL_GRAPH_BIN:-$home/bin/skill-graph}"
-[ -x "$bin" ] || bin="$(command -v skill-graph || true)"
-[ -n "$bin" ] && [ -x "$bin" ] || { echo "skill-graph binary not found; set SKILL_GRAPH_HOME or PATH" >&2; exit 1; }
-bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
 
 case "$runtime:$scope" in
   claude-code:--user)    hooks_file="$HOME/.claude/settings.json" ;;
@@ -51,17 +47,18 @@ esac
 
 if [ "$runtime" = opencode ]; then
   hooks_file="$cfg_file"
-  plugin_dir="$here/opencode/skill-graph"
-  [ -f "$plugin_dir/index.ts" ] || { echo "opencode plugin missing: $plugin_dir" >&2; exit 1; }
-  plugin_dir="$(cd "$plugin_dir" && pwd)"
-  plugin_spec="file://$plugin_dir"
 fi
 
-if [ "$runtime" != opencode ]; then
-  adapter_bin="$here/$runtime/skill-graph/bin/skill-graph-recommend-hook"
-  [ -f "$adapter_bin" ] || { echo "adapter script missing: $adapter_bin" >&2; exit 1; }
-  adapter_bin="$(cd "$(dirname "$adapter_bin")" && pwd)/$(basename "$adapter_bin")"
-fi
+# Identity markers used to find OUR entries in runtime configs. Matching is
+# deliberately NOT tied to the absolute install path: the versioned layout
+# (~/.local/share/skill-graph/<ver>/ or a `current` symlink) means the same
+# logical adapter can live at a different path after an update, and path-based
+# matching would leave stale duplicate hooks behind.
+hook_marker="skill-graph-recommend-hook"
+# Our opencode plugin spec is always a file:// URL whose path ends in the
+# plugin directory named `skill-graph`; "/skill-graph" cannot collide with an
+# npm package specifier.
+plugin_marker="/skill-graph"
 
 mktemp_json() { mktemp "${TMPDIR:-/tmp}/skill-graph-install.XXXXXX.json"; }
 
@@ -79,9 +76,10 @@ if [ "$uninstall" = 1 ]; then
     rm -f "$1"
   }
   if [ "$runtime" = opencode ]; then
-    # Drop our plugin specifier, then prune an emptied plugins array.
-    jq --arg p "$plugin_spec" '
-      .plugins = ((.plugins // []) | map(select(. != $p)))
+    # Drop our plugin specifier (any versioned path), then prune an emptied
+    # plugins array.
+    jq --arg m "$plugin_marker" '
+      .plugins = ((.plugins // []) | map(select((. | contains($m)) | not)))
       | if (.plugins | length) == 0 then del(.plugins) else . end
     ' "$hooks_file" > "$tmp"
     finish_uninstall "$tmp" "$hooks_file"
@@ -90,7 +88,7 @@ if [ "$uninstall" = 1 ]; then
   fi
   # Drop hook command objects referencing our adapter, then prune emptied
   # matcher groups and event arrays. Other hooks are untouched.
-  jq --arg m "$adapter_bin" '
+  jq --arg m "$hook_marker" '
     .hooks = ((.hooks // {}) | with_entries(.value |=
       map(.hooks = ((.hooks // []) | map(select(.command == null or ((.command | contains($m)) | not))))
         | select((.hooks | length) > 0))
@@ -106,17 +104,42 @@ if [ "$uninstall" = 1 ]; then
     overlay="${XDG_CONFIG_HOME:-$HOME/.config}/dotfiles/claude/settings.local.json"
     if [ -f "$overlay" ]; then
       tmp="$(mktemp_json)"
-      jq --arg m "$adapter_bin" '
+      if jq --arg m "$hook_marker" '
         .hooks = ((.hooks // {}) | with_entries(.value |=
           map(.hooks = ((.hooks // []) | map(select(.command == null or ((.command | contains($m)) | not))))
             | select((.hooks | length) > 0))
         ) | with_entries(select(.value | length > 0)))
         | if (.hooks | length) == 0 then del(.hooks) else . end
-      ' "$overlay" > "$tmp" && mv "$tmp" "$overlay" || rm -f "$tmp"
+      ' "$overlay" > "$tmp"; then
+        mv "$tmp" "$overlay"
+      else
+        rm -f "$tmp"
+      fi
       echo "uninstalled skill-graph hooks from $overlay"
     fi
   fi
   exit 0
+fi
+
+# Install path only from here on: resolve the binary, the adapter script, and
+# (for opencode) the plugin directory. Uninstall above is marker-based and
+# deliberately works even when these files are already gone.
+bin="${SKILL_GRAPH_BIN:-$home/bin/skill-graph}"
+[ -x "$bin" ] || bin="$(command -v skill-graph || true)"
+[ -n "$bin" ] && [ -x "$bin" ] || { echo "skill-graph binary not found; set SKILL_GRAPH_BIN or PATH" >&2; exit 1; }
+bin="$(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+
+if [ "$runtime" = opencode ]; then
+  plugin_dir="$here/opencode/skill-graph"
+  [ -f "$plugin_dir/index.ts" ] || { echo "opencode plugin missing: $plugin_dir" >&2; exit 1; }
+  plugin_dir="$(cd "$plugin_dir" && pwd)"
+  plugin_spec="file://$plugin_dir"
+fi
+
+if [ "$runtime" != opencode ]; then
+  adapter_bin="$here/$runtime/skill-graph/bin/skill-graph-recommend-hook"
+  [ -f "$adapter_bin" ] || { echo "adapter script missing: $adapter_bin" >&2; exit 1; }
+  adapter_bin="$(cd "$(dirname "$adapter_bin")" && pwd)/$(basename "$adapter_bin")"
 fi
 
 # Build the config fragment with absolute paths substituted. The adapter
@@ -160,9 +183,11 @@ merge() {
   mkdir -p "$(dirname "$target")"
   if [ "$runtime" = opencode ]; then
     # Append our plugin specifier once, preserving other plugins and keys.
+    # Drop any prior skill-graph entry first so a version/path change cannot
+    # leave duplicates behind.
     if [ -f "$target" ]; then
-      jq --arg p "$plugin_spec" '
-        .plugins = (((.plugins // []) | map(select(. != $p))) + [$p])
+      jq --arg p "$plugin_spec" --arg m "$plugin_marker" '
+        .plugins = (((.plugins // []) | map(select((. | contains($m)) | not))) + [$p])
       ' "$target" > "$target.new" && mv "$target.new" "$target"
     else
       jq -n --arg p "$plugin_spec" '{plugins: [$p]}' > "$target"
@@ -173,7 +198,7 @@ merge() {
   # already reference this adapter so re-running install is idempotent and
   # other hooks in the same event are preserved.
   if [ -f "$target" ]; then
-    jq --arg m "$adapter_bin" --slurpfile f "$fragment" '
+    jq --arg m "$hook_marker" --slurpfile f "$fragment" '
       .hooks = (.hooks // {})
       | reduce (($f[0].hooks // {}) | to_entries[]) as $ev (.;
           .hooks[$ev.key] = (
