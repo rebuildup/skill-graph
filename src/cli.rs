@@ -69,6 +69,15 @@ enum Command {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Runtime hook entry point: reads one hook payload JSON on stdin,
+    /// emits Skill Usage Events, and prints additionalContext injection.
+    /// Always exits 0 (fail-open).
+    Hook {
+        /// claude-code | codex
+        runtime: String,
+        /// prompt | skill-load
+        mode: String,
+    },
     /// Normalize a single runtime hook/plugin payload (stdin JSON) into a
     /// Skill Usage Event. Prints the event JSON, or nothing when the
     /// payload carries no skill-load signal. Detection only — never runs
@@ -130,6 +139,12 @@ pub fn run() -> Result<(), String> {
         Command::Observe { path, format } => {
             let obs = observe::observe_path(&path)?;
             print_result(json!(obs), &format)
+        }
+        Command::Hook { runtime, mode } => {
+            use crate::events::Runtime;
+            let runtime =
+                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            crate::hook::run_hook(runtime, &mode)
         }
         Command::Detect { runtime, via } => {
             use crate::events::{self, ObservedVia, Runtime};
