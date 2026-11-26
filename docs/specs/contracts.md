@@ -104,8 +104,8 @@ JSONL で追記し、`observe <path>` が contract 形式の行を deserialize
 
 CLI・hook・MCP・plugin の全入口で同一規則を使う（`src/discovery.rs::resolve_roots`）:
 
-1. `SKILL_GRAPH_ROOTS`（`:` 区切り、存在する dir のみ）— 設定されていれば常に最優先。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。
-2. 明示引数（CLI `--root`、MCP tool `roots`。MCP は 32 件上限）
-3. 呼び出し側の既定 root（CLI/plugin 既定、hook は runtime 別 fallback）
+1. `SKILL_GRAPH_ROOTS`（プラットフォームの path-list 区切り）— **非空値が設定されていれば常に最優先**で、設定値が探索範囲の全体を定義する。存在しない・ファイル・権限不足の entry は `discover` の `errors` で診断され、有効 entry のみが走査される。**有効 entry が 0 件でも explicit 引数や既定 root へは拡大しない**（空の走査 + 診断に縮退する）。空文字列は未設定と同等。非 UTF-8 値も `var_os` で「設定済み」と判定される。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。
+2. 明示引数（CLI `--root`、MCP tool `roots`。MCP は 32 件上限）— env 未設定時のみ
+3. 呼び出し側の既定 root（CLI/plugin 既定、hook は runtime 別 fallback）— env 未設定かつ明示引数なしのときのみ
 
 `discover` は canonical 化した SKILL.md パスで重複を除くため、包含・重複する root を渡しても同一 skill を二重計上しない。
