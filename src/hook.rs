@@ -360,7 +360,9 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
         let Some(skill_name) = event.skill_name.clone() else {
             continue;
         };
-        let roots = roots_cache.get_or_insert_with(|| hook_roots(env.runtime));
+        let roots = roots_cache.get_or_insert_with(|| {
+            crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime))
+        });
         if let Some(ctx) = skill_load_context(env, &skill_name, roots) {
             contexts.push(ctx);
         }
@@ -390,7 +392,6 @@ fn skill_load_context(env: &HookEnv, skill_name: &str, roots: &[PathBuf]) -> Opt
     }
     env.touch_marker(&dedup_key);
 
-    let roots = crate::discovery::resolve_roots(Vec::new(), || hook_fallback_roots(env.runtime));
     if roots.is_empty() {
         emit_recommendation(
             env,
