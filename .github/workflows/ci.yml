@@ -101,3 +101,22 @@ jobs:
             grep -E '^(tests|evals|npm|docs|plugins|adapters|experiments|\.github|\.agents|\.claude|\.devin)/' /tmp/crate-files.txt >&2
             exit 1
           fi
+  msrv:
+    # Cargo.toml declares rust-version; keep the guarantee honest by
+    # compiling and testing on exactly that toolchain (#130 — declared
+    # MSRV was previously unverified). The toolchain is read from the
+    # manifest so a rust-version bump can never drift from CI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read declared rust-version
+        id: msrv
+        run: |
+          v="$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ -n "$v" ] || { echo "rust-version missing in Cargo.toml" >&2; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: cargo check --locked --all-targets
+      - run: cargo test --locked
