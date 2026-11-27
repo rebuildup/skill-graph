@@ -1,0 +1,35 @@
+{
+  "headline": "Peak memory stays near 7 MB across corpus sizes",
+  "subheadline": "peak RSS of `skill-graph discover` per invocation · no index or cache files",
+  "method": "/usr/bin/time -v 'Maximum resident set size' per process invocation, release build, quiet machine",
+  "value_rule": "rss_mb = maximum observed across samples_per_point runs (conservative peak)",
+  "samples_per_point": 20,
+  "measured_at": "2026-11-28",
+  "points": [
+    {
+      "label": "this repo's skills",
+      "skills": 24,
+      "rss_mb": 6.6,
+      "kind": "real",
+      "command": "discover --root .agents/skills"
+    },
+    {
+      "label": "design-skills repo",
+      "skills": 88,
+      "rss_mb": 7.3,
+      "kind": "real",
+      "command": "discover --root <design-skills>/skills"
+    },
+    {
+      "label": "synthetic corpus",
+      "skills": 500,
+      "rss_mb": 7.1,
+      "kind": "synthetic",
+      "command": "discover --root <corpus500>"
+    }
+  ],
+  "footnotes": [
+    "hook end-to-end: 6.8 MB peak RSS · recommend @500 skills: ~7.2 MB",
+    "measured with /usr/bin/time -v on release build · 20 runs per point, max reported · RSS includes binary + parsed corpus · x-axis: log scale"
+  ]
+}

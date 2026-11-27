@@ -22,6 +22,67 @@ work="$(mktemp -d "${TMPDIR:-/tmp}/sg-verify.XXXXXX")" || exit 1
 cleanup() { rm -rf "$work"; }
 trap cleanup EXIT
 
+# Archive-format gate, applied to BOTH tarballs before extraction
+# (#225 r5). `tar -xzf` alone only proves "gzip-compressed tar that
+# GNU tar accepts" — it does not prove the archive is a well-formed
+# npm tarball: a different compression would fail extraction anyway,
+# but duplicate members (last-wins at extract), members outside
+# package/, and non-regular types (symlink/hardlink/device) would all
+# slip through to the tree diff in their FINAL extracted state.
+check_archive() { # $1=file $2=label
+  f="$1"; label="$2"
+  # gzip magic + integrity: reject zstd/xz/uncompressed-renamed/.tgz
+  # and truncated/corrupt streams explicitly rather than relying on
+  # tar's error path alone.
+  magic="$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d ' \n')" || exit 1
+  [ "$magic" = "1f8b" ] || {
+    echo "$label is not gzip-compressed (magic=$magic)" >&2; exit 1; }
+  gzip -t "$f" 2>/dev/null || {
+    echo "$label fails gzip integrity check" >&2; exit 1; }
+
+  # Member names: every entry must live under package/. This rejects
+  # ../ traversal, absolute paths, and stray top-level members in the
+  # ARCHIVE itself (not just after extraction). A member name
+  # containing a newline splits into extra lines here, and any
+  # continuation line fails the prefix check — fail-closed.
+  tar -tzf "$f" > "$work/$label.names" 2>/dev/null || {
+    echo "$label is not a readable tar archive" >&2; exit 1; }
+  [ -s "$work/$label.names" ] || {
+    echo "$label is an empty archive" >&2; exit 1; }
+  bad="$(grep -v '^package/' "$work/$label.names" || true)"
+  [ -z "$bad" ] || {
+    echo "$label has members outside package/: $(echo "$bad" | head -3)" >&2
+    exit 1; }
+  # `package/../x` passes the prefix check but is still a traversal
+  # member — GNU tar refuses it at extract, so reject it here where
+  # the diagnosis is precise (#225 r5).
+  dotdot="$(grep -nE '(^|/)\.\.(/|$)' "$work/$label.names" || true)"
+  [ -z "$dotdot" ] || {
+    echo "$label has traversal members: $(echo "$dotdot" | head -3)" >&2
+    exit 1; }
+  # Duplicate member names: extraction is last-wins, so the compared
+  # tree would hide an earlier divergent entry entirely.
+  dups="$(sort "$work/$label.names" | uniq -d || true)"
+  [ -z "$dups" ] || {
+    echo "$label has duplicate members: $(echo "$dups" | head -3)" >&2
+    exit 1; }
+
+  # Member types: tar -tv's mode field leads with the typeflag —
+  # '-' regular file, 'd' directory are the only shapes an npm
+  # tarball may contain. 'l'/'h'/'c'/'b'/'p' are rejected outright
+  # even when both sides would extract identically: installs must
+  # never materialize links or device nodes from a package (#225 r5).
+  tar -tvzf "$f" 2>/dev/null | awk '
+    substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { print; bad = 1 }
+    END { exit bad ? 1 : 0 }
+  ' > "$work/$label.badtypes" || {
+    echo "$label has non-regular members: $(head -3 "$work/$label.badtypes")" >&2
+    exit 1; }
+}
+
+check_archive "$pub" pub
+check_archive "$loc" local
+
 mkdir -p "$work/pub" "$work/local" || exit 1
 # Extraction failure (corrupt gzip, non-tar, hostile path entries) is a
 # rejection, not a skip — tar's own checks apply.

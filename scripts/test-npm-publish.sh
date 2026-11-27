@@ -199,6 +199,105 @@ else
   ok "failed npm publish propagates non-zero"
 fi
 
+# --- round-5 guarantees: two-phase preflight, required files, bin
+# format, dependency order (#225 r5) ---------------------------------
+
+echo "== preflight failure on LAST package means ZERO publishes =="
+reset_registry
+# pkgBad declares files[] entry that does not exist on disk.
+mkdir -p pkgBad/bin
+cat > pkgBad/package.json <<'JSON'
+{
+  "name": "@test/pkg-bad",
+  "version": "1.0.0",
+  "files": ["bin/tool", "missing-payload.txt"]
+}
+JSON
+printf '#!/bin/sh\necho t\n' > pkgBad/bin/tool
+chmod +x pkgBad/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA pkgBad >"$work/out9" 2>&1; then
+  fail "package with missing required file was published"
+else
+  ok "missing required file rejected"
+  grep -q "required file missing" "$work/out9" \
+    && ok "rejection names the missing file" || fail "unclear rejection"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "NO package published when a later package fails preflight" \
+  || fail "partial publish occurred: $(cat "$FAKE_NPM_ROOT/publish.log")"
+
+echo "== +x but non-executable-format bin rejected =="
+reset_registry
+printf 'just some text, no shebang\n' > pkgA/bin/tool
+chmod +x pkgA/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out10" 2>&1; then
+  fail "text-file bin with exec bit was published"
+else
+  ok "non-executable-format bin rejected"
+fi
+printf '#!/bin/sh\necho tool\n' > pkgA/bin/tool
+chmod +x pkgA/bin/tool
+
+echo "== symlink bin entry rejected =="
+reset_registry
+rm pkgA/bin/tool
+ln -s /bin/sh pkgA/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out11" 2>&1; then
+  fail "symlink bin was published"
+else
+  ok "symlink bin rejected"
+fi
+rm -f pkgA/bin/tool
+printf '#!/bin/sh\necho tool\n' > pkgA/bin/tool
+chmod +x pkgA/bin/tool
+
+echo "== subdirectory inside bin/ rejected =="
+reset_registry
+mkdir -p pkgA/bin/nested
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out12" 2>&1; then
+  fail "bin subdirectory was published"
+else
+  ok "bin subdirectory rejected"
+fi
+rmdir pkgA/bin/nested
+
+echo "== dependency order: dependent before dependency rejected =="
+reset_registry
+# pkgMeta depends on @test/pkg-a via optionalDependencies.
+mkdir -p pkgMeta/bin
+cat > pkgMeta/package.json <<'JSON'
+{
+  "name": "@test/pkg-meta",
+  "version": "1.0.0",
+  "files": ["bin/tool"],
+  "optionalDependencies": {
+    "@test/pkg-a": "1.0.0"
+  }
+}
+JSON
+printf '#!/bin/sh\necho m\n' > pkgMeta/bin/tool
+chmod +x pkgMeta/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgMeta pkgA >"$work/out13" 2>&1; then
+  fail "dependent-before-dependency order was published"
+else
+  ok "publish order violation rejected"
+  grep -q "order violation" "$work/out13" && ok "rejection names the violation" || fail "unclear rejection"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "order violation prevented ALL publishes" \
+  || fail "partial publish on order violation"
+
+echo "== dependency order: dependency first is accepted =="
+reset_registry
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA pkgMeta >"$work/out14" 2>&1; then
+  ok "dependency-first order accepted"
+else
+  fail "dependency-first order rejected: $(cat "$work/out14")"
+fi
+grep -q 'PUBLISH @test/pkg-a@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
+  && grep -q 'PUBLISH @test/pkg-meta@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
+  && ok "publish order preserved (dep then dependent)" || fail "order wrong"
+
 if [ "$fails" -gt 0 ]; then
   say "$fails publish-path test(s) FAILED"
   exit 1

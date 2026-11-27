@@ -439,7 +439,7 @@ fn emitted_events_validate_against_event_schema() {
 
 /// Round-9: payload session ids that sanitize to empty must not
 /// collapse distinct sessions into one `""` key — they get distinct
-/// `unknown-<hash>` ids instead.
+/// `u-<hash>` ids instead.
 #[test]
 fn degenerate_session_ids_stay_distinct() {
     let dir = tempfile::tempdir().unwrap();
@@ -461,7 +461,7 @@ fn degenerate_session_ids_stay_distinct() {
         .collect();
     assert_eq!(ids.len(), 3);
     for id in &ids {
-        assert!(id.starts_with("unknown-"), "session_id {id}");
+        assert!(id.starts_with("u-"), "session_id {id}");
     }
     let mut sorted = ids.clone();
     sorted.sort();

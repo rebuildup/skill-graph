@@ -92,36 +92,52 @@ function validSkillName(name: string): boolean {
 // "unknown" funnel session. Exported for the parity contract test
 // (opencode-plugin.test.ts) — the sanitize rules are part of the
 // cross-entrypoint event contract (#225).
+// Session-id contract (#225 r5, parity with events::sanitize_session_id):
+// the sanitized form must be INJECTIVE over arbitrary host input. The
+// previous head+8hex scheme let a charset-valid literal id collide with
+// another id's transformed output ("sess1-deadbeef" == sanitize("sess!1")).
+// The transform output shape — "-" + 32 lowercase hex at the end — is
+// RESERVED: any id matching it is itself transformed, so passthrough
+// and generated namespaces can never overlap. Idempotency is NOT a
+// contract (injectivity and idempotency are mutually exclusive for a
+// charset-lossy map); sanitize runs once per event at ingest.
+const ID_MAX_CHARS = 128
+const ID_HEAD_CHARS = 95 // 95 + 1 + 32 = 128
+const ID_SCAN_CHARS = 8192
+const ID_HASH_HEX = 32
+const ID_SAFE_CHAR = /[A-Za-z0-9._-]/
+const ID_RESERVED = /-[0-9a-f]{32}$/
+
 export function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
-  // Bounded scan parity with events::sanitize_session_id's take(129):
-  // collect at most 129 valid chars — enough to detect the >128
-  // overflow without materializing a multi-MB filtered copy of a
-  // hostile id (#225 re-review). The charset is ASCII-only, so
-  // .length == char count, and reaching 129 means overflow whether or
-  // not a 130th valid char exists (Rust's count > 128 branch).
-  let filtered = ""
+  if (!s) return ""
+  // Canonical fast path: inspect at most 129 code points — a hostile
+  // multi-MB id cannot force a full scan. for..of counts code points,
+  // matching Rust's chars() parity for astral input (which fails the
+  // charset check anyway).
+  const prefix: string[] = []
+  let count = 0
   for (const ch of s) {
-    if (!/[A-Za-z0-9._-]/.test(ch)) continue
-    filtered += ch
-    if (filtered.length === 129) break
+    if (++count > ID_MAX_CHARS) break
+    prefix.push(ch)
   }
-  // Distinct ids sharing a 128-char prefix must not collapse: bounded
-  // head plus a hash suffix of the original (parity with Rust).
-  if (filtered.length === 129) {
-    return `${filtered.slice(0, 119)}-${sha256(s).slice(0, 8)}`
+  if (count <= ID_MAX_CHARS) {
+    const whole = prefix.join("")
+    if (whole.length === s.length && [...whole].every((c) => ID_SAFE_CHAR.test(c)) && !ID_RESERVED.test(whole)) {
+      return whole
+    }
   }
-  if (!filtered) {
-    if (!s) return ""
-    return `unknown-${sha256(s).slice(0, 16)}`
+  // Non-canonical: bounded head of valid chars + hash of the ORIGINAL
+  // string. Scan cap keeps pathological all-invalid ids at O(8192).
+  let head = ""
+  let scanned = 0
+  for (const ch of s) {
+    if (scanned >= ID_SCAN_CHARS || head.length >= ID_HEAD_CHARS) break
+    scanned++
+    if (ID_SAFE_CHAR.test(ch)) head += ch
   }
-  // Charset filtering is lossy: "sess!1" and "sess?1" would both
-  // collapse to "sess1". When any character was stripped, suffix a
-  // hash of the ORIGINAL id so distinct inputs stay distinct — parity
-  // with events::sanitize_session_id (#225). The 119-char head cap
-  // keeps the result inside the 128-char contract even when the
-  // filtered id is already 120-128 chars (#225 re-review).
-  return filtered === s ? filtered : `${filtered.slice(0, 119)}-${sha256(s).slice(0, 8)}`
+  if (!head) head = "u"
+  return `${head}-${sha256(s).slice(0, ID_HASH_HEX)}`
 }
 
 function emit(event: Record<string, unknown>): boolean {
@@ -428,9 +444,13 @@ export function boundJsonValue(v: unknown, depth: number, st: BoundState): unkno
     return v
   }
   if (Array.isArray(v)) {
-    if (v.length > MAX_INPUT_NODES) return BOUND_FAIL
-    const out: unknown[] = new Array(v.length)
-    for (let i = 0; i < v.length; i++) {
+    // Read length ONCE: a Proxy get trap could answer differently on
+    // a second read, making `new Array(len)` allocate far beyond the
+    // checked bound (#225 r5).
+    const len = v.length
+    if (!Number.isInteger(len) || len < 0 || len > MAX_INPUT_NODES) return BOUND_FAIL
+    const out: unknown[] = new Array(len)
+    for (let i = 0; i < len; i++) {
       const c = boundJsonValue(v[i], depth + 1, st)
       if (c === BOUND_FAIL) return BOUND_FAIL
       out[i] = c
@@ -442,14 +462,13 @@ export function boundJsonValue(v: unknown, depth: number, st: BoundState): unkno
     if (proto !== Object.prototype && proto !== null) return BOUND_FAIL
     const out: Record<string, unknown> = {}
     let n = 0
-    // for..in enumerates lazily and we break at the node budget —
-    // Object.keys() would materialize ALL keys of a hostile object
-    // before the budget could apply (#225 re-review). hasOwnProperty
-    // keeps the walk to own keys (proto is already plain, but a
-    // polluted Object.prototype must not leak keys into the clone).
+    // for..in + hasOwnProperty keeps enumeration lazy: the runtime
+    // fetches each key's descriptor only as iteration reaches it, so
+    // the early break bounds per-key work for plain objects AND
+    // Proxy traps alike (ownKeys itself is a single call either way).
     for (const k in v as Record<string, unknown>) {
       if (!Object.prototype.hasOwnProperty.call(v, k)) continue
-      if (++n > MAX_INPUT_NODES) return BOUND_FAIL
+      if (++n > MAX_INPUT_NODES || st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
       if (k.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
       st.strBytes += utf8Bytes(k)
       if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL

@@ -130,11 +130,88 @@ tar -czf "$work/extra-both.tgz" -C "$work/extra-both" package note.txt
 expect_reject "identical extra top-level entry still rejected" \
   bash "$TAR_VERIFY" "$work/extra-both.tgz" "$work/a.tgz"
 
+# --- archive-format gate (#225 r5) -------------------------------------
+# These reject at the ARCHIVE level, before extraction: the extracted
+# tree alone cannot reveal duplicate members (last-wins), member types
+# both sides share, or non-gzip containers tar happens to decode.
+
+# uncompressed tar renamed .tgz — magic bytes are not 1f8b
+mkdir -p "$work/plain/package"
+cp -r "$work/a/package/." "$work/plain/package/"
+tar -cf "$work/plain.tar" -C "$work/plain" package
+cp "$work/plain.tar" "$work/plain.tgz"
+expect_reject "non-gzip tarball rejected (magic)" \
+  bash "$TAR_VERIFY" "$work/plain.tgz" "$work/a.tgz"
+
+# truncated gzip stream — magic ok, integrity fails
+head -c 64 "$work/a.tgz" > "$work/trunc.tgz"
+expect_reject "truncated gzip rejected" \
+  bash "$TAR_VERIFY" "$work/trunc.tgz" "$work/a.tgz"
+
+# duplicate member names — extraction is last-wins so the compared
+# tree would hide the earlier divergent entry
+mkdir -p "$work/dup/package"
+cp -r "$work/a/package/." "$work/dup/package/"
+tar -czf "$work/dup.tgz" -C "$work/dup" \
+  package package/package.json package/package.json
+expect_reject "duplicate member rejected" \
+  bash "$TAR_VERIFY" "$work/dup.tgz" "$work/a.tgz"
+
+# symlink member — identical on both sides, still not an npm shape
+mkdir -p "$work/sym/package"
+cp -r "$work/a/package/." "$work/sym/package/"
+ln -s package.json "$work/sym/package/link"
+tar -czf "$work/sym.tgz" -C "$work/sym" package
+expect_reject "symlink member rejected even when identical" \
+  bash "$TAR_VERIFY" "$work/sym.tgz" "$work/sym.tgz"
+
+# hardlink member
+mkdir -p "$work/hl/package"
+cp -r "$work/a/package/." "$work/hl/package/"
+ln "$work/hl/package/package.json" "$work/hl/package/package-copy.json"
+tar -czf "$work/hl.tgz" -C "$work/hl" package
+expect_reject "hardlink member rejected" \
+  bash "$TAR_VERIFY" "$work/hl.tgz" "$work/hl.tgz"
+
+# traversal member under package/ — passes the prefix check, must be
+# caught by the .. component check (extract would refuse anyway)
+mkdir -p "$work/dd/package"
+cp -r "$work/a/package/." "$work/dd/package/"
+tar -czf "$work/dd.tgz" -C "$work/dd" \
+  --transform='s|^package/package.json$|package/../evil.json|' package 2>/dev/null
+expect_reject "traversal member rejected" \
+  bash "$TAR_VERIFY" "$work/dd.tgz" "$work/a.tgz"
+
+# member outside package/ at ARCHIVE level (tree check also catches,
+# but the archive gate must fire first)
+mkdir -p "$work/outside/package"
+cp -r "$work/a/package/." "$work/outside/package/"
+printf 'x\n' > "$work/outside/stray"
+tar -czf "$work/outside.tgz" -C "$work/outside" package stray
+expect_reject "archive-level member outside package/ rejected" \
+  bash "$TAR_VERIFY" "$work/outside.tgz" "$work/a.tgz"
+
 # nonexistent inputs
 expect_reject "missing published file rejected" \
   bash "$TAR_VERIFY" "$work/nope.tgz" "$work/a.tgz"
 expect_reject "missing local file rejected" \
   bash "$TAR_VERIFY" "$work/a.tgz" "$work/nope.tgz"
+
+# --- bin-format verifier ------------------------------------------------
+expect_ok "bin verifier self-test passes" bash scripts/verify-npm-bin.sh --self-test
+
+# e2e: +x text file rejected, +x script accepted, symlink rejected
+printf 'plain text, no shebang\n' > "$work/textbin"
+chmod +x "$work/textbin"
+expect_reject "text file with exec bit rejected" \
+  bash scripts/verify-npm-bin.sh "$work/textbin"
+printf '#!/bin/sh\necho ok\n' > "$work/scriptbin"
+chmod +x "$work/scriptbin"
+expect_ok "shebang script accepted" \
+  bash scripts/verify-npm-bin.sh "$work/scriptbin"
+ln -s "$work/scriptbin" "$work/linkbin"
+expect_reject "symlink bin rejected" \
+  bash scripts/verify-npm-bin.sh "$work/linkbin"
 
 # --- arch verifier ------------------------------------------------------
 expect_ok "arch self-test passes" bash "$ARCH_VERIFY" --self-test
