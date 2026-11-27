@@ -155,6 +155,11 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // per-link whole-query scans are already covered by `link_bytes`.
     let query_whole = !query.contains(char::is_whitespace);
     let context_whole = !context.contains(char::is_whitespace);
+    // Exact needle bytes for the per-term preprocessing charge: CJK
+    // bigrams and glossary terms are NOT substrings of the query, so
+    // query.len() undercounts them (#144 r16).
+    let query_term_bytes: usize = query_terms.iter().map(|t| t.len()).sum();
+    let context_term_bytes: usize = context_terms.iter().map(|t| t.len()).sum();
 
     for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
@@ -194,18 +199,21 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             .links
             .len()
             .saturating_mul(query.len())
-            .saturating_add(query.len().saturating_mul(4))
-            .saturating_add(context.len().saturating_mul(2))
+            .saturating_add(query_term_bytes.saturating_mul(4))
+            .saturating_add(context_term_bytes.saturating_mul(2))
             .saturating_add(if query_whole {
                 query.len().saturating_mul(2)
             } else {
                 0
             })
             .saturating_add(if context_whole { context.len() } else { 0 });
+        // matches_query lowercases non-lowercase-ASCII targets before
+        // scanning — the allocation and the scan of the lowered text
+        // can each reach ~3x target.len() (#144 r16).
         let skill_work = scan_terms
             .saturating_mul(2)
             .saturating_mul(skill_names[index].len() + skill_descriptions[index].len())
-            .saturating_add(link_bytes)
+            .saturating_add(link_bytes.saturating_mul(3))
             .saturating_add(whole_query_work)
             .saturating_add(preprocess_work);
         match_work = match_work.saturating_add(skill_work);
@@ -242,6 +250,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             20.0,
             "name",
             &mut direct_reasons,
+            query_whole,
         ) + field_score(
             &query,
             &query_terms,
@@ -249,6 +258,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             8.0,
             "description",
             &mut direct_reasons,
+            query_whole,
         ) + field_score(
             &context,
             &context_terms,
@@ -256,6 +266,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             4.0,
             "context+description",
             &mut direct_reasons,
+            context_whole,
         );
 
         // Weak relatedness evidence: link targets here; body text is
@@ -272,11 +283,15 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                     } else {
                         1.0
                     };
-                    weak_reasons.push(format!("{:?} link target: {}", link.kind, link.target));
+                    if weak_reasons.len() < MAX_REASONS_PER_SKILL {
+                        weak_reasons.push(format!("{:?} link target: {}", link.kind, link.target));
+                    }
                 }
                 LinkKind::Mention if matches_query(&query, &link.target) => {
                     weak += 1.0;
-                    weak_reasons.push(format!("mention: {}", link.target));
+                    if weak_reasons.len() < MAX_REASONS_PER_SKILL {
+                        weak_reasons.push(format!("mention: {}", link.target));
+                    }
                 }
                 _ => {}
             }
@@ -438,6 +453,15 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // into tens of GiB of scanning. Bound total term×byte work too.
     const MAX_BODY_TERM_WORK: usize = 256 * 1024 * 1024;
     let term_count = query_terms.len() + context_terms.len();
+    // expand_gloss appends at most the sum of every glossary term's
+    // bytes (dedup only shrinks it); compute that bound once so the
+    // per-body estimate covers the EXPANDED field the scorer scans,
+    // not just body_text.len() (#144 r16).
+    let max_gloss_bytes: usize = GLOSS
+        .iter()
+        .flat_map(|(_, g)| g.split_whitespace())
+        .map(|t| t.len() + 1)
+        .sum();
     let mut body_scanned = 0usize;
     let mut body_work = 0usize;
     let mut body_order: Vec<usize> = admitted.keys().copied().collect();
@@ -446,8 +470,27 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         if body_scanned >= MAX_BODY_SCAN_BYTES {
             break;
         }
-        let body_len = graph.skills[index].body_text.len();
-        let work = term_count.saturating_mul(body_len);
+        let raw_body = &graph.skills[index].body_text;
+        let body_len = raw_body.len();
+        let non_ascii = !raw_body.is_ascii();
+        // est_field upper-bounds the expanded+lowercased text field_score
+        // scans; non-ASCII bodies additionally pay GLOSS.len() substring
+        // scans inside expand_gloss plus the to_lowercase copy.
+        let est_field = if non_ascii {
+            body_len.saturating_add(max_gloss_bytes)
+        } else {
+            body_len
+        };
+        let work = term_count
+            .saturating_mul(est_field)
+            .saturating_add(if query_whole { est_field } else { 0 })
+            .saturating_add(if context_whole { est_field } else { 0 })
+            .saturating_add(if non_ascii {
+                GLOSS.len().saturating_mul(body_len)
+            } else {
+                0
+            })
+            .saturating_add(body_len);
         if body_scanned + body_len > MAX_BODY_SCAN_BYTES || body_work + work > MAX_BODY_TERM_WORK {
             continue;
         }
@@ -457,15 +500,23 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             continue;
         };
         let body = expand_gloss(&graph.skills[index].body_text.to_lowercase());
-        info.weak += field_score(&query, &query_terms, &body, 2.0, "body", &mut info.reasons)
-            + field_score(
-                &context,
-                &context_terms,
-                &body,
-                1.0,
-                "context+body",
-                &mut info.reasons,
-            );
+        info.weak += field_score(
+            &query,
+            &query_terms,
+            &body,
+            2.0,
+            "body",
+            &mut info.reasons,
+            query_whole,
+        ) + field_score(
+            &context,
+            &context_terms,
+            &body,
+            1.0,
+            "context+body",
+            &mut info.reasons,
+            context_whole,
+        );
     }
 
     let mut out: Vec<Recommendation> = infos
@@ -611,9 +662,19 @@ fn document_frequency<'a>(
         .filter(|(_, s)| s.parse_error.is_none())
         .map(|(i, _)| skill_names[i].len() + skill_descriptions[i].len())
         .sum();
+    // Each term_matches call also builds a Two-Way searcher over the
+    // needle — up to 2 calls per installed copy per term — so charge
+    // term.len() preprocessing on top of the field-byte scan (#144 r16).
+    let n_copies = graph
+        .skills
+        .iter()
+        .filter(|s| s.parse_error.is_none())
+        .count();
     let mut frequencies = HashMap::new();
     for term in unique {
-        *match_work = match_work.saturating_add(field_bytes);
+        *match_work = match_work
+            .saturating_add(field_bytes)
+            .saturating_add(term.len().saturating_mul(2).saturating_mul(n_copies));
         if *match_work > MAX_MATCH_TERM_WORK {
             break;
         }
@@ -653,6 +714,7 @@ fn field_score(
     weight: f64,
     label: &str,
     reasons: &mut Vec<String>,
+    query_whole: bool,
 ) -> f64 {
     if query.is_empty() || field.is_empty() {
         return 0.0;
@@ -666,7 +728,7 @@ fn field_score(
             }
         }
     }
-    if !query.contains(char::is_whitespace) && term_matches(field, query) {
+    if query_whole && term_matches(field, query) {
         score += weight * 2.0;
         if reasons.len() < MAX_REASONS_PER_SKILL {
             reasons.push(format!("{label}: {query}"));

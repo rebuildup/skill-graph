@@ -325,6 +325,18 @@ fn detect_arg_error(err: String) -> Result<(), String> {
 }
 
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    // Each distinct root gets its own walk budget; cap repetitions at
+    // the MCP MAX_TOOL_ROOTS parity bound so a huge --root list cannot
+    // multiply discovery work (#144 r16).
+    const MAX_CLI_ROOTS: usize = 32;
+    let mut roots = roots;
+    if roots.len() > MAX_CLI_ROOTS {
+        write_stderr_line(&format!(
+            "skill-graph: {} --root entries ignored (max {MAX_CLI_ROOTS})",
+            roots.len() - MAX_CLI_ROOTS
+        ));
+        roots.truncate(MAX_CLI_ROOTS);
+    }
     crate::discovery::resolve_roots(roots, crate::discovery::default_roots)
 }
 
