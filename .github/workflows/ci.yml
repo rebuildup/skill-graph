@@ -6,6 +6,35 @@ on:
   pull_request:
 
 jobs:
+  base-guard:
+    # Release-driven delivery: ticket PRs must target the active
+    # release branch; `main` only accepts release-* integration PRs
+    # (#144 運用違反の再発防止 — main への直接統合を CI で構造的に
+    # 拒否する)。Push events have no base_ref and skip this check.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: PR refs must follow the release-driven delivery model
+        # Refs pass through env, never `${{ }}` interpolation: ref names
+        # may legally contain `$`, backticks, `;`, quotes, and
+        # parentheses, so direct interpolation is script injection on
+        # attacker-controlled fork branch names (#144 R23).
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          # Ticket PRs integrate into a release-* branch. The only
+          # main-bound PR allowed is a release-* integration head.
+          # `release-*` is a naming convention, not proof of release
+          # status — the human merge-approval boundary for main covers
+          # the residual (#144). Push events skip this job entirely.
+          if [[ "$BASE_REF" != release-* ]] &&
+             { [ "$BASE_REF" != "main" ] || [[ "$HEAD_REF" != release-* ]]; }; then
+            echo "ticket PRs must target a release-* branch;" >&2
+            echo "main-bound PRs must come from a release-* branch." >&2
+            exit 1
+          fi
+
   rust:
     runs-on: ubuntu-latest
     steps:
