@@ -8,7 +8,7 @@
 - 恒久的な設計判断は `docs/adr/` に記録する。
 - 仕様は `docs/specs/` に置き、実装都合だけで黙って変更しない。
 - 通常作業は Issue 番号の ticket branch で行い、`main` へ直接 commit/push しない。
-- release branch と `main` の統合はユーザーの明示承認を必要とする。
+- ticket PR の base は active release branch (`release-x-y-z`) とする。`main` への PR は `release-*` branch からの release 統合のみに限定し、その merge にはユーザーの明示承認を必要とする (#144 運用違反の再発防止)。
 
 ## 作業開始時
 
