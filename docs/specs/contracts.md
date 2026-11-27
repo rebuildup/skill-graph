@@ -100,7 +100,9 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   （収集・ファイル毎の双方を含む。latched な打ち切り通知
   数件を別途含みうる）、ファイル毎 256 MiB
   （`.db` は `-wal` 込み）、JSONL 行・`.db` 行の `data` ペイロード毎
-  4 MiB（`serde_json::Value` は入力の ~16-30 倍を占めるため、
+  4 MiB（文字数・UTF-8 byte 数の双方で判定。`session_id`/`type` 列も
+  substr + length で同上限を適用し、超過行は skip する。
+  `serde_json::Value` は入力の ~16-30 倍を占めるため、
   ファイル上限だけでは 1 行で数 GB を確保しうる）、retained
   events/loads 各 1,000,000、retained detail 合計 64 MiB
   （イベント/ロードの推定バイト数 —
@@ -122,6 +124,10 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   いずれの打ち切りも `errors` に latched 通知が入り、
   `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される
   （`skill_loads` の name cardinality 打ち切りを除く）。
+  なお走査中は canonical 化した dir path（最大 ~4 KiB ×
+  65,536 dir ≒ worst case ~270 MB）を visited set として保持する
+  — 256 MiB ファイル上限と同程度の transient であり、dir 数上限が
+  そのまま memory 暗黙上限になる点は既知の residual。
   transcript scanner（Claude/Codex）が finish まで保持する
   record にも count+byte の共有予算がある（`MAX_SCAN_ITEMS`
   65,536・`MAX_SCAN_BYTES` 64 MiB/ scanner）: tool_use input は

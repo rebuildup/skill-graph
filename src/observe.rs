@@ -1749,11 +1749,14 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
     // serde_json sees it (same contract as the JSONL line cap).
     // `session_id`/`type` are also substr-capped: a single row could
     // otherwise carry a ~file-size cell into Rust before sanitization.
-    // `length(session_id)` is selected alongside so an over-cap id is
-    // detected and skipped rather than silently merged with any other
-    // id sharing the same prefix (#144 r15).
+    // `length(session_id)` (chars) and its BLOB length (bytes) are
+    // selected alongside so an over-cap id is detected and skipped
+    // rather than silently merged with any other id sharing the same
+    // prefix — the byte check mirrors the `data` payload rule since a
+    // multi-byte id could otherwise materialize ~4x the char cap
+    // (#144 r15/r16).
     let sql = format!(
-        "SELECT substr(session_id, 1, {}), length(session_id), substr(type, 1, 65), length(data), substr(data, 1, {}), time_created FROM session_message ORDER BY session_id, {order_col}",
+        "SELECT substr(session_id, 1, {}), length(session_id), length(CAST(session_id AS BLOB)), substr(type, 1, 65), length(data), substr(data, 1, {}), time_created FROM session_message ORDER BY session_id, {order_col}",
         MAX_OBSERVE_LINE_BYTES + 1,
         MAX_OBSERVE_LINE_BYTES + 1
     );
@@ -1763,24 +1766,25 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(|e| format!("query: {e}"))?;
     for row in rows {
         // A single malformed row (NULL column, type drift) must not abort
         // the whole database scan.
-        let Ok((session_id, sid_chars, kind, data_chars, data, created_ms)) = row else {
+        let Ok((session_id, sid_chars, sid_bytes, kind, data_chars, data, created_ms)) = row else {
             obs.lines_skipped += 1;
             continue;
         };
         // An id longer than the substr cap would be truncated into a
         // prefix shared with other over-long ids — skip rather than
         // merge distinct sessions (#144 r15).
-        if sid_chars > MAX_OBSERVE_LINE_BYTES as i64 {
+        if sid_chars > MAX_OBSERVE_LINE_BYTES as i64 || sid_bytes > MAX_OBSERVE_LINE_BYTES as i64 {
             obs.lines_skipped += 1;
             continue;
         }
