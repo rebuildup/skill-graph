@@ -89,13 +89,26 @@ function validSkillName(name: string): boolean {
 // Mirror events.rs's sanitize_session_id contract: absent/empty ids
 // stay unattributed (""), charset-valid ids pass through bounded, and
 // distinct all-invalid ids hash apart instead of collapsing into one
-// "unknown" funnel session.
-function safeSessionID(id: unknown): string {
+// "unknown" funnel session. Exported for the parity contract test
+// (opencode-plugin.test.ts) — the sanitize rules are part of the
+// cross-entrypoint event contract (#225).
+export function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
-  const filtered = s.replace(/[^A-Za-z0-9._-]/g, "")
+  // Bounded scan parity with events::sanitize_session_id's take(129):
+  // collect at most 129 valid chars — enough to detect the >128
+  // overflow without materializing a multi-MB filtered copy of a
+  // hostile id (#225 re-review). The charset is ASCII-only, so
+  // .length == char count, and reaching 129 means overflow whether or
+  // not a 130th valid char exists (Rust's count > 128 branch).
+  let filtered = ""
+  for (const ch of s) {
+    if (!/[A-Za-z0-9._-]/.test(ch)) continue
+    filtered += ch
+    if (filtered.length === 129) break
+  }
   // Distinct ids sharing a 128-char prefix must not collapse: bounded
   // head plus a hash suffix of the original (parity with Rust).
-  if (filtered.length > 128) {
+  if (filtered.length === 129) {
     return `${filtered.slice(0, 119)}-${sha256(s).slice(0, 8)}`
   }
   if (!filtered) {
@@ -105,8 +118,10 @@ function safeSessionID(id: unknown): string {
   // Charset filtering is lossy: "sess!1" and "sess?1" would both
   // collapse to "sess1". When any character was stripped, suffix a
   // hash of the ORIGINAL id so distinct inputs stay distinct — parity
-  // with events::sanitize_session_id (#225).
-  return filtered === s ? filtered : `${filtered}-${sha256(s).slice(0, 8)}`
+  // with events::sanitize_session_id (#225). The 119-char head cap
+  // keeps the result inside the 128-char contract even when the
+  // filtered id is already 120-128 chars (#225 re-review).
+  return filtered === s ? filtered : `${filtered.slice(0, 119)}-${sha256(s).slice(0, 8)}`
 }
 
 function emit(event: Record<string, unknown>): boolean {
@@ -334,15 +349,33 @@ function resultText(result: unknown): string {
       parts.push(t)
       total += utf8Bytes(t) + 1
     }
-    const walk = (v: any) => {
-      if (total >= MAX_RESULT_TEXT_BYTES || !v || typeof v !== "object") return
+    // Depth AND node bounds: a deeply nested `output`/`content` chain
+    // with no text never exhausts `total`, and a giant flat array would
+    // still cost O(n) walk calls — both are capped so hostile result
+    // shapes cannot stall this long-lived plugin (#225 re-review).
+    let walked = 0
+    const walk = (v: any, depth: number) => {
+      if (total >= MAX_RESULT_TEXT_BYTES || depth > MAX_INPUT_DEPTH || !v || typeof v !== "object") return
+      if (++walked > MAX_INPUT_NODES) return
       if (typeof v.text === "string") push(v.text)
       if (typeof v.content === "string") push(v.content)
-      if (Array.isArray(v.content)) v.content.forEach(walk)
-      if (Array.isArray(v.output)) v.output.forEach(walk)
-      if (v.output && typeof v.output === "object") walk(v.output)
+      // for..of + break (not forEach): iteration itself must stop at
+      // the node budget, not merely skip recursion per element.
+      if (Array.isArray(v.content)) {
+        for (const c of v.content) {
+          if (walked > MAX_INPUT_NODES) break
+          walk(c, depth + 1)
+        }
+      }
+      if (Array.isArray(v.output)) {
+        for (const c of v.output) {
+          if (walked > MAX_INPUT_NODES) break
+          walk(c, depth + 1)
+        }
+      }
+      if (v.output && typeof v.output === "object") walk(v.output, depth + 1)
     }
-    walk(r)
+    walk(r, 0)
     return parts.join("\n")
   } catch {
     return ""

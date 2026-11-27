@@ -186,8 +186,12 @@ pub(crate) fn sanitize_session_id(session_id: &str) -> String {
         // was stripped, suffix a hash of the ORIGINAL id so distinct
         // inputs stay distinct — the same suffix scheme the >128-char
         // branch uses, mirrored exactly by the OpenCode plugin's
-        // safeSessionID (#225).
-        return format!("{safe}-{}", &sha256_hex(session_id.as_bytes())[..8]);
+        // safeSessionID (#225). The head is capped at 119 chars so the
+        // result can never exceed the 128-char session_id contract —
+        // a 128-char filtered id plus the suffix would otherwise emit
+        // 137 chars (#225 re-review).
+        let head: String = safe.chars().take(119).collect();
+        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
     }
     safe
 }
@@ -1237,6 +1241,29 @@ mod tests {
         // Deterministic for joins, and a clean id keeps its bare form.
         assert_eq!(a, sanitize_session_id("sess!1"));
         assert_eq!(sanitize_session_id("sess1"), "sess1");
+    }
+
+    #[test]
+    fn sanitize_session_id_never_exceeds_contract_limit() {
+        // #225 re-review: the stripped-chars suffix must not push the
+        // result past the 128-char session_id contract — a 128-char
+        // filtered id plus "-" + 8 hash chars emitted 137 before.
+        for raw in [
+            format!("{}!", "x".repeat(128)),
+            format!("{}?", "x".repeat(120)),
+            format!("{}!", "x".repeat(200)),
+            "sess!1".to_string(),
+        ] {
+            let out = sanitize_session_id(&raw);
+            assert!(out.len() <= 128, "{out:?} exceeds 128 chars");
+            // Idempotent: sanitizing an already-sanitized id is a no-op.
+            assert_eq!(sanitize_session_id(&out), out);
+        }
+        // Distinct long ids that share a 119-char filtered head still
+        // separate via the original-bytes hash.
+        let a = format!("{}!a", "x".repeat(128));
+        let b = format!("{}!b", "x".repeat(128));
+        assert_ne!(sanitize_session_id(&a), sanitize_session_id(&b));
     }
 
     #[test]

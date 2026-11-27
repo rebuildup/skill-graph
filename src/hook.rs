@@ -498,22 +498,14 @@ fn restrict_perms_fd(f: &std::fs::File) {
 #[cfg(not(unix))]
 fn restrict_perms_fd(_f: &std::fs::File) {}
 
-/// 0700 on the state dir, applied through an open fd: the fd's metadata
-/// must show a directory owned by our euid before fchmod, so a symlink
-/// swapped in after the earlier lstat check cannot redirect the chmod
-/// into an arbitrary directory (fail-open otherwise).
+/// 0700 on the state dir, applied through the already-verified dirfd:
+/// fchmod on the fd can never be redirected by swapping the directory
+/// entry after open — the path-based variant it replaces could be
+/// aimed at an arbitrary euid-owned directory via a planted symlink
+/// (#225 re-review).
 #[cfg(unix)]
-fn restrict_dir_perms(path: &std::path::Path) {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(f) = std::fs::File::open(path) else {
-        return;
-    };
-    let Ok(m) = f.metadata() else {
-        return;
-    };
-    if !m.is_dir() || m.uid() != unsafe { libc::geteuid() } {
-        return;
-    }
+fn restrict_dir_fd(f: &std::fs::File) {
+    use std::os::unix::fs::PermissionsExt;
     let _ = f.set_permissions(std::fs::Permissions::from_mode(0o700));
 }
 
@@ -1025,19 +1017,38 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         if is_link {
             env.state_disabled = true;
         } else {
-            let _ = std::fs::create_dir_all(&env.state_dir);
-            restrict_dir_perms(&env.state_dir);
+            // Create missing dirs with 0700 up front: create_dir_all
+            // would leave a umask-default (e.g. 0755) window before the
+            // dirfd fchmod below, exposing state filenames to other
+            // TMPDIR users (#225 re-review).
             #[cfg(unix)]
             {
-                // Anchor every state file op to a verified dirfd: the
-                // check-then-open race documented at R18 is closed —
-                // after this open no path re-resolution can be
-                // redirected by swapping the state-dir entry (#225).
+                use std::os::unix::fs::DirBuilderExt;
+                let _ = std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .recursive(true)
+                    .create(&env.state_dir);
+            }
+            #[cfg(not(unix))]
+            let _ = std::fs::create_dir_all(&env.state_dir);
+            #[cfg(unix)]
+            {
+                // Anchor EVERY state-dir operation — including the
+                // permission tightening — to the verified dirfd. The
+                // previous path-based chmod reopened the file between
+                // check and fchmod, so a symlink swapped in after the
+                // lstat could redirect the mode change into an
+                // arbitrary euid-owned directory (#225 re-review).
                 match open_state_dir(&env.state_dir) {
-                    Ok(fd) => env.state_fd = Some(fd),
+                    Ok(fd) => {
+                        restrict_dir_fd(&fd);
+                        env.state_fd = Some(fd);
+                    }
                     Err(_) => env.state_disabled = true,
                 }
             }
+            #[cfg(not(unix))]
+            restrict_dir_perms(&env.state_dir);
         }
     }
 

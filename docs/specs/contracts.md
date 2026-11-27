@@ -93,7 +93,10 @@ queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
   funnel join キーに流入させない）。charset フィルタで文字が除去
   された `session_id` は元 id の hash 接尾辞を付すため merge されない
   （`sess!1` と `sess?1` は別 id；除去がなければ素通し、全滅なら
-  `unknown-<hash>`、128 文字超は先頭 119 文字 + `-` + hash 8 桁）。
+  `unknown-<hash>`）。接尾辞付与時も head は 119 文字に cap される
+  ため、結果は常に 128 文字以内（`session_id` の上限契約を suffix
+  が破らない）。OpenCode plugin の `safeSessionID` は同一規則を
+  実装し、`src/assets/opencode-plugin.test.ts` が parity を検証する。
   `recommended[].name` は
   schema の `minLength: 1` より厳しく valid skill name を要求する —
   schema 適合でも観測側の join キーにならない名前は `lines_skipped`
@@ -290,6 +293,8 @@ Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts
 - Rust の state dir（`${TMPDIR}/skill-graph-hook-state`）は open 時に
   `O_NOFOLLOW|O_DIRECTORY` で dirfd を取得し euid 所有を検証したうえで、
   全 state file 操作を `openat`/`fstatat` でその fd 相対に行う。
+  dir 自体の permission tightening も検証済み dirfd への `fchmod` で
+  行い、dirfd 確立前後を通じて path 再解決に依存する操作を残さない。
   検査と操作の間に state dir エントリを差し替える競合は構造的に
   不可能（#225）。state file 名は `<runtime>-<session>` を含み、
   runtime 間・未知 session 間で dedup/recommended state を共有しない
