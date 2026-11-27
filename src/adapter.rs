@@ -1175,6 +1175,59 @@ fn payload_base_dirs() -> Vec<PathBuf> {
     bases
 }
 
+/// The verified filesystem action for one payload deletion candidate,
+/// or `None` to leave it untouched (documented orphan residue).
+enum PayloadDelete {
+    /// Unlink the final-component symlink itself — never followed.
+    UnlinkSymlink,
+    /// Recursively delete the canonicalized payload directory.
+    RemoveDirAll(PathBuf),
+}
+
+/// Verify-then-act decision for a single payload dir. This is the ONLY
+/// place payload deletion guards live: symlink handling,
+/// canonicalization, managed-layout, and data-home base membership are
+/// all verified here so no call site can bypass a layer (#144
+/// structural — six rounds of guard accretion collapsed into one
+/// predicate). `managed_parents`/`managed_dirs` are the canonicalized
+/// `<base>/skill-graph` / `<base>/skill-graph/opencode-plugin` pairs.
+fn payload_delete_action(
+    dir: &Path,
+    managed_parents: &[PathBuf],
+    managed_dirs: &[PathBuf],
+) -> Option<PayloadDelete> {
+    // A symlink AT the final component is different from intermediate
+    // symlinks: canonicalize() would resolve it and delete the link
+    // target's contents. Unlink the link itself instead — the payload
+    // entry is gone either way. The unlink needs the same
+    // base-membership gate as the recursive delete: spec-decoded dirs
+    // are arbitrary absolute paths, and removing a foreign
+    // `*/skill-graph/opencode-plugin` symlink is still
+    // attacker-directed deletion (#144 r18/r22). Canonicalize the
+    // PARENT — never the final component.
+    if dir
+        .symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        let parent_ok = dir
+            .parent()
+            .and_then(|p| p.canonicalize().ok())
+            .is_some_and(|p| managed_parents.contains(&p));
+        return parent_ok.then_some(PayloadDelete::UnlinkSymlink);
+    }
+    // Intermediate components may still be symlinks the lexical guard
+    // cannot see: a spec naming `<any-abs>/skill-graph/opencode-plugin`
+    // where `skill-graph` is a symlink would recurse into the link
+    // target. Canonicalize and re-verify the resolved path against the
+    // managed layout before deleting (#144 r18).
+    let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    if is_managed_payload_dir(&resolved) && managed_dirs.contains(&resolved) {
+        return Some(PayloadDelete::RemoveDirAll(resolved));
+    }
+    None
+}
+
 /// Payload dirs referenced by v0.4.x `file://` plugin specs in `config`.
 /// Legacy-marker entries point into removed adapter bundles, not the
 /// shared payload dir, and specs that fail to decode — or decode to a
@@ -1473,41 +1526,15 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                     base_dirs.iter().map(|b| b.join("skill-graph")).collect();
                 let managed_dirs: Vec<PathBuf> =
                     base_dirs.iter().map(|b| b.join(PLUGIN_MARKER)).collect();
-                for dir in payload_dirs {
-                    // The lexical guard above cannot see symlinks in
-                    // intermediate components: a spec naming
-                    // `<any-abs>/skill-graph/opencode-plugin` where
-                    // `skill-graph` is a symlink would still recurse
-                    // into the link target. Canonicalize and re-verify
-                    // the resolved path before deleting (#144 r18).
-                    //
-                    // A symlink AT the final component is different:
-                    // canonicalize() would resolve it and delete the
-                    // link target's contents. Unlink the link itself
-                    // instead — the payload entry is gone either way.
-                    // The unlink needs the same base-membership gate as
-                    // the recursive delete: spec-decoded dirs are
-                    // arbitrary absolute paths, and removing a foreign
-                    // `*/skill-graph/opencode-plugin` symlink is still
-                    // attacker-directed deletion (#144 r22). Canonicalize
-                    // the PARENT — never the final component.
-                    if dir
-                        .symlink_metadata()
-                        .map(|m| m.file_type().is_symlink())
-                        .unwrap_or(false)
-                    {
-                        let parent_ok = dir
-                            .parent()
-                            .and_then(|p| p.canonicalize().ok())
-                            .is_some_and(|p| managed_parents.contains(&p));
-                        if parent_ok {
-                            let _ = std::fs::remove_file(&dir);
+                for dir in &payload_dirs {
+                    match payload_delete_action(dir, &managed_parents, &managed_dirs) {
+                        Some(PayloadDelete::UnlinkSymlink) => {
+                            let _ = std::fs::remove_file(dir);
                         }
-                        continue;
-                    }
-                    let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                    if is_managed_payload_dir(&resolved) && managed_dirs.contains(&resolved) {
-                        let _ = std::fs::remove_dir_all(&resolved);
+                        Some(PayloadDelete::RemoveDirAll(resolved)) => {
+                            let _ = std::fs::remove_dir_all(resolved);
+                        }
+                        None => {}
                     }
                 }
                 outln!(

@@ -14,12 +14,23 @@ jobs:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - name: PR base must be a release branch for main-bound changes
+      - name: PR refs must follow the release-driven delivery model
+        # Refs pass through env, never `${{ }}` interpolation: ref names
+        # may legally contain `$`, backticks, `;`, quotes, and
+        # parentheses, so direct interpolation is script injection on
+        # attacker-controlled fork branch names (#144 R23).
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          base="${{ github.base_ref }}"
-          head="${{ github.head_ref }}"
-          if [ "$base" = "main" ] && [[ "$head" != release-* ]]; then
-            echo "ticket PRs must target the active release branch;" >&2
+          # Ticket PRs integrate into a release-* branch. The only
+          # main-bound PR allowed is a release-* integration head.
+          # `release-*` is a naming convention, not proof of release
+          # status — the human merge-approval boundary for main covers
+          # the residual (#144). Push events skip this job entirely.
+          if [[ "$BASE_REF" != release-* ]] &&
+             { [ "$BASE_REF" != "main" ] || [[ "$HEAD_REF" != release-* ]]; }; then
+            echo "ticket PRs must target a release-* branch;" >&2
             echo "main-bound PRs must come from a release-* branch." >&2
             exit 1
           fi
