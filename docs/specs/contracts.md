@@ -219,7 +219,12 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   順の真の prefix になる（passthrough pending buffer と同じ
   意味論）。tool_use 1 件あたりの classification 数も
   `MAX_EVENTS_PER_PAYLOAD`（64）で打ち切る（hook の per-payload
-  cap と同じ上限）。
+  cap と同じ上限）。`--summary` の `session_events`/`funnel_for`
+  は集計用の transient map（`runtime:session_id` キー等）を
+  event 数比例で構築するため、最悪入力では retained
+  `MAX_OBSERVE_RETAINED_BYTES` budget の数倍の peak memory に
+  なる — CPU は共有 pair-check 予算で有限であり、memory 増幅は
+  受容 residual として記録する（#144 R23 LOW）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
   `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
