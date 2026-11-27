@@ -1278,3 +1278,78 @@ fn opencode_status_empty_skill_graph_bin_uses_path() {
     assert!(out.contains("enabled"), "{out}");
     assert!(!out.contains("broken"), "{out}");
 }
+
+/// Round-17: status/disable resolve the payload dir from the config's
+/// own file:// spec, not the current XDG_DATA_HOME — an env change
+/// between enable and status must not report a healthy install as
+/// broken, and disable must remove the spec-referenced payload.
+#[test]
+fn opencode_status_and_disable_follow_spec_dir_across_env_change() {
+    let f = Fixture::new();
+    let (out, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    let payload = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin");
+    assert!(payload.join("index.ts").is_file());
+
+    // Status under a different XDG_DATA_HOME: the spec still points at
+    // the original payload, which exists -> enabled, not broken.
+    let alt = f.home.path().join("alt-data");
+    let (out, rc) = f.run_env(
+        &["adapter", "status", "opencode", "--user"],
+        &[("XDG_DATA_HOME", alt.to_str().unwrap())],
+    );
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("enabled"), "{out}");
+    assert!(!out.contains("broken"), "{out}");
+
+    // Disable under the changed env must remove the spec-referenced
+    // payload, not the (nonexistent) env-resolved dir.
+    let (_, rc) = f.run_env(
+        &["adapter", "disable", "opencode", "--user"],
+        &[("XDG_DATA_HOME", alt.to_str().unwrap())],
+    );
+    assert_eq!(rc, 0);
+    assert!(!payload.exists(), "spec-referenced payload must be removed");
+}
+
+#[test]
+fn opencode_disable_never_removes_dirs_outside_payload_layout() {
+    // A crafted file:// spec can percent-decode to a path containing
+    // `..`; marker matching alone must not turn it into a
+    // remove_dir_all target (#144 r17 CR). The spec still matches our
+    // plugin marker so disable strips the config entry, but the
+    // resolved victim directory must survive.
+    let f = Fixture::new();
+    let victim = f.home.path().join(".local/Documents");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), "do not delete").unwrap();
+    let managed = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin");
+    // managed/../../../Documents resolves to .local/Documents.
+    let spec = format!("file://{}/../../../Documents", managed.display());
+    let cfg = f.home.path().join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(&cfg, serde_json::json!({ "plugins": [spec] }).to_string()).unwrap();
+
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        victim.join("keep.txt").is_file(),
+        "spec-decoded path outside the payload layout must not be removed"
+    );
+    // An emptied config is removed entirely (uninstall behavior), so
+    // absence of the file is the success signal here.
+    assert!(
+        !cfg.exists()
+            || serde_json::from_str::<Value>(&std::fs::read_to_string(&cfg).unwrap())
+                .unwrap()["plugins"]
+                .as_array()
+                .map(Vec::len)
+                == Some(0)
+    );
+}

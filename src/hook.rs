@@ -425,7 +425,12 @@ fn cksum_decimal(data: &[u8]) -> String {
 /// Runtime-specific fallback roots. `SKILL_GRAPH_ROOTS` is handled by
 /// `discovery::resolve_roots` and takes precedence over these.
 fn hook_fallback_roots(runtime: Runtime) -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    // A relative HOME would resolve `~`-style roots against the hook's
+    // cwd (the project tree); require absolute like the adapter's env
+    // policy (#144 r17).
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute());
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let dot_dir = match runtime {
         Runtime::Codex => ".codex",

@@ -165,7 +165,12 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   1 件でも混在する session では、timestamp による cursor kill を
   無効化する（encounter-order fallback が timestamp-dead 判定済みの
   load を位置的に eligible としうるため。消費済み load の kill は
-  有効のまま）。
+  有効のまま）。timestamp を持たない rec の変換勝者は timestamp
+  sort 位置ではなく encounter order で選ぶ（eligibility と同じ
+  順序で「最初」を定義するため）。transcript 由来 event と
+  contract-log passthrough event は file 内の feed line index を
+  共有し、(timestamp, line) で emit されるため、timestamp が
+  欠落・同値の場合も真の出現順が保たれる。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
   `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
@@ -345,6 +350,12 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   ディレクトリ内 config の置換に限定される設計（dirfd pin や
   `openat2(RESOLVE_BENEATH)` は採用しない）。この残余 race は
   既知の制限として記録する。
+- `adapter status`/`disable` は payload dir を env
+  （XDG_DATA_HOME/HOME）から再解決せず、config 内 `file://` spec を
+  percent-decode して解決する。enable 後に env が変わっても spec が
+  指す実 payload を検査・削除するため、状態報告と削除対象が
+  OpenCode の実挙動と一致する（#144 r17）。enable は config write
+  失敗時に今回作成した payload のみを rollback する。
 - materialize される OpenCode plugin payload は XDG data dir 配下に
   置かれ、最終 component の symlink は拒否するが、中間 component
   （例: `$XDG_DATA_HOME/skill-graph` 自体の symlink）は user 所有
@@ -383,6 +394,13 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   `requires-skills`/`requires_skills` を優先し・残りを key sort で
   決定的に選ぶ（HashMap 反復順は process 毎に random なため、
   requires-link の admit 結果が run 間で変わらないようにする）。
+- frontmatter に YAML alias（`*name`）を 1 件でも含む document は
+  parse_error として reject する。serde_yaml は alias を anchor
+  subtree の event 再走査で展開し、その回数制限は jump 数のみを
+  bound するため、flat な anchor/alias 対で ~10^10 node の materialize
+  （OOM）に至りうる（#144 r17）。anchor 定義のみ・alias 非含有の
+  document は影響を受けない。判定は serde_yaml と同一の libyaml
+  event stream で行うため parser と乖離しない。
 - `parse_skill` の `O_NOFOLLOW` は最終 component のみを守る。
   WalkDir 収集後に skill ディレクトリや祖先 component が symlink
   へ差し替えられる窓は残るが、影響は ≤1 MiB の untrusted parse

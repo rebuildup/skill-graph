@@ -7,11 +7,15 @@ struct Evidence {
     direct: f64,
     weak: f64,
     necessity: f64,
-    // Hit terms only; document frequency is attached later, computed just
-    // for the union of hit terms rather than every query term.
-    name_hits: Vec<String>,
-    description_hits: Vec<String>,
-    context_hits: Vec<String>,
+    // Hit terms as indices into `query_terms` (name/description hits)
+    // and `context_terms` (context hits): storing the term strings
+    // themselves would retain up to ~3xMAX_RECOMMEND_TERMS cloned
+    // Strings per signal skill simultaneously (#144 r17). Document
+    // frequency is attached later, computed just for the union of hit
+    // terms rather than every query term.
+    name_hits: Vec<u32>,
+    description_hits: Vec<u32>,
+    context_hits: Vec<u32>,
     reasons: Vec<String>,
 }
 
@@ -78,6 +82,11 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         .collect();
     let context_terms: Vec<String> = context_tagged.iter().map(|(t, _)| t.clone()).collect();
     let context_sources = term_sources(&context_tagged);
+    // Three lowercased corpus-text copies are retained per call
+    // (names, base descriptions, expanded descriptions — ~3x corpus
+    // description bytes, worst ~150MB on a max corpus). They are
+    // outside every documented work budget but bounded by discovery
+    // caps; this dominates small-query latency on max corpora (#144 r17).
     let skill_names: Vec<String> = graph
         .skills
         .iter()
@@ -304,18 +313,21 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
         let name_hits = query_terms
             .iter()
-            .filter(|term| term_matches(name_lower, term))
-            .cloned()
+            .enumerate()
+            .filter(|(_, term)| term_matches(name_lower, term))
+            .map(|(i, _)| i as u32)
             .collect::<Vec<_>>();
         let description_hits = query_terms
             .iter()
-            .filter(|term| term_matches(description_lower, term))
-            .cloned()
+            .enumerate()
+            .filter(|(_, term)| term_matches(description_lower, term))
+            .map(|(i, _)| i as u32)
             .collect::<Vec<_>>();
         let context_hits = context_terms
             .iter()
-            .filter(|term| term_matches(&skill_descriptions_base[index], term))
-            .cloned()
+            .enumerate()
+            .filter(|(_, term)| term_matches(&skill_descriptions_base[index], term))
+            .map(|(i, _)| i as u32)
             .collect::<Vec<_>>();
 
         // Materialize Evidence only for skills carrying signal: direct or
@@ -347,8 +359,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             info.name_hits
                 .iter()
                 .chain(&info.description_hits)
-                .chain(&info.context_hits)
-                .map(|s| &**s)
+                .map(|&i| query_terms[i as usize].as_str())
+                .chain(
+                    info.context_hits
+                        .iter()
+                        .map(|&i| context_terms[i as usize].as_str()),
+                )
         })
         .collect();
     let document_frequency = document_frequency(
@@ -372,6 +388,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // - Markdown links, mentions, body text, and backlinks never admit.
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
+    // Cache the directly_admitted verdict per skill: requires propagation
+    // below re-checks it per (seed, link, copy) triple, and recomputing
+    // builds two HashSets over up to ~1k hit terms each time (#144 r17).
+    // `None` = not yet evaluated (exact-name seeds skip the check during
+    // admission); resolved lazily on first requires-target use.
+    let mut direct_flags: Vec<Option<bool>> = vec![None; infos.len()];
     for (index, info) in infos.iter().enumerate() {
         // An exact name match is the strongest possible signal and admits
         // even names too short to survive term extraction (e.g. a 1-char
@@ -381,23 +403,36 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let exact_name = !query.is_empty()
             && graph.skills[index].parse_error.is_none()
             && skill_names[index] == query;
-        if exact_name
-            || info.as_ref().is_some_and(|info| {
-                directly_admitted(
+        let direct = !exact_name
+            && info.as_ref().is_some_and(|info| {
+                let d = directly_admitted(
                     info,
+                    &query_terms,
+                    &context_terms,
                     &query_sources,
                     &context_sources,
                     &document_frequency,
                     df_bound,
-                )
-            })
-        {
+                );
+                direct_flags[index] = Some(d);
+                d
+            });
+        if exact_name || direct {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
     }
 
-    for seed in &seeds {
+    // Bound the (seed × requires-link × same-name copies) fan-out: every
+    // installed copy of a required name is a distinct target, so a
+    // hostile corpus could otherwise materialize O(seeds × links ×
+    // copies) reason strings with no cap (#144 r17). Iteration order is
+    // deterministic (index order → declaration order → by_name order),
+    // so truncation is stable across runs.
+    const MAX_PROPAGATION_CHECKS: usize = 4 * 1024 * 1024;
+    let mut propagation_checks = 0usize;
+    'propagation: for seed in &seeds {
+        let seed_reason = format!("required by {}", graph.skills[*seed].name);
         for link in &graph.skills[*seed].links {
             if link.kind != LinkKind::Requires {
                 continue;
@@ -409,20 +444,43 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 continue;
             };
             for &target in targets {
+                // Charge before the parse-error skip: `by_name` also
+                // holds parse-error copies, and iterating them must
+                // consume the same budget or a corpus of same-name
+                // parse-error copies could exceed the cap's intent
+                // (#144 r17 CR).
+                propagation_checks += 1;
+                if propagation_checks > MAX_PROPAGATION_CHECKS {
+                    break 'propagation;
+                }
                 if graph.skills[target].parse_error.is_some() {
                     continue;
                 }
-                let is_seed = infos[target].as_ref().is_some_and(|info| {
-                    directly_admitted(
-                        info,
-                        &query_sources,
-                        &context_sources,
-                        &document_frequency,
-                        df_bound,
-                    )
-                });
+                let is_seed = match direct_flags[target] {
+                    Some(d) => d,
+                    None => {
+                        let d = infos[target].as_ref().is_some_and(|info| {
+                            directly_admitted(
+                                info,
+                                &query_terms,
+                                &context_terms,
+                                &query_sources,
+                                &context_sources,
+                                &document_frequency,
+                                df_bound,
+                            )
+                        });
+                        direct_flags[target] = Some(d);
+                        d
+                    }
+                };
                 let entry = admitted.entry(target).or_default();
-                entry.push(format!("required by {}", graph.skills[*seed].name));
+                // Propagated reasons share the per-skill cap: distinct
+                // seed names would otherwise grow the Vec without bound
+                // before the final dedup (#144 r17).
+                if entry.len() < MAX_REASONS_PER_SKILL && !entry.contains(&seed_reason) {
+                    entry.push(seed_reason.clone());
+                }
                 if !is_seed {
                     // A requires target with no query signal has no stored
                     // Evidence; materialize a zeroed one so the necessity
@@ -475,11 +533,14 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let non_ascii = !raw_body.is_ascii();
         // est_field upper-bounds the expanded+lowercased text field_score
         // scans; non-ASCII bodies additionally pay GLOSS.len() substring
-        // scans inside expand_gloss plus the to_lowercase copy.
+        // scans inside expand_gloss plus the to_lowercase copy. A char
+        // can expand to several times its UTF-8 length under
+        // to_lowercase (combining marks), so the scanned field is
+        // charged at 4x body bytes, not body_len (#144 r17).
         let est_field = if non_ascii {
-            body_len.saturating_add(max_gloss_bytes)
+            body_len.saturating_mul(4).saturating_add(max_gloss_bytes)
         } else {
-            body_len
+            body_len.saturating_add(max_gloss_bytes)
         };
         let work = term_count
             .saturating_mul(est_field)
@@ -576,11 +637,15 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
 fn directly_admitted(
     info: &Evidence,
+    query_terms: &[String],
+    context_terms: &[String],
     query_sources: &HashMap<String, Rc<str>>,
     context_sources: &HashMap<String, Rc<str>>,
     document_frequency: &HashMap<String, usize>,
     df_bound: usize,
 ) -> bool {
+    let qterm = |i: u32| query_terms[i as usize].as_str();
+    let cterm = |i: u32| context_terms[i as usize].as_str();
     let df = |term: &str| document_frequency.get(term).copied().unwrap_or(usize::MAX);
     // Corpus-relative rarity: a term counts as specific evidence while its
     // document frequency stays within df_bound (see recommend()). df==1 made
@@ -590,8 +655,9 @@ fn directly_admitted(
     // one name is specific regardless of corpus-wide document frequency.
     // A single name hit stays conservative (low df, meaningful length).
     let multiple_name_hits = info.name_hits.len() >= 2;
-    let unique_name_hit =
-        info.name_hits.len() == 1 && rare(&info.name_hits[0]) && info.name_hits[0].len() >= 4;
+    let unique_name_hit = info.name_hits.len() == 1
+        && rare(qterm(info.name_hits[0]))
+        && qterm(info.name_hits[0]).len() >= 4;
     // A name hit plus independent description evidence admits: the name anchors
     // identity while the description confirms topical fit. This keeps high-df
     // description terms from admitting alone but lets e.g. "PR review" reach
@@ -604,27 +670,23 @@ fn directly_admitted(
     let description_sources: HashSet<&str> = info
         .description_hits
         .iter()
-        .map(|term| {
-            query_sources
-                .get(term)
-                .map(|s| &**s)
-                .unwrap_or(term.as_str())
+        .map(|&i| {
+            let term = qterm(i);
+            query_sources.get(term).map(|s| &**s).unwrap_or(term)
         })
         .collect();
     let description_admitted = info.description_hits.len() >= 2
         && description_sources.len() >= 2
-        && info.description_hits.iter().any(|term| rare(term));
+        && info.description_hits.iter().any(|&i| rare(qterm(i)));
     // Context admission applies the same independence rule: hits must
     // come from at least two distinct provenance sources, so one CJK
     // run's bigram cluster cannot self-admit through context (#144).
     let context_hit_sources: HashSet<&str> = info
         .context_hits
         .iter()
-        .map(|term| {
-            context_sources
-                .get(term)
-                .map(|s| &**s)
-                .unwrap_or(term.as_str())
+        .map(|&i| {
+            let term = cterm(i);
+            context_sources.get(term).map(|s| &**s).unwrap_or(term)
         })
         .collect();
     let context_admitted = info.context_hits.len() >= 2 && context_hit_sources.len() >= 2;
@@ -731,7 +793,11 @@ fn field_score(
     if query_whole && term_matches(field, query) {
         score += weight * 2.0;
         if reasons.len() < MAX_REASONS_PER_SKILL {
-            reasons.push(format!("{label}: {query}"));
+            // The bonus embeds the whole query (up to 32K chars) per
+            // reason; cap it so 64 reasons cannot retain ~2MB per skill
+            // (#144 r17).
+            let shown: String = query.chars().take(512).collect();
+            reasons.push(format!("{label}: {shown}"));
         }
     }
     score

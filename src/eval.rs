@@ -29,13 +29,29 @@ struct Case {
     case_kind: Option<String>,
 }
 
+/// Dataset bound: `bench` is a maintainer-invoked dev tool, but an
+/// unbounded JSONL read is the one remaining uncapped CLI input — a
+/// multi-GB or hostile dataset would OOM the process (#144 r17).
+const MAX_DATASET_BYTES: u64 = 64 * 1024 * 1024;
+
 /// `max` is the primary recommendation cutoff scored by `required_recall`.
 /// It defaults to the top-N the runtime actually injects (hook/plugin
 /// surface top-3); recall@3 and recall@5 are additionally reported from
 /// the same `recommend` pass so metric drift stays visible.
 pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
-    let text =
-        fs::read_to_string(dataset).map_err(|e| format!("read {}: {e}", dataset.display()))?;
+    use std::io::Read;
+    let file = fs::File::open(dataset).map_err(|e| format!("read {}: {e}", dataset.display()))?;
+    let mut text = String::new();
+    file.take(MAX_DATASET_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("read {}: {e}", dataset.display()))?;
+    if text.len() as u64 > MAX_DATASET_BYTES {
+        return Err(format!(
+            "{}: dataset exceeds {} bytes",
+            dataset.display(),
+            MAX_DATASET_BYTES
+        ));
+    }
     let mut cases = Vec::new();
     for (line_no, line) in text.lines().enumerate() {
         if line.trim().is_empty() {

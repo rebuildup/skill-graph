@@ -70,6 +70,14 @@ jobs:
             echo "plugins/skill-graph/plugin.json is $pver but tag is $want" >&2
             exit 1
           }
+          # Cargo.toml parity too: cross-compiled payloads cannot be
+          # executed here, so a wrong-version binary inside a tarball
+          # would ship undetected (#144 r17).
+          cver="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          [ "$cver" = "$want" ] || {
+            echo "Cargo.toml is $cver but tag is $want" >&2
+            exit 1
+          }
           # The metapackage's optionalDependencies must pin the release
           # version — a stale pin silently ships the previous binary.
           stale="$(node -e "

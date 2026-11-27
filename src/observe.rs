@@ -499,7 +499,20 @@ fn observe_jsonl(
     }
     let mut claude = ClaudeScan::default();
     let mut codex = CodexScan::default();
-    for line in content.lines() {
+    // Contract-log lines are buffered with their line index instead of
+    // being recorded inline: transcript-derived events are emitted at
+    // finish(), so inline recording would always place passthrough
+    // events before every transcript event regardless of line position
+    // (#144 r17). All three sources share one (timestamp, line) sort.
+    let mut pending: Vec<(u64, SkillUsageEvent)> = Vec::new();
+    // The pending buffer must be bounded BEFORE the feed-order merge:
+    // `record_event`'s count/byte caps only run after every line is
+    // scanned, so an input of many small passthrough events could
+    // otherwise materialize unboundedly first (#144 r17 CR). Overflowed
+    // events still feed the counter maps; only detail is dropped.
+    let mut pending_bytes = 0usize;
+    let mut pending_truncated = false;
+    for (line_idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -515,18 +528,40 @@ fn observe_jsonl(
         if let Some(sid) = line_session_id(&value) {
             sessions.insert(sid);
         }
-        if try_passthrough_event(&value, line, obs) {
+        if try_passthrough_event(
+            &value,
+            line,
+            &mut pending,
+            &mut pending_bytes,
+            &mut pending_truncated,
+            line_idx as u64,
+            obs,
+        ) {
             continue;
         }
         if looks_like_codex_rollout(&value) {
-            codex.feed(&value);
+            codex.feed(&value, line_idx as u64);
         } else if looks_like_claude_transcript(&value) {
-            claude.feed(&value);
+            claude.feed(&value, line_idx as u64);
         }
         // Other JSON shapes are ignored silently (format drift tolerance).
     }
-    codex.finish(obs);
-    claude.finish(obs);
+    let mut events = codex.finish(obs);
+    events.extend(claude.finish(obs));
+    events.extend(pending);
+    // Emit in feed-line order: transcript scanners emit category-grouped
+    // at finish() and passthrough events are buffered, so without the
+    // merge a same-line or missing-timestamp event would land far from
+    // its true position (#144 r17). The sort key is the feed line ONLY —
+    // not the timestamp: `obs.events` order is the encounter order that
+    // `session_funnel`'s untimestamped fallback (`li > ri`) compares,
+    // and timestamp ordering is already applied downstream in
+    // `funnel_for`'s (timestamp, index) sort. The stable sort preserves
+    // per-line emission order for the multiple events one line yields.
+    events.sort_by_key(|(seq, _)| *seq);
+    for (_, event) in events {
+        record_event(event, obs);
+    }
     Ok(())
 }
 
@@ -534,7 +569,15 @@ fn observe_jsonl(
 /// `line` is the raw JSON text: deserializing the struct straight from
 /// it avoids deep-cloning the already-parsed `Value` tree (~30x the
 /// line's retained size) just to convert it (#144 r14).
-fn try_passthrough_event(value: &Value, line: &str, obs: &mut Observation) -> bool {
+fn try_passthrough_event(
+    value: &Value,
+    line: &str,
+    pending: &mut Vec<(u64, SkillUsageEvent)>,
+    pending_bytes: &mut usize,
+    pending_truncated: &mut bool,
+    seq: u64,
+    obs: &mut Observation,
+) -> bool {
     if value.get("kind").is_none() || value.get("schema_version").is_none() {
         return false;
     }
@@ -659,7 +702,39 @@ fn try_passthrough_event(value: &Value, line: &str, obs: &mut Observation) -> bo
             return true;
         }
     }
-    record_event(event, obs);
+    // Bound the pending buffer with the same budgets record_event will
+    // re-apply after the merge: count plus the event's own retained
+    // estimate and its implied load row. Overflowed events still update
+    // the counter maps so `runtimes`/`skill_loads` stay exact (#144 r17
+    // CR); only their retained detail is dropped, with one latched
+    // notice — same truncation semantics as record_event.
+    let charge = event_retained_bytes(&event)
+        .saturating_add(implied_load(&event, obs.current_file_len).map_or(0, |(_, b)| b));
+    if pending.len() >= MAX_OBSERVE_EVENTS
+        || pending_bytes.saturating_add(charge) > MAX_OBSERVE_RETAINED_BYTES
+    {
+        if !*pending_truncated {
+            *pending_truncated = true;
+            obs_error(
+                obs,
+                "passthrough events truncated at pending budget".to_string(),
+            );
+        }
+        // Mirror record_event's unattributable-drop rule so counters
+        // stay exact for overflowed events too.
+        if !(event.kind == EventKind::SkillLoad
+            && event
+                .skill_name
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true))
+        {
+            account_event_counters(&event, obs);
+        }
+        return true;
+    }
+    *pending_bytes = pending_bytes.saturating_add(charge);
+    pending.push((seq, event));
     true
 }
 
@@ -758,19 +833,11 @@ fn under_cap(
     false
 }
 
-fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
-    // The contract requires skill_name on skill_load; unattributable
-    // observations are dropped rather than emitted schema-invalid. An
-    // empty string is equally unattributable.
-    if event.kind == EventKind::SkillLoad
-        && event
-            .skill_name
-            .as_deref()
-            .map(str::is_empty)
-            .unwrap_or(true)
-    {
-        return;
-    }
+/// Counter-only accounting (`runtimes`, `skill_loads`) for an event
+/// whose detail cannot be retained — used when the passthrough pending
+/// buffer overflows its budget, so summary counters stay exact even
+/// though the event itself is dropped (#144 r17 CR).
+fn account_event_counters(event: &SkillUsageEvent, obs: &mut Observation) {
     if event.counts_as_load() {
         *obs.runtimes
             .entry(event.runtime.as_str().to_string())
@@ -790,38 +857,67 @@ fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
                 obs.skill_loads_truncated = true;
                 obs_error(obs, "skill_loads name cardinality truncated".to_string());
             }
-            if under_cap(
-                obs.loads.len(),
-                MAX_OBSERVE_LOADS,
-                "loads",
-                &mut obs.loads_truncated,
-                &mut obs.errors,
-            ) {
-                let load = SkillLoad {
-                    session_id: event.session_id.clone(),
-                    skill: name.clone(),
-                    timestamp: event.timestamp.clone(),
-                    file: String::new(),
-                    runtime: event.runtime.as_str().to_string(),
-                    detection: event
-                        .detection
-                        .map(detection_name)
-                        .unwrap_or_default()
-                        .to_string(),
-                };
-                // file is backfilled with the source path after the
-                // scan; charge the current file's length up front so
-                // the retained-bytes estimate does not undercount.
-                let lb = load_retained_bytes(&load) + obs.current_file_len;
-                if obs.retained_bytes.saturating_add(lb) <= MAX_OBSERVE_RETAINED_BYTES {
-                    obs.retained_bytes += lb;
-                    obs.loads.push(load);
-                } else if !obs.loads_truncated {
-                    obs.loads_truncated = true;
-                    obs.errors
-                        .push("loads truncated at retained-byte budget".to_string());
-                }
-            }
+        }
+    }
+}
+
+/// The `SkillLoad` detail row `record_event` derives from a load-grade
+/// event, plus its retained-byte charge. None when the event is not
+/// load-grade or carries no skill name.
+fn implied_load(event: &SkillUsageEvent, current_file_len: usize) -> Option<(SkillLoad, usize)> {
+    if !event.counts_as_load() {
+        return None;
+    }
+    let name = event.skill_name.as_ref()?;
+    let load = SkillLoad {
+        session_id: event.session_id.clone(),
+        skill: name.clone(),
+        timestamp: event.timestamp.clone(),
+        file: String::new(),
+        runtime: event.runtime.as_str().to_string(),
+        detection: event
+            .detection
+            .map(detection_name)
+            .unwrap_or_default()
+            .to_string(),
+    };
+    // file is backfilled with the source path after the scan; charge the
+    // current file's length up front so the retained-bytes estimate
+    // does not undercount.
+    let bytes = load_retained_bytes(&load) + current_file_len;
+    Some((load, bytes))
+}
+
+fn record_event(event: SkillUsageEvent, obs: &mut Observation) {
+    // The contract requires skill_name on skill_load; unattributable
+    // observations are dropped rather than emitted schema-invalid. An
+    // empty string is equally unattributable.
+    if event.kind == EventKind::SkillLoad
+        && event
+            .skill_name
+            .as_deref()
+            .map(str::is_empty)
+            .unwrap_or(true)
+    {
+        return;
+    }
+    account_event_counters(&event, obs);
+    if let Some((load, lb)) = implied_load(&event, obs.current_file_len)
+        && under_cap(
+            obs.loads.len(),
+            MAX_OBSERVE_LOADS,
+            "loads",
+            &mut obs.loads_truncated,
+            &mut obs.errors,
+        )
+    {
+        if obs.retained_bytes.saturating_add(lb) <= MAX_OBSERVE_RETAINED_BYTES {
+            obs.retained_bytes += lb;
+            obs.loads.push(load);
+        } else if !obs.loads_truncated {
+            obs.loads_truncated = true;
+            obs.errors
+                .push("loads truncated at retained-byte budget".to_string());
         }
     }
     if under_cap(
@@ -910,12 +1006,12 @@ fn cap_bytes(s: &str, max: usize) -> String {
 
 #[derive(Default)]
 struct ClaudeScan {
-    /// (tool_use_id, session_id, timestamp, tool name, input)
-    uses: Vec<(String, String, String, String, Value)>,
+    /// (feed line index, tool_use_id, session_id, timestamp, tool name, input)
+    uses: Vec<(u64, String, String, String, String, Value)>,
     /// tool_use_id -> output text
     results: HashMap<String, String>,
-    /// (session_id, timestamp, text) user prompts
-    prompts: Vec<(String, String, String)>,
+    /// (feed line index, session_id, timestamp, text) user prompts
+    prompts: Vec<(u64, String, String, String)>,
     /// Aggregate retained bytes across uses/results/prompts.
     retained: usize,
     uses_dropped: usize,
@@ -935,7 +1031,7 @@ impl ClaudeScan {
         }
     }
 
-    fn feed(&mut self, value: &Value) {
+    fn feed(&mut self, value: &Value, seq: u64) {
         let Some(raw_session) = value.get("sessionId").and_then(Value::as_str) else {
             return;
         };
@@ -975,6 +1071,7 @@ impl ClaudeScan {
                                 self.uses_dropped += 1;
                             } else {
                                 self.uses.push((
+                                    seq,
                                     id,
                                     session_id.clone(),
                                     timestamp.clone(),
@@ -1008,6 +1105,7 @@ impl ClaudeScan {
                                     self.prompts_dropped += 1;
                                 } else {
                                     self.prompts.push((
+                                        seq,
                                         session_id.clone(),
                                         timestamp.clone(),
                                         text,
@@ -1026,14 +1124,14 @@ impl ClaudeScan {
                     self.prompts_dropped += 1;
                 } else {
                     self.prompts
-                        .push((session_id.clone(), timestamp.clone(), text));
+                        .push((seq, session_id.clone(), timestamp.clone(), text));
                 }
             }
             _ => {}
         }
     }
 
-    fn finish(self, obs: &mut Observation) {
+    fn finish(self, obs: &mut Observation) -> Vec<(u64, SkillUsageEvent)> {
         let dropped = self.uses_dropped + self.results_dropped + self.prompts_dropped;
         if dropped > 0 {
             obs_error(
@@ -1041,9 +1139,11 @@ impl ClaudeScan {
                 format!("claude transcript records truncated at scan budgets: {dropped}"),
             );
         }
-        for (session, ts, text) in &self.prompts {
+        let mut events = Vec::new();
+        for (seq, session, ts, text) in &self.prompts {
             if is_meaningful_prompt(text) {
-                record_event(
+                events.push((
+                    *seq,
                     SkillUsageEvent::prompt_submit(
                         Runtime::ClaudeCode,
                         ObservedVia::Transcript,
@@ -1051,8 +1151,7 @@ impl ClaudeScan {
                         ts,
                         text,
                     ),
-                    obs,
-                );
+                ));
             }
         }
         // Mirror the codex rule (#144 r13): a captured tool output's
@@ -1062,7 +1161,7 @@ impl ClaudeScan {
         // would verify the same output into a separate file_read event.
         let mut frontmatter_consumed: std::collections::HashSet<&str> =
             std::collections::HashSet::new();
-        for (id, session, ts, tool, input) in &self.uses {
+        for (seq, id, session, ts, tool, input) in &self.uses {
             let raw = self.results.get(id).map(String::as_str).unwrap_or("");
             let output = if frontmatter_consumed.contains(id.as_str()) {
                 ""
@@ -1077,7 +1176,8 @@ impl ClaudeScan {
                 frontmatter_consumed.insert(id.as_str());
             }
             for c in classes {
-                record_event(
+                events.push((
+                    *seq,
                     SkillUsageEvent::skill_load(
                         Runtime::ClaudeCode,
                         ObservedVia::Transcript,
@@ -1089,10 +1189,10 @@ impl ClaudeScan {
                         c.detection,
                         c.confidence,
                     ),
-                    obs,
-                );
+                ));
             }
         }
+        events
     }
 }
 
@@ -1101,6 +1201,9 @@ impl ClaudeScan {
 // ---------------------------------------------------------------------------
 
 struct PendingCall {
+    /// Feed line index — orders emitted events against equal/missing
+    /// timestamps (#144 r17).
+    seq: u64,
     /// Interned Rc<str>: a rollout's calls share the same session_id,
     /// and timestamp/call_id are bounded at ingest, so retaining them
     /// per access costs O(1) instead of cloning up-to-4MiB strings
@@ -1138,10 +1241,10 @@ struct CodexScan {
     /// residual count rather than silently losing the loads.
     overflow_dropped: usize,
     outputs: HashMap<String, String>,
-    /// (session, timestamp, text)
-    prompts: Vec<(Rc<str>, Rc<str>, String)>,
+    /// (feed line index, session, timestamp, text)
+    prompts: Vec<(u64, Rc<str>, Rc<str>, String)>,
     prompts_dropped: usize,
-    injected: Vec<SkillUsageEvent>,
+    injected: Vec<(u64, SkillUsageEvent)>,
     injected_dropped: usize,
     outputs_dropped: usize,
 }
@@ -1151,6 +1254,9 @@ struct CodexScan {
 /// captured output's frontmatter, mirroring the pending path's
 /// `frontmatter_available` rule.
 struct OverflowAccess {
+    /// Feed line index — orders emitted events against equal/missing
+    /// timestamps (#144 r17).
+    seq: u64,
     session_id: Rc<str>,
     timestamp: Rc<str>,
     call_id: Rc<str>,
@@ -1183,7 +1289,7 @@ impl CodexScan {
         }
     }
 
-    fn feed(&mut self, value: &Value) {
+    fn feed(&mut self, value: &Value, seq: u64) {
         // Constructors truncate timestamps to 64 chars; do it at ingest
         // so the interned Rc<str> retained per access is already small.
         let timestamp: Rc<str> = Rc::from(
@@ -1333,6 +1439,7 @@ impl CodexScan {
                         if pending_n > 0 {
                             self.pending_accesses += pending_n;
                             self.pending.push(PendingCall {
+                                seq,
                                 call_id: call_id.clone(),
                                 session_id: self.session_id.clone(),
                                 timestamp: timestamp.clone(),
@@ -1359,6 +1466,7 @@ impl CodexScan {
                                 continue;
                             }
                             self.overflow.push(OverflowAccess {
+                                seq,
                                 session_id: self.session_id.clone(),
                                 timestamp: timestamp.clone(),
                                 call_id: call_id.clone(),
@@ -1416,6 +1524,7 @@ impl CodexScan {
                                 self.prompts_dropped += 1;
                             } else {
                                 self.prompts.push((
+                                    seq,
                                     self.session_id.clone(),
                                     timestamp.clone(),
                                     text,
@@ -1439,7 +1548,7 @@ impl CodexScan {
                                 if self.injected.len() >= MAX_SCAN_ITEMS || !self.charge(cost) {
                                     self.injected_dropped += 1;
                                 } else {
-                                    self.injected.push(event);
+                                    self.injected.push((seq, event));
                                 }
                             }
                         }
@@ -1452,21 +1561,22 @@ impl CodexScan {
         }
     }
 
-    fn finish(self, obs: &mut Observation) {
-        // Emit in encounter (timestamp) order, not collection order:
-        // injected recommendations, prompts, and exec loads are gathered
-        // from different payload types, and downstream funnel logic
-        // falls back to vector order when a timestamp is unparseable.
-        // A stable sort keeps same-timestamp events in feed order.
-        let mut events: Vec<SkillUsageEvent> = Vec::new();
+    fn finish(self, obs: &mut Observation) -> Vec<(u64, SkillUsageEvent)> {
+        // Events carry their feed line index; observe_jsonl merges all
+        // sources and sorts by (timestamp, line) so equal/missing
+        // timestamps keep true transcript order (#144 r17).
+        let mut events: Vec<(u64, SkillUsageEvent)> = Vec::new();
         events.extend(self.injected);
-        for (session, ts, text) in &self.prompts {
-            events.push(SkillUsageEvent::prompt_submit(
-                Runtime::Codex,
-                ObservedVia::Transcript,
-                session,
-                ts,
-                text,
+        for (seq, session, ts, text) in &self.prompts {
+            events.push((
+                *seq,
+                SkillUsageEvent::prompt_submit(
+                    Runtime::Codex,
+                    ObservedVia::Transcript,
+                    session,
+                    ts,
+                    text,
+                ),
             ));
         }
         // A captured tool output's frontmatter belongs to exactly one
@@ -1508,16 +1618,19 @@ impl CodexScan {
                         confidence: Confidence::Low,
                     },
                 };
-                events.push(SkillUsageEvent::skill_load(
-                    Runtime::Codex,
-                    ObservedVia::Transcript,
-                    &pending.session_id,
-                    &pending.timestamp,
-                    Some("exec".to_string()),
-                    c.skill_name,
-                    c.skill_path,
-                    c.detection,
-                    c.confidence,
+                events.push((
+                    pending.seq,
+                    SkillUsageEvent::skill_load(
+                        Runtime::Codex,
+                        ObservedVia::Transcript,
+                        &pending.session_id,
+                        &pending.timestamp,
+                        Some("exec".to_string()),
+                        c.skill_name,
+                        c.skill_path,
+                        c.detection,
+                        c.confidence,
+                    ),
                 ));
             }
         }
@@ -1556,16 +1669,19 @@ impl CodexScan {
                     (ov.name_hint.clone(), Detection::Mention, Confidence::Low)
                 }
             };
-            events.push(SkillUsageEvent::skill_load(
-                Runtime::Codex,
-                ObservedVia::Transcript,
-                &ov.session_id,
-                &ov.timestamp,
-                Some("exec".to_string()),
-                name,
-                None,
-                detection,
-                confidence,
+            events.push((
+                ov.seq,
+                SkillUsageEvent::skill_load(
+                    Runtime::Codex,
+                    ObservedVia::Transcript,
+                    &ov.session_id,
+                    &ov.timestamp,
+                    Some("exec".to_string()),
+                    name,
+                    None,
+                    detection,
+                    confidence,
+                ),
             ));
         }
         let dropped = self.overflow_dropped
@@ -1587,10 +1703,7 @@ impl CodexScan {
                 ),
             );
         }
-        events.sort_by_cached_key(|e| rfc3339_ms(&e.timestamp).unwrap_or(i64::MAX));
-        for event in events {
-            record_event(event, obs);
-        }
+        events
     }
 }
 
@@ -2320,11 +2433,26 @@ fn session_funnel(
                 if !after {
                     continue;
                 }
-                let p = pos[&li];
-                if best.is_none_or(|(bp, _)| p < bp) {
-                    best = Some((p, li));
+                // The ranking key must match the eligibility ordering:
+                // an untimestamped rec admits candidates by encounter
+                // order (`li > ri`), so "first" must also be encounter
+                // order — timestamp-sorted `pos` would let an old-but-
+                // valid timestamp jump ahead of an earlier-encountered
+                // untimestamped load and change which load converts
+                // (#144 r17).
+                let rank = if rec_ts.is_none() { li } else { pos[&li] };
+                if best.is_none_or(|(bp, _)| rank < bp) {
+                    best = Some((rank, li));
                 }
-                break;
+                // Timestamped recs: the list is position-ordered, so the
+                // first eligible candidate per name is already that
+                // name's minimum — stop scanning. Untimestamped recs
+                // rank by encounter order (`li`) but the list is
+                // timestamp-ordered, so the true minimum can sit later;
+                // keep scanning within the checks budget (#144 r17 CR).
+                if rec_ts.is_some() {
+                    break;
+                }
             }
         }
         if let Some((_, li)) = best {

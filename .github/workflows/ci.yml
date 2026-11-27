@@ -47,6 +47,21 @@ jobs:
               stale = {k: v for k, v in deps.items() if v != version}
               if stale:
                   bad.append(f"{p}: optionalDependencies not at {version}: {stale}")
+          # The optionalDependencies name set must equal the set of
+          # platform packages that actually ship: a missing or renamed
+          # dep passes every version check but 404s at install time
+          # (#144 r17).
+          meta = json.loads(pathlib.Path("npm/skill-graph/package.json").read_text())
+          dep_names = set((meta.get("optionalDependencies") or {}).keys())
+          pkg_names = {
+              json.loads(p.read_text())["name"]
+              for p in pathlib.Path("npm").glob("skill-graph-*/package.json")
+          }
+          if dep_names != pkg_names:
+              bad.append(
+                  "optionalDependencies "
+                  f"{sorted(dep_names)} != platform packages {sorted(pkg_names)}"
+              )
           if bad:
               sys.exit("version mismatch: " + "; ".join(bad))
           PY

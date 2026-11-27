@@ -1087,6 +1087,96 @@ fn opencode_plugin_spec(dir: &Path) -> String {
     format!("file://{}", file_url_encode(dir))
 }
 
+/// Decode the `file://` specifier `adapter enable opencode` writes back
+/// to a filesystem path — the inverse of `file_url_encode`. Status and
+/// disable must resolve the payload dir from the config's own spec,
+/// not from the *current* XDG_DATA_HOME/HOME: after an env change the
+/// env-resolved dir is a different directory than the one OpenCode
+/// actually loads (#144 r17). Raw percent-decoded bytes become an
+/// OsStr on Unix so non-UTF-8 env paths round-trip. Returns None for
+/// non-file schemes, remote authorities, or malformed escapes —
+/// callers treat that as "cannot verify", never as "missing".
+fn plugin_spec_dir(spec: &str) -> Option<PathBuf> {
+    let rest = spec.strip_prefix("file://")?;
+    let path_part = match rest.find('/') {
+        Some(i) => {
+            let (authority, p) = rest.split_at(i);
+            if !authority.is_empty() && authority != "localhost" {
+                return None;
+            }
+            p
+        }
+        None => {
+            if !rest.is_empty() && rest != "localhost" {
+                return None;
+            }
+            "/"
+        }
+    };
+    let bytes = path_part.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            decoded.push((hi * 16 + lo) as u8);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(PathBuf::from(std::ffi::OsStr::from_bytes(&decoded)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(decoded).ok().map(PathBuf::from)
+    }
+}
+
+/// True only for directories `adapter enable opencode` could have
+/// materialized: absolute, free of `.`/`..` components, and ending in
+/// `skill-graph/opencode-plugin`. A project config is untrusted input —
+/// a crafted `file://` spec can percent-decode to any path, and
+/// `remove_dir_all` follows `..` at the filesystem layer, so marker
+/// matching alone must never grant deletion rights (#144 r17 CR).
+fn is_managed_payload_dir(dir: &Path) -> bool {
+    use std::path::Component;
+    dir.is_absolute()
+        && dir.ends_with("skill-graph/opencode-plugin")
+        && !dir
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
+/// Payload dirs referenced by v0.4.x `file://` plugin specs in `config`.
+/// Legacy-marker entries point into removed adapter bundles, not the
+/// shared payload dir, and specs that fail to decode — or decode to a
+/// path outside the managed payload layout — are skipped (unverifiable
+/// rather than missing, and never eligible for recursive deletion).
+fn opencode_spec_dirs(config: &Value) -> Vec<PathBuf> {
+    config
+        .get("plugins")
+        .and_then(Value::as_array)
+        .map(|p| {
+            p.iter()
+                .filter_map(Value::as_str)
+                .filter(|s| marker_at_boundary(s, PLUGIN_MARKER))
+                .filter_map(plugin_spec_dir)
+                .filter(|d| is_managed_payload_dir(d))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Embedded OpenCode plugin source, materialized on `adapter enable opencode`.
 const OPENCODE_PLUGIN_TS: &str = include_str!("assets/opencode-plugin.ts");
 
@@ -1191,6 +1281,9 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
+    // (payload dir, payload pre-existed) for rollback when the config
+    // write fails after materialization (#144 r17).
+    let mut materialized: Option<(PathBuf, bool)> = None;
 
     if args.runtime == Runtime::Opencode {
         if !opencode_bin_resolvable() {
@@ -1213,7 +1306,15 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             .ok_or_else(|| format!("{}: \"plugins\" must be an array", path.display()))?;
         // Materialize only after the config shape is validated — same
         // resolve/validate-before-touch ordering as the hook path.
+        // The payload pre-existence is recorded so a failed config
+        // write can roll back only what this command created.
+        let payload_dir = opencode_plugin_dir().ok_or_else(|| {
+            "cannot resolve the opencode plugin directory: XDG_DATA_HOME and HOME              are unset or not absolute"
+                .to_string()
+        })?;
+        let payload_preexisting = payload_dir.join("index.ts").is_file();
         let plugin_dir = materialize_opencode_plugin()?;
+        materialized = Some((plugin_dir.clone(), payload_preexisting));
         arr.push(json!(opencode_plugin_spec(&plugin_dir)));
     } else {
         strip_our_hooks(&mut config);
@@ -1245,7 +1346,17 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     // check at entry can be invalidated while resolve_bin probes ran,
     // and write_text_atomic resolves symlinks at write time.
     check_project_symlink(path, args.scope)?;
-    write_config(path, &config)?;
+    if let Err(e) = write_config(path, &config) {
+        // Roll back the materialized payload so a failed enable leaves
+        // no orphaned side effect. Only remove what this command
+        // created: a pre-existing payload may serve other scopes, and
+        // remove_dir (non-recursive) keeps any foreign files (#144 r17).
+        if let Some((dir, false)) = materialized {
+            let _ = std::fs::remove_file(dir.join("index.ts"));
+            let _ = std::fs::remove_dir(dir);
+        }
+        return Err(e);
+    }
     outln!(
         "enabled skill-graph ({}, {}) -> {}",
         args.runtime.as_str(),
@@ -1270,6 +1381,11 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
 
 fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     check_project_symlink(path, args.scope)?;
+    // Payload dirs referenced by the config's own file:// specs,
+    // captured before strip_our_plugins removes them: after an env
+    // change the env-resolved dir is not the dir the spec points at
+    // (#144 r17).
+    let mut payload_dirs: Vec<PathBuf> = Vec::new();
     if !path.exists() {
         outln!("no config file: {}", path.display());
     } else {
@@ -1282,6 +1398,7 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         }
         let before = config.clone();
         if args.runtime == Runtime::Opencode {
+            payload_dirs = opencode_spec_dirs(&config);
             strip_our_plugins(&mut config);
         } else {
             strip_our_hooks(&mut config);
@@ -1310,9 +1427,19 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         // absence of references here is best-effort.
         match opencode_plugin_referenced() {
             Some(false) => {
-                // An unresolvable dir means no payload could exist —
-                // skip rather than fabricate a cwd-relative path.
-                if let Some(dir) = opencode_plugin_dir() {
+                // Remove every payload dir the readable configs
+                // referenced (spec-decoded) plus the env-resolved dir,
+                // which covers payloads orphaned by env changes or
+                // failed enables. An unresolvable env dir is skipped
+                // rather than fabricated cwd-relative.
+                if let Some(dir) = opencode_plugin_dir()
+                    && is_managed_payload_dir(&dir)
+                {
+                    payload_dirs.push(dir);
+                }
+                payload_dirs.sort();
+                payload_dirs.dedup();
+                for dir in payload_dirs {
                     let _ = std::fs::remove_dir_all(dir);
                 }
                 outln!(
@@ -1411,15 +1538,21 @@ fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                     })
                 })
                 .unwrap_or(false);
-            // An unresolvable payload dir means the materialized plugin
-            // cannot be verified — do not claim it missing.
-            let plugin_file_missing = v040_plugin
-                && opencode_plugin_dir()
-                    .map(|d| !d.join("index.ts").is_file())
-                    .unwrap_or(false);
+            // Resolve the payload dir from the config's own file://
+            // spec, not the current env: after an XDG_DATA_HOME/HOME
+            // change the env-resolved dir is a different directory than
+            // the one the spec (and OpenCode) actually references
+            // (#144 r17). Undecodable specs are unverifiable, not
+            // missing — same fail-open direction as an unresolvable
+            // env dir before.
+            let spec_dirs = opencode_spec_dirs(&config);
+            let plugin_file_missing =
+                v040_plugin && spec_dirs.iter().any(|d| !d.join("index.ts").is_file());
             let bin_missing = v040_plugin && !opencode_bin_resolvable();
             broken = plugin_file_missing || bin_missing;
-            if plugin_file_missing && let Some(dir) = opencode_plugin_dir() {
+            if plugin_file_missing
+                && let Some(dir) = spec_dirs.iter().find(|d| !d.join("index.ts").is_file())
+            {
                 outln!(
                     "  warning: materialized plugin missing: {}",
                     dir.join("index.ts").display()
