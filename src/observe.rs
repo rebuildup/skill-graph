@@ -1826,6 +1826,18 @@ impl CodexScan {
                 }
             }
         }
+        // The lazy runs index flag vectors positionally; a divergence
+        // would panic mid-iteration on hostile input. Assert the 1:1
+        // alignment here and degrade to no-claim in the iterators
+        // (#144 r22).
+        debug_assert_eq!(pending_verify.len(), self.pending.len());
+        debug_assert!(
+            pending_verify
+                .iter()
+                .zip(self.pending.iter())
+                .all(|(flags, call)| flags.len() == call.accesses.len())
+        );
+        debug_assert_eq!(overflow_claim.len(), self.overflow.len());
         vec![
             Box::new(self.injected.iter().cloned()),
             Box::new(self.prompts.iter().map(|(seq, session, ts, text)| {
@@ -1886,7 +1898,13 @@ impl Iterator for CodexPendingRun<'_> {
                 continue;
             }
             let (path, access) = &call.accesses[self.access_idx];
-            let verify = self.call_flags[self.access_idx];
+            // Missing flag => no frontmatter claim: conservative
+            // PathReference rather than a panic or misattribution.
+            let verify = self
+                .call_flags
+                .get(self.access_idx)
+                .copied()
+                .unwrap_or(false);
             self.access_idx += 1;
             let output = if verify {
                 self.outputs

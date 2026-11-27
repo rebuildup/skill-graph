@@ -451,6 +451,18 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut pos = 0usize;
+    // Start of the contiguous path-byte run ending at `pos`, tracked
+    // forward: every byte is classified exactly once (needle bodies are
+    // path bytes, so `pos = end` jumps never break the run), giving each
+    // SKILL.md hit its candidate start in O(1). The previous per-hit
+    // backward rescan made dense `,SKILL.md`-style input ~500x slower
+    // than the input — overlapping ~4 KiB scans per 8-byte hit with no
+    // retention cap able to preempt the work (#144 r22). Over-long runs
+    // still reject via the length check below: the tracked start is the
+    // TRUE run start, which only makes over-length candidates longer —
+    // accepted candidates (<= MAX_CANDIDATE_BYTES) are identical to the
+    // old floor-bounded scan.
+    let mut run_start = 0usize;
     // Distinct candidates and per-candidate length are both bounded: a
     // max-size payload could otherwise materialize hundreds of MB of
     // path strings before any downstream cap applies.
@@ -458,6 +470,9 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     const MAX_CANDIDATE_BYTES: usize = 4096;
     while pos + NEEDLE.len() <= bytes.len() && out.len() < MAX_CANDIDATES {
         if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
+            if !is_path_byte(bytes[pos]) {
+                run_start = pos + 1;
+            }
             pos += 1;
             continue;
         }
@@ -473,19 +488,7 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
             pos = end;
             continue;
         }
-        // Bound the backward scan: any run longer than
-        // MAX_CANDIDATE_BYTES is rejected below anyway, so scanning
-        // further back is pure waste — and an unbounded walk makes a
-        // >4 KiB path-byte run followed by many SKILL.md hits quadratic.
-        let mut start = pos;
-        let scan_floor = pos.saturating_sub(MAX_CANDIDATE_BYTES + NEEDLE.len());
-        while start > scan_floor && is_path_byte(bytes[start - 1]) {
-            start -= 1;
-        }
-        // Trim a leading run that cannot begin a path (e.g. `foo=bar/SKILL.md`
-        // keeps `bar/SKILL.md` only if `=` were allowed — it is, so instead we
-        // accept the whole run; `is_skill_md_path` filters non-SKILL.md names).
-        if let Ok(candidate) = std::str::from_utf8(&bytes[start..end])
+        if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
             && candidate.len() <= MAX_CANDIDATE_BYTES
             && !candidate.is_empty()
             && seen.insert(candidate)
@@ -1222,6 +1225,26 @@ mod tests {
             skill_md_paths(&mixed),
             vec!["/SKILL.md".to_string(), "b/SKILL.md".to_string()]
         );
+    }
+
+    /// #144 r22: dense `,SKILL.md` hits inside one long path-byte run
+    /// must not re-scan ~4 KiB per hit — candidates resolve in O(1)
+    /// via the forward-tracked run start. Hits near the run start
+    /// still produce candidates (the whole run prefix); once the
+    /// candidate exceeds MAX_CANDIDATE_BYTES every later hit rejects.
+    #[test]
+    fn skill_md_paths_dense_hits_stay_linear() {
+        // 5000 'a's + 500 ",SKILL.md" hits: every candidate is the full
+        // run prefix (>4 KiB) — all rejected, and the call must not
+        // degrade to ~500x5000 byte-ops.
+        let hostile = format!("{}{}", "a".repeat(5000), ",SKILL.md".repeat(500));
+        assert!(skill_md_paths(&hostile).is_empty());
+        // Run-start hits within the bound still extract: "a"*4000 keeps
+        // the first ~10 candidates <= 4096 bytes, the rest reject.
+        let bounded = format!("{}{}", "a".repeat(4000), ",SKILL.md".repeat(500));
+        let paths = skill_md_paths(&bounded);
+        assert_eq!(paths.len(), 10, "{paths:?}");
+        assert!(paths.iter().all(|p| p.starts_with(&"a".repeat(100))));
     }
 
     #[test]
