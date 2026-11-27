@@ -877,3 +877,36 @@ fn db_symlink_to_different_extension_is_still_scanned_as_db() {
     assert!(obs.errors.is_empty(), "errors: {:?}", obs.errors);
     assert!(obs.events.iter().any(|e| e.kind == EventKind::PromptSubmit));
 }
+
+/// Round-15: duplicate/missing tool_use_id must not let multiple uses
+/// claim the same captured frontmatter (codex parity, #144 r15).
+#[test]
+fn claude_duplicate_tool_use_id_claims_frontmatter_once() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "c.jsonl",
+        &[
+            r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"/repo/.agents/skills/alpha/SKILL.md"}},{"type":"tool_use","id":"t1","name":"Read","input":{"path":"/repo/.agents/skills/beta/SKILL.md"}}]}}"#,
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"---\nname: real-skill\n---\nbody"}]}}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    let loads: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .collect();
+    assert_eq!(loads.len(), 2, "events: {:?}", obs.events);
+    let claimed = loads
+        .iter()
+        .filter(|e| e.skill_name.as_deref() == Some("real-skill"))
+        .count();
+    assert_eq!(claimed, 1, "frontmatter must be claimed exactly once");
+    // The losing use falls back to its path-derived name.
+    assert!(
+        loads
+            .iter()
+            .any(|e| e.skill_name.as_deref() == Some("beta"))
+    );
+}

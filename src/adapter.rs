@@ -171,10 +171,11 @@ fn resolve_bin(override_path: Option<&str>) -> Result<PathBuf, String> {
     // plugin, which resolves the same env var at runtime: an operator
     // pointing it at a wrapper gets consistent behavior across entry
     // points instead of hooks silently embedding a different binary.
+    // Empty means unset on both sides (#144 r15).
     // The plugin accepts a bare command name (spawn resolves PATH), so
     // a separator-less value is looked up on PATH rather than treated
     // as a relative path.
-    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN") {
+    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN").filter(|p| !p.is_empty()) {
         let raw = PathBuf::from(p);
         let is_path_form = raw.components().count() > 1 || raw.is_absolute();
         let mut candidates: Vec<PathBuf> = Vec::new();
@@ -1051,11 +1052,20 @@ fn opencode_plugin_dir() -> Option<PathBuf> {
 
 /// Percent-encode a filesystem path for use in a `file://` URI.
 /// Unreserved characters plus `/` pass through; everything else (including
-/// `%`, `?`, `#`, spaces, non-ASCII UTF-8) is percent-encoded so the spec
-/// cannot be reinterpreted as URI syntax.
+/// `%`, `?`, `#`, spaces, non-ASCII) is percent-encoded so the spec
+/// cannot be reinterpreted as URI syntax. On Unix the raw path *bytes*
+/// are encoded — `to_string_lossy` would replace non-UTF-8 components
+/// with U+FFFD and emit a spec that matches nothing on disk (#144 r15).
 fn file_url_encode(path: &Path) -> String {
+    #[cfg(unix)]
+    let bytes = {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    };
+    #[cfg(not(unix))]
+    let bytes = path.to_string_lossy().into_owned().into_bytes();
     let mut out = String::new();
-    for &b in path.to_string_lossy().as_bytes() {
+    for &b in &bytes {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 out.push(b as char)
@@ -1514,4 +1524,28 @@ fn legacy_hook_bins(config: &Value) -> Vec<String> {
 /// on commands already validated by `v040_hook_parts`.
 fn embedded_bin(command: &str) -> Option<String> {
     v040_hook_parts(command).map(|(bin, _)| bin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-15: `file://` specs must percent-encode raw path bytes on
+    /// Unix — `to_string_lossy` would emit U+FFFD for non-UTF-8
+    /// components and produce a spec matching nothing on disk.
+    #[cfg(unix)]
+    #[test]
+    fn file_url_encode_preserves_non_utf8_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xfffoo/skill-graph"));
+        let spec = file_url_encode(path);
+        assert!(spec.contains("%FF"), "spec: {spec}");
+        assert!(!spec.contains("\u{FFFD}"), "spec: {spec}");
+    }
+
+    #[test]
+    fn file_url_encode_escapes_uri_metacharacters() {
+        let spec = file_url_encode(Path::new("/a b/100%/x?y#z"));
+        assert_eq!(spec, "/a%20b/100%25/x%3Fy%23z");
+    }
 }

@@ -216,24 +216,15 @@ impl ServerHandler for SkillGraphMcp {
 /// 2026-11-25-c03-performance-benchmark.md), far below any interactive
 /// budget, and it keeps every call consistent with the filesystem —
 /// no staleness window for a long-lived stdio server.
-struct BuiltGraph {
-    graph: Graph,
-    errors: Vec<String>,
-}
-
-fn build_graph(roots: &[PathBuf]) -> BuiltGraph {
+fn build_graph(roots: &[PathBuf]) -> Graph {
     let discovery = discover(roots);
-    let errors = discovery.errors.clone();
     // recommend/resolve return bare result JSON, so discovery
     // diagnostics would vanish; stderr is the MCP logging channel
     // (stdout carries the protocol). Bounded like the CLI surface.
-    for err in errors.iter().take(10) {
+    for err in discovery.errors.iter().take(10) {
         crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
     }
-    BuiltGraph {
-        graph: build(discovery),
-        errors,
-    }
+    build(discovery)
 }
 
 fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpError> {
@@ -247,31 +238,40 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
             for err in &diagnostics {
                 crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
             }
-            let built = build_graph(&roots);
+            let graph = build_graph(&roots);
+            // `max` is operator/agent supplied; clamp so a huge value
+            // cannot materialize an unbounded response (#144 r15).
             let recs = recommend(
-                &built.graph,
+                &graph,
                 query,
                 arg_str(args, "context").unwrap_or(""),
-                arg_usize(args, "max", 3),
+                arg_usize(args, "max", 3).min(64),
             );
             tool_result(&json!(recs))
         }
         "discover" => {
             let (roots, diagnostics) =
                 tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
-            let built = build_graph(&roots);
+            // discover needs only skill summaries + errors — skip
+            // resolver::build entirely: add_mentions clones every
+            // body_text and the backlinks pass is O(links), work this
+            // tool would discard (#144 r15).
+            let discovery = discover(&roots);
+            for err in discovery.errors.iter().take(10) {
+                crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
+            }
             // skills is capped; errors need the same bound — and take()
             // avoids cloning the whole discovery error vector before
             // truncation (a hostile corpus can produce ~1k entries).
             const MAX_DISCOVER_ERRORS: usize = 256;
             let mut errors: Vec<String> = diagnostics;
             let room = MAX_DISCOVER_ERRORS.saturating_sub(errors.len());
-            errors.extend(built.errors.iter().take(room).cloned());
-            if built.errors.len() > room {
+            errors.extend(discovery.errors.iter().take(room).cloned());
+            if discovery.errors.len() > room {
                 errors.push(format!("errors truncated at {MAX_DISCOVER_ERRORS}"));
             }
             let mut output = DiscoveryOutput {
-                skills: built.graph.skills.iter().map(Skill::summary).collect(),
+                skills: discovery.skills.iter().map(Skill::summary).collect(),
                 errors,
             };
             if output.skills.len() > MAX_DISCOVER_SKILLS {
@@ -291,8 +291,8 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
             for err in &diagnostics {
                 crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
             }
-            let built = build_graph(&roots);
-            tool_result(&json!(crate::cli::resolve_target(&built.graph, target)))
+            let graph = build_graph(&roots);
+            tool_result(&json!(crate::cli::resolve_target(&graph, target)))
         }
         other => {
             return Err(McpError::invalid_params(

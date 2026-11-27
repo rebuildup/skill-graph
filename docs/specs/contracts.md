@@ -97,7 +97,8 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 - `observe` の保持量には集約上限がある: 入力ファイル数 4096、
   ディレクトリ再帰深さ 64、走査ディレクトリ数 65,536・
   ディレクトリエントリ総数 1,000,000、走査エラー 1024 件
-  （収集・ファイル毎の双方を含む）、ファイル毎 256 MiB
+  （収集・ファイル毎の双方を含む。latched な打ち切り通知
+  数件を別途含みうる）、ファイル毎 256 MiB
   （`.db` は `-wal` 込み）、JSONL 行・`.db` 行の `data` ペイロード毎
   4 MiB（`serde_json::Value` は入力の ~16-30 倍を占めるため、
   ファイル上限だけでは 1 行で数 GB を確保しうる）、retained
@@ -124,7 +125,9 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   transcript scanner（Claude/Codex）が finish まで保持する
   record にも count+byte の共有予算がある（`MAX_SCAN_ITEMS`
   65,536・`MAX_SCAN_BYTES` 64 MiB/ scanner）: tool_use input は
-  `value_bytes` 推定で課金、tool output は先頭 256 KiB のみ保持
+  `value_bytes` 推定で課金（node overhead を多めに見積もるが
+  あくまで推定であり、実保持量は名目値の数倍になりうる）、
+  tool output は先頭 256 KiB のみ保持
   （frontmatter 検証は head のみを読む）、session_id は ingest で
   sanitize・timestamp は 64 chars・call_id は 1,024 bytes・
   access path は 4,096 bytes に丸め、Codex の
@@ -136,6 +139,12 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   行うが、検査と rusqlite の path open の間の差し替え窓は残る
   （fd ベースの SQLite open は `-wal` sibling を解決できないため
   採用しない。project config の TOCTOU residual と同じ受容区分）。
+  canonical 化した JSONL path も同じ区分: `O_NOFOLLOW` は最終
+  component のみを守り、収集後に directory component が symlink
+  へ差し替えられる窓は残る（`.db` と同じ受容 TOCTOU）。
+  hardlink で `.jsonl` と `.db` が同一 inode を指す場合、format
+  判定は traversal が先に見た名前の拡張子に依存する
+  （1 file は 1 形式として走査される）。
   `skill-graph detect` の stdin も hook と同じ 4 MiB parse 前
   閾値と bounded drain を持つ。OpenCode plugin の
   `prompt.skills` 由来 skill_load は 1 prompt あたり 1,024 entry・
@@ -247,7 +256,12 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
 絶対パスを config に埋め込むのに対し、opencode plugin は実行時に
 `SKILL_GRAPH_BIN` → PATH の順で解決する。enable 後に
 `SKILL_GRAPH_BIN` を変更しても hook command の埋め込みパスは
-変わらない（plugin のみ追従する）。
+変わらない（plugin のみ追従する）。`SKILL_GRAPH_BIN` が
+path 形式（separator 含有）の相対値の場合、adapter の存在検査は
+adapter 自身の cwd 基準、plugin の spawn は OpenCode server の
+cwd 基準で解決するため、cwd が一致しない環境では診断と実行が
+ずれうる（operator 制御の env であり既知の非対称）。
+`SKILL_GRAPH_BIN` の空文字列は両側で未設定と同等に扱う。
 
 ## adapter/plugin の信頼できない入力境界
 
@@ -265,9 +279,16 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   OpenCode plugin 側も `SKILL_GRAPH_EVENT_LOG` と `tmpdir()` の
   戻り値に同じ absolute-only 規則を適用する（server の cwd は
   任意の project tree でありうるため）。
-  なお非 UTF-8 の絶対パスは Unix の `var_os` 経由で受理される
-  （path bytes を失わないため）。UTF-8 を要求するのは hook command
-  へ埋め込む `--bin`/`SKILL_GRAPH_BIN`/`PATH` 解決結果のみで、
+  なお非 UTF-8 の絶対パスは adapter の env について Unix の
+  `var_os` 経由で受理される（path bytes を失わないため）。
+  `file://` spec は Unix では path の raw bytes を percent-encode
+  するため非 UTF-8 dir でも spec が実 path を指す。
+  hook/plugin の env（`TMPDIR`・`SKILL_GRAPH_EVENT_LOG`・
+  `SKILL_GRAPH_HOOK_STATE`）は UTF-8 のみ受理し、非 UTF-8 値は
+  未設定として縮退する（plugin は Node の env decode 上
+  非 UTF-8 を受け取れず、完全 parity は不可能）。UTF-8 を
+  要求するのは hook command へ埋め込む
+  `--bin`/`SKILL_GRAPH_BIN`/`PATH` 解決結果のみで、
   その場合は `enable` がエラーを返す。
 - legacy hook 検出の shell 解析は quote/escape を考慮する:
   `'FOO=bar'` や `FOO\=bar` のように quote・escape された `NAME=`
@@ -283,9 +304,20 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   しない（under-claim：既存 entry を残したまま新規追加しうる）。
   v0.4.x hook command の parse は binary path の single/double
   quote と引数の quote を受理する。
+- transcript/exec の read 判定 heuristic（`segment_has_read_verb`）
+  は quote/escape を考慮しない: `'FOO=bar' cat x/SKILL.md` のように
+  quote された `NAME=` を env assignment とみなして read verb を
+  skip しうる。detection の over/under-claim 双方向の既知制限で
+  あり、foreign 設定を壊す方向には働かない。
 - plugin specifier の境界判定で、marker 直後の `%` は follower と
   みなさない（`file_url_encode` は marker 直後に raw `%` を出力
   せず、`%2F` 等の percent-encoding で path が継続しうるため）。
+  逆に marker 判定は suffix 一致のため、`skill-graph/opencode-plugin`
+  を含む別 prefix の spec（vendor 配下の copy 等）も我々の
+  plugin とみなして enable/disable の対象になりうる。versioned
+  path を literal 一致で判定できない設計上の trade-off であり、
+  境界規則は `opencode-plugin-fork`・`my-skill-graph/…`・
+  `%2F` 継続を正しく拒否する。
 - project scope の enable/disable は write 直前に
   `check_project_symlink` を再検査するが、検査と rename の間の
   symlink 差し替え（TOCTOU）は完全には閉じない。影響は project
@@ -307,9 +339,18 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
 
 - `discover` の byte 会計は pre-read の `metadata().len()` ではなく、
   parse 後の retained フィールド量（body/name/description/keywords/
-  links/path + 固定 overhead）と file bytes の大きい方を課金する。
+  metadata key+value/links/path/digest/parse_error/root + 固定
+  overhead）と file bytes の大きい方を課金する。
   `from_utf8_lossy` の UTF-8 置換拡大（最大 ~3x）と metadata〜read 間の
   file 成長による過小計上を防ぐ。
+- この 512 MiB 境界は **discovery phase の `Skill` データのみ**を
+  対象とする。Graph phase（`resolver::build`）では link 毎に
+  `resolved_name`/`resolved_path` が追加され、mention link は skill
+  毎 64 件・backlinks map は discovery cap 上で worst case
+  ~100-200 MB の transient を持つ（`resolver.rs` のコメント参照）。
+  MCP `recommend`/`resolve` は call 毎にこの Graph を再構築するため、
+  実メモリは名目値を超えうる既知の residual として記録する
+  （`discover` tool は resolver を通らずこの上乗せを持たない）。
 - discovery の `errors` は収集時点で 1024 件（`MAX_DISCOVER_ERRORS`）に
   制限され、打ち切りは latched notice で通知される。parse 失敗は
   skill/byte cap を消費しないが、error エントリ自体は bounded。
@@ -321,3 +362,8 @@ bin 解決経路の非対称は既知の仕様: hook 系 runtime は enable 時�
   `requires-skills`/`requires_skills` を優先し・残りを key sort で
   決定的に選ぶ（HashMap 反復順は process 毎に random なため、
   requires-link の admit 結果が run 間で変わらないようにする）。
+- `parse_skill` の `O_NOFOLLOW` は最終 component のみを守る。
+  WalkDir 収集後に skill ディレクトリや祖先 component が symlink
+  へ差し替えられる窓は残るが、影響は ≤1 MiB の untrusted parse
+  入力に限定され、project config / `.db` open と同じ受容 TOCTOU
+  区分として記録する。

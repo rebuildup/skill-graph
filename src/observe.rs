@@ -181,24 +181,20 @@ impl SessionSet {
 
 /// Best-effort session identifier on any parsed record, used only for the
 /// `sessions` summary count (not for event attribution).
-fn line_session_id(value: &Value) -> Option<String> {
+fn line_session_id(value: &Value) -> Option<&str> {
     if let Some(sid) = value.get("sessionId").and_then(Value::as_str) {
-        return Some(sid.to_string());
+        return Some(sid);
     }
     if let Some(sid) = value.get("session_id").and_then(Value::as_str) {
-        return Some(sid.to_string());
+        return Some(sid);
     }
     let payload = value.get("payload")?;
     match value.get("type").and_then(Value::as_str) {
         Some("session_meta") => payload
             .get("session_id")
             .or_else(|| payload.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        Some("token_usage_record") => payload
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+            .and_then(Value::as_str),
+        Some("token_usage_record") => payload.get("session_id").and_then(Value::as_str),
         _ => None,
     }
 }
@@ -444,6 +440,10 @@ fn push_observable(
     // canonicalization: a symlink `x.db -> storage.sqlite` must still
     // be scanned as a database (#144 r14).
     let is_db = is_db_path(path);
+    // Hardlinks share one (dev,ino) key, so `a.jsonl` + `b.db` on the
+    // same inode yield a single observable whose format is whichever
+    // name traversal saw first — a file cannot be both formats, and the
+    // choice is traversal-order dependent (accepted, #144 r15).
     if seen.insert(observable_key(path)) {
         // Store the canonical path: every symlink component is resolved
         // at collection time, so the O_NOFOLLOW open in observe_jsonl
@@ -513,7 +513,7 @@ fn observe_jsonl(
             continue;
         };
         if let Some(sid) = line_session_id(&value) {
-            sessions.insert(&sid);
+            sessions.insert(sid);
         }
         if try_passthrough_event(&value, line, obs) {
             continue;
@@ -701,9 +701,11 @@ const MAX_OBSERVE_LOADS: usize = 1_000_000;
 const MAX_OBSERVE_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 
 /// Conservative estimate of one event's retained heap/serialized size.
+/// The ~230 B struct plus ~24 B per populated String/Option<String>
+/// header are charged on top of the content lengths.
 fn event_retained_bytes(e: &SkillUsageEvent) -> usize {
-    let mut n = 256usize;
-    n += e.session_id.len() + e.timestamp.len();
+    let mut n = 448usize;
+    n += e.session_id.len() + e.timestamp.len() + 48;
     for s in [
         &e.prompt_hash,
         &e.reason,
@@ -712,18 +714,19 @@ fn event_retained_bytes(e: &SkillUsageEvent) -> usize {
         &e.skill_digest,
         &e.tool,
     ] {
-        n += s.as_deref().map_or(0, str::len);
+        n += s.as_deref().map_or(0, |v| v.len() + 24);
     }
     n += e
         .recommended
         .iter()
-        .map(|r| r.name.len() + r.digest.as_deref().map_or(0, str::len) + 48)
+        .map(|r| r.name.len() + r.digest.as_deref().map_or(0, |d| d.len() + 24) + 72)
         .sum::<usize>();
     n
 }
 
 fn load_retained_bytes(l: &SkillLoad) -> usize {
-    96 + l.session_id.len()
+    // ~230 B struct + six String headers + content lengths.
+    384 + l.session_id.len()
         + l.skill.len()
         + l.timestamp.len()
         + l.file.len()
@@ -867,19 +870,23 @@ const MAX_SCAN_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_SCAN_ITEMS: usize = 65_536;
 const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
 
-/// Conservative retained-size estimate for a serde_json::Value tree
-/// (strings + node overhead). Nesting is bounded by serde_json's
-/// recursion limit, so this cannot overflow the stack.
+/// Retained-size estimate for a serde_json::Value tree. Per-node costs
+/// dominate for the small-object inputs a hostile line is made of:
+/// `Value` is ~32 B inline, a `String` adds its 24 B header plus alloc
+/// slack, and each BTreeMap entry costs key header + node overhead —
+/// so the constants below are deliberately generous, not tight.
+/// Nesting is bounded by serde_json's recursion limit, so this cannot
+/// overflow the stack.
 fn value_bytes(v: &Value) -> usize {
     match v {
-        Value::Null | Value::Bool(_) => 8,
-        Value::Number(_) => 16,
-        Value::String(s) => s.len() + 24,
-        Value::Array(a) => 24 + a.iter().map(value_bytes).sum::<usize>(),
+        Value::Null | Value::Bool(_) => 32,
+        Value::Number(_) => 48,
+        Value::String(s) => s.len() + 64,
+        Value::Array(a) => 32 + a.iter().map(|x| value_bytes(x) + 32).sum::<usize>(),
         Value::Object(o) => {
-            24 + o
+            32 + o
                 .iter()
-                .map(|(k, v)| k.len() + value_bytes(v) + 16)
+                .map(|(k, v)| k.len() + value_bytes(v) + 96)
                 .sum::<usize>()
         }
     }
@@ -1044,9 +1051,28 @@ impl ClaudeScan {
                 );
             }
         }
+        // Mirror the codex rule (#144 r13): a captured tool output's
+        // frontmatter belongs to exactly one file — the first Read
+        // across ALL uses sharing a tool_use_id may claim it. Crafted
+        // or buggy transcripts can repeat ids; without this each use
+        // would verify the same output into a separate file_read event.
+        let mut frontmatter_consumed: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         for (id, session, ts, tool, input) in &self.uses {
-            let output = self.results.get(id).map(String::as_str).unwrap_or("");
-            for c in events::classify_tool_access_all(tool, input, output) {
+            let raw = self.results.get(id).map(String::as_str).unwrap_or("");
+            let output = if frontmatter_consumed.contains(id.as_str()) {
+                ""
+            } else {
+                raw
+            };
+            let classes = events::classify_tool_access_all(tool, input, output);
+            if classes
+                .iter()
+                .any(|c| c.detection == events::Detection::FileRead)
+            {
+                frontmatter_consumed.insert(id.as_str());
+            }
+            for c in classes {
                 record_event(
                     SkillUsageEvent::skill_load(
                         Runtime::ClaudeCode,
@@ -1717,8 +1743,13 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
     // the transferred prefix, and the byte check below still applies.
     // A row whose data exceeds the per-record bound is skipped before
     // serde_json sees it (same contract as the JSONL line cap).
+    // `session_id`/`type` are also substr-capped: a single row could
+    // otherwise carry a ~file-size cell into Rust before sanitization.
+    // The caps exceed any contract session id, so prefix collisions are
+    // not reachable through legitimate transcripts.
     let sql = format!(
-        "SELECT session_id, type, length(data), substr(data, 1, {}), time_created FROM session_message ORDER BY session_id, {order_col}",
+        "SELECT substr(session_id, 1, {}), substr(type, 1, 65), length(data), substr(data, 1, {}), time_created FROM session_message ORDER BY session_id, {order_col}",
+        MAX_OBSERVE_LINE_BYTES + 1,
         MAX_OBSERVE_LINE_BYTES + 1
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| format!("prepare: {e}"))?;

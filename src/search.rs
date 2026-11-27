@@ -149,6 +149,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     infos.resize_with(graph.skills.len(), || None);
     let mut match_work = 0usize;
     let mut budget_noted = false;
+    // field_score's whitespace-free whole-query bonus costs O(field
+    // bytes) per scored field — name once for `query`, description once
+    // for `query` and once for `context` — not O(query length). The
+    // per-link whole-query scans are already covered by `link_bytes`.
+    let query_whole = !query.contains(char::is_whitespace);
+    let context_whole = !context.contains(char::is_whitespace);
 
     for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
@@ -159,21 +165,25 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         // scanned once per query term and once per context term for
         // scoring AND again for the hit lists, and every link target is
         // matched against the whole query. Skills past the budget keep
-        // `infos[index] = None` and cannot be admitted — deterministic
-        // index order, same degrade direction as the body budget.
+        // `infos[index] = None`, so direct admission is skipped —
+        // deterministic index order, same degrade direction as the body
+        // budget. Explicit `requires` propagation below can still admit
+        // such a skill structurally (bounded link iteration only).
         let scan_terms = query_terms.len() + context_terms.len();
         let link_bytes: usize = skill.links.iter().map(|l| l.target.len()).sum();
-        // Whole-query matches are O(query) needle work per call and are
-        // NOT covered by the per-term charge: matches_query runs once
-        // per link target, and field_score's whitespace-free bonus runs
-        // once per scored field (the query twice — name and description
-        // — plus the context once).
-        let whole_query_work = skill
-            .links
-            .len()
-            .saturating_mul(query.len())
-            .saturating_add(query.len().saturating_mul(2))
-            .saturating_add(context.len());
+        // Whole-query matches are O(field bytes) needle work per call
+        // and are NOT covered by the per-term charge: field_score runs
+        // a whitespace-free `term_matches(field, query)` bonus on the
+        // name and description fields, plus one on the description for
+        // `context`. Per-link whole-query scans cost O(target bytes) =
+        // `link_bytes`, already counted.
+        let desc_len = skill_descriptions[index].len();
+        let whole_query_work = (if query_whole {
+            skill_names[index].len() + desc_len
+        } else {
+            0
+        })
+        .saturating_add(if context_whole { desc_len } else { 0 });
         let skill_work = scan_terms
             .saturating_mul(2)
             .saturating_mul(skill_names[index].len() + skill_descriptions[index].len())
@@ -609,6 +619,11 @@ fn document_frequency<'a>(
     frequencies
 }
 
+/// Per-skill reason strings are retained in `Evidence` for every
+/// admitted candidate; a query with thousands of terms would otherwise
+/// produce thousands of reason entries per skill (#144 r15).
+const MAX_REASONS_PER_SKILL: usize = 64;
+
 /// `field` must already be lowercase — callers pass pre-lowered
 /// descriptions/bodies/names. Lowercasing inside this per-skill hot loop
 /// would copy up to ~1 MiB per field per recommend() call.
@@ -627,12 +642,16 @@ fn field_score(
     for term in query_terms {
         if term_matches(field, term) {
             score += weight;
-            reasons.push(format!("{label}: {term}"));
+            if reasons.len() < MAX_REASONS_PER_SKILL {
+                reasons.push(format!("{label}: {term}"));
+            }
         }
     }
     if !query.contains(char::is_whitespace) && term_matches(field, query) {
         score += weight * 2.0;
-        reasons.push(format!("{label}: {query}"));
+        if reasons.len() < MAX_REASONS_PER_SKILL {
+            reasons.push(format!("{label}: {query}"));
+        }
     }
     score
 }
