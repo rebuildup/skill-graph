@@ -12,7 +12,7 @@ fn fixture_root() -> PathBuf {
 #[test]
 fn discovers_fixture_skills() {
     let discovery = discover(&[fixture_root()]);
-    assert_eq!(discovery.skills.len(), 8);
+    assert_eq!(discovery.skills.len(), 9);
     assert!(discovery.errors.is_empty());
 }
 
@@ -36,18 +36,11 @@ fn resolves_links_requires_and_backlinks() {
             .any(|l| l.kind == skill_graph::model::LinkKind::Requires
                 && l.resolved_name.as_deref() == Some("beta-skill"))
     );
-    assert!(
-        graph
-            .backlinks
-            .get(&beta)
-            .is_some_and(|v| v.contains(&alpha))
-    );
-    assert!(
-        graph
-            .backlinks
-            .get(&gamma)
-            .is_some_and(|v| v.contains(&alpha))
-    );
+    // backlinks stores deduplicated source counts, not source lists
+    // (#144 r18): alpha reaches beta via Markdown + Requires and gamma
+    // via a body mention, so each target counts alpha exactly once.
+    assert_eq!(graph.backlinks.get(&beta), Some(&1));
+    assert_eq!(graph.backlinks.get(&gamma), Some(&1));
 }
 
 #[test]
@@ -62,6 +55,20 @@ fn recommends_with_reasons_and_empty_when_no_match() {
     );
     assert!(!recs[0].reasons.is_empty());
     assert!(recommend(&graph, "quantum gardening", "", 3).is_empty());
+}
+
+#[test]
+fn keywords_bridge_paraphrased_task_phrasing() {
+    // #184: natural phrasing that avoids description vocabulary still
+    // reaches the skill through opt-in `keywords` aliases.
+    let graph = build(discover(&[fixture_root()]));
+    let recs = recommend(
+        &graph,
+        "we need to tell customers what changed in tonight's hotfix — draft the announcement",
+        "",
+        3,
+    );
+    assert_eq!(recs[0].skill.name, "gamma-skill");
 }
 
 #[test]
@@ -255,6 +262,42 @@ fn requires_to_ambiguous_name_admits_once_with_collision_note() {
 }
 
 #[test]
+fn backlinks_cover_all_name_copies_and_dedup_sources() {
+    // Regression for #171 (audit D-04): with two same-name copies, a
+    // path-resolved Markdown link attaches to its concrete copy while a
+    // name-resolved Requires link attaches to every copy; both links
+    // share one source skill, so each target counts it exactly once.
+    let temp = tempfile::tempdir().unwrap();
+    for copy in ["root-a", "root-b"] {
+        write_skill_md(
+            &temp.path().join(format!("{copy}/dep-skill")),
+            "dep-skill",
+            "Use for dep work.",
+        );
+    }
+    let referrer = temp.path().join("root-a/referrer-skill");
+    fs::create_dir_all(&referrer).unwrap();
+    fs::write(
+        referrer.join("SKILL.md"),
+        "---\nname: referrer-skill\ndescription: Use for referring work.\nmetadata:\n  requires-skills: dep-skill\n---\n\nSee [dep](../dep-skill).\n",
+    )
+    .unwrap();
+    let graph = build(discover(&[
+        temp.path().join("root-a"),
+        temp.path().join("root-b"),
+    ]));
+    let deps = &graph.by_name["dep-skill"];
+    assert_eq!(deps.len(), 2);
+    for &target in deps {
+        assert_eq!(
+            graph.backlinks.get(&target),
+            Some(&1),
+            "target {target} must carry exactly one deduped backlink"
+        );
+    }
+}
+
+#[test]
 fn ambiguous_names_are_reported_not_uniquified() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("skills");
@@ -273,5 +316,127 @@ fn cjk_terms_and_keywords_admit_crosslingual_match() {
         recs.iter().any(|r| r.skill.name == "kappa-skill"),
         "expected kappa-skill via keywords, got: {:?}",
         recs.iter().map(|r| &r.skill.name).collect::<Vec<_>>()
+    );
+}
+
+/// #144 round-9: one CJK substring is ONE piece of evidence. A query
+/// that is a single CJK word emits a bigram cluster plus glossary
+/// expansions, but they all share the run as provenance — they must not
+/// satisfy the two-independent-sources description admission rule by
+/// themselves. Two distinct CJK words DO provide independent sources.
+#[test]
+fn cjk_single_word_cannot_self_admit_via_description() {
+    let graph = build(discover(&[fixture_root()]));
+
+    // Single CJK word: bigram cluster + gloss "review" all trace to the
+    // same run -> description-only admission must fail.
+    let recs = recommend(&graph, "レビュー", "", 5);
+    assert!(
+        !recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "single CJK substring self-admitted: {recs:?}"
+    );
+
+    // Two distinct CJK words are independent sources -> admits.
+    let recs = recommend(&graph, "レビュー テスト", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "two CJK words should admit: {recs:?}"
+    );
+}
+
+/// #144 round-9: resolver-derived mentions are capped per skill —
+/// parser MAX_LINKS does not cover them, so a body naming many skills
+/// must not create unbounded link/backlink blowup.
+#[test]
+fn resolver_mentions_are_capped_per_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    for i in 0..70 {
+        let d = dir.path().join(format!("skill-{i:02}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: skill-{i:02}\ndescription: fixture {i}\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    let mentioner = dir.path().join("mentioner");
+    std::fs::create_dir_all(&mentioner).unwrap();
+    let names = (0..70)
+        .map(|i| format!("skill-{i:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        mentioner.join("SKILL.md"),
+        format!("---\nname: mentioner\ndescription: mentions many\n---\n{names}\n"),
+    )
+    .unwrap();
+
+    let graph = build(discover(&[dir.path().to_path_buf()]));
+    let skill = graph
+        .skills
+        .iter()
+        .find(|s| s.name == "mentioner")
+        .expect("mentioner discovered");
+    let mentions = skill
+        .links
+        .iter()
+        .filter(|l| l.kind == skill_graph::model::LinkKind::Mention)
+        .count();
+    assert_eq!(mentions, 64, "mention cap should engage deterministically");
+}
+
+/// #144 round-11: a CJK run that contains a recognized dictionary word
+/// plus uncovered characters (particles/suffixes like する) must still
+/// count as ONE evidence unit. Previously the uncovered bigrams fell
+/// back to run-level provenance, giving the same utterance a second
+/// source (`{key, run}`) and letting `レビューする` self-admit — the
+/// hole the key-scoped bigram fix was meant to close.
+#[test]
+fn cjk_key_plus_particle_cannot_self_admit() {
+    let graph = build(discover(&[fixture_root()]));
+
+    // One run = glossary key レビュー + uncovered する: only the key's
+    // provenance survives, so description admission (needs 2 sources)
+    // must fail.
+    let recs = recommend(&graph, "レビューする", "", 5);
+    assert!(
+        !recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "key+particle run self-admitted: {recs:?}"
+    );
+
+    // Two independent runs still admit.
+    let recs = recommend(&graph, "レビューする テスト", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "japanese-only-skill"),
+        "independent second source should admit: {recs:?}"
+    );
+}
+
+/// Round-13: a parse-error skill must never admit — including via the
+/// exact-name path — so it cannot seed requires-propagation for a
+/// dependency it declares.
+#[test]
+fn parse_error_skill_cannot_seed_requires() {
+    let temp = tempfile::tempdir().unwrap();
+    // Dir fallback yields the valid name "bad-deploy" while the
+    // frontmatter name violates the spec charset -> parse_error set.
+    let bad = temp.path().join("bad-deploy");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(
+        bad.join("SKILL.md"),
+        "---\nname: \"bad\\ndeploy\"\ndescription: d\nmetadata:\n  requires-skills: victim-skill\n---\n\nbody\n",
+    )
+    .unwrap();
+    write_skill_md(
+        &temp.path().join("victim-skill"),
+        "victim-skill",
+        "Use for victim work.",
+    );
+    let graph = build(discover(&[temp.path().to_path_buf()]));
+    assert!(graph.skills.iter().any(|s| s.parse_error.is_some()));
+    let recs = recommend(&graph, "bad-deploy", "", 5);
+    assert!(
+        recs.iter().all(|r| r.skill.name != "victim-skill"),
+        "parse-error skill must not admit its requires target: {recs:?}"
     );
 }

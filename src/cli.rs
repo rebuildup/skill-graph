@@ -7,6 +7,7 @@ use crate::resolver::build;
 use crate::search::recommend;
 use clap::{Parser, Subcommand};
 use serde_json::json;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -19,6 +20,12 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+/// Output-size bound for `search`/`recommend --max`: an unbounded value
+/// would materialize every unique-name recommendation (up to the
+/// discovery skill cap) with reasons — the same class of bound the MCP
+/// surface applies at 64 (#144 r19).
+const MAX_CLI_MAX: usize = 64;
 
 #[derive(Subcommand)]
 enum Command {
@@ -38,7 +45,11 @@ enum Command {
         format: String,
     },
     Recommend {
-        query: String,
+        /// Query text. Use --query-stdin to read it from stdin instead —
+        /// keeps prompts beginning with `-` and prompt bodies off argv.
+        query: Option<String>,
+        #[arg(long)]
+        query_stdin: bool,
         #[arg(long)]
         context: Option<String>,
         #[arg(long)]
@@ -57,6 +68,10 @@ enum Command {
     },
     Bench {
         dataset: PathBuf,
+        /// Recommendation cutoff scored as the primary metric. Defaults
+        /// to 3, matching the top-N the hook/plugin actually inject.
+        #[arg(long, default_value_t = 3)]
+        max: usize,
     },
     Perf {
         #[arg(long, value_delimiter = ',', default_value = "50,100,200,500")]
@@ -76,7 +91,7 @@ enum Command {
     /// emits Skill Usage Events, and prints additionalContext injection.
     /// Always exits 0 (fail-open).
     Hook {
-        /// claude-code | codex
+        /// claude-code | codex | opencode
         runtime: String,
         /// prompt | skill-load
         mode: String,
@@ -98,8 +113,8 @@ enum Command {
         #[arg(long)]
         bin: Option<String>,
     },
-    /// Normalize a single runtime hook/plugin payload (stdin JSON) into a
-    /// Skill Usage Event. Prints the event JSON, or nothing when the
+    /// Normalize runtime hook/plugin payloads (stdin JSON) into Skill
+    /// Usage Events — one JSON object per line. Prints nothing when a
     /// payload carries no skill-load signal. Detection only — never runs
     /// recommendation or corpus analysis.
     Detect {
@@ -125,18 +140,46 @@ pub fn run() -> Result<(), String> {
             format,
         } => {
             let graph = graph_for(roots_or_default(root))?;
-            let recs = recommend(&graph, &query, "", max);
+            let recs = recommend(&graph, &query, "", max.min(MAX_CLI_MAX));
             print_result(json!(recs), &format)
         }
         Command::Recommend {
             query,
+            query_stdin,
             context,
             root,
             max,
             format,
         } => {
+            let query = match (query, query_stdin) {
+                (Some(q), false) => q,
+                (None, true) => {
+                    // Same 16 MiB bound as hook/detect stdin: query text is
+                    // agent-controlled and recommend() work scales with it.
+                    let mut buf = String::new();
+                    std::io::stdin()
+                        .take(16 * 1024 * 1024 + 1)
+                        .read_to_string(&mut buf)
+                        .map_err(|e| format!("failed to read --query-stdin: {e}"))?;
+                    if buf.len() > 16 * 1024 * 1024 {
+                        return Err("--query-stdin input exceeds 16 MiB".into());
+                    }
+                    buf
+                }
+                (Some(_), true) => {
+                    return Err("pass either a query argument or --query-stdin, not both".into());
+                }
+                (None, false) => {
+                    return Err("recommend requires a query argument or --query-stdin".into());
+                }
+            };
             let graph = graph_for(roots_or_default(root))?;
-            let recs = recommend(&graph, &query, context.as_deref().unwrap_or(""), max);
+            let recs = recommend(
+                &graph,
+                &query,
+                context.as_deref().unwrap_or(""),
+                max.min(MAX_CLI_MAX),
+            );
             print_result(json!(recs), &format)
         }
         Command::Resolve {
@@ -148,12 +191,10 @@ pub fn run() -> Result<(), String> {
             let result = resolve_target(&graph, &target);
             print_result(json!(result), &format)
         }
-        Command::Bench { dataset } => {
-            let result = eval::run(&dataset)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
-            );
+        Command::Bench { dataset, max } => {
+            let result = eval::run(&dataset, max)?;
+            write_stdout_line(&serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
         Command::Observe {
@@ -163,14 +204,23 @@ pub fn run() -> Result<(), String> {
         } => {
             let obs = observe::observe_path(&path)?;
             if summary {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&observe::summary(&obs))
-                        .map_err(|e| e.to_string())?
-                );
+                // Route through print_result so --format is validated
+                // (bogus values error) instead of being silently ignored.
+                print_result(observe::summary(&obs), &format)?;
                 return Ok(());
             }
-            print_result(json!(obs), &format)
+            // Serialize Observation directly: routing through json!(obs)
+            // first would materialize a second ~64MiB-budgeted tree as a
+            // Value before pretty-printing (#144 r14). `human` is
+            // rejected outright: human() would to_value the whole
+            // Observation (~30x transient) only to fall through to a
+            // pretty-print anyway — meaningless for this shape (#144 r18).
+            if format == "human" {
+                return Err(
+                    "observe: --format human is not supported; use json or --summary".to_string(),
+                );
+            }
+            print_result(obs, &format)
         }
         Command::Hook { runtime, mode } => {
             use crate::events::Runtime;
@@ -183,12 +233,15 @@ pub fn run() -> Result<(), String> {
             match parsed {
                 Some(runtime) if valid_mode => crate::hook::run_hook(runtime, &mode),
                 _ => {
+                    // Same 16 MiB cap as the real hook path — an
+                    // invalid-args invocation must not drain unboundedly.
                     let mut sink = Vec::new();
-                    let _ = std::io::stdin().read_to_end(&mut sink);
+                    let _ = std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024)
+                        .read_to_end(&mut sink);
                     if parsed.is_none() {
-                        eprintln!("skill-graph: unknown runtime: {runtime}");
+                        write_stderr_line(&format!("skill-graph: unknown runtime: {runtime}"));
                     } else {
-                        eprintln!("skill-graph: unknown hook mode: {mode}");
+                        write_stderr_line(&format!("skill-graph: unknown hook mode: {mode}"));
                     }
                     Ok(())
                 }
@@ -224,49 +277,103 @@ pub fn run() -> Result<(), String> {
         }
         Command::Detect { runtime, via } => {
             use crate::events::{self, ObservedVia, Runtime};
-            let runtime =
-                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            // Callers pipe a payload unconditionally; drain stdin (bounded)
+            // before any early error exit so the writer never hits EPIPE.
+            let runtime = match Runtime::parse(&runtime) {
+                Some(r) => r,
+                None => return detect_arg_error(format!("unknown runtime: {runtime}")),
+            };
             let via = match via.as_str() {
                 "hook" => ObservedVia::Hook,
                 "plugin" => ObservedVia::Plugin,
                 "transcript" => ObservedVia::Transcript,
                 "db" => ObservedVia::Db,
-                other => return Err(format!("unknown observed_via: {other}")),
+                other => {
+                    return detect_arg_error(format!("unknown observed_via: {other}"));
+                }
             };
             let mut input = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+            std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024 + 1)
+                .read_to_string(&mut input)
                 .map_err(|e| format!("stdin: {e}"))?;
+            // Drain any unread remainder (bounded) so a caller writing a
+            // large payload does not hit EPIPE against an exited process
+            // — same contract as the hook's oversized-stdin path.
+            if input.len() as u64 > 16 * 1024 * 1024 {
+                let mut sink = Vec::new();
+                let _ = std::io::stdin()
+                    .take(16 * 1024 * 1024)
+                    .read_to_end(&mut sink);
+                return Err("stdin payload too large".to_string());
+            }
+            // serde_json::Value retains ~16-30x its input; refuse to
+            // materialize a tree for payloads far beyond any legitimate
+            // hook/plugin message (the plugin sends KB-scale events).
+            const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+            if input.len() > MAX_PARSE_BYTES {
+                let mut sink = Vec::new();
+                let _ = std::io::stdin()
+                    .take(16 * 1024 * 1024)
+                    .read_to_end(&mut sink);
+                return Err("stdin payload too large".to_string());
+            }
             let payload: serde_json::Value =
                 serde_json::from_str(&input).map_err(|e| format!("payload json: {e}"))?;
-            if let Some(event) = events::detect_from_payload(runtime, via, &payload) {
-                println!(
-                    "{}",
-                    serde_json::to_string(&event).map_err(|e| e.to_string())?
-                );
+            for event in events::detect_all_from_payload(runtime, via, &payload) {
+                write_stdout_line(&serde_json::to_string(&event).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         }
         Command::Perf { sizes, iterations } => {
             let result = perf::run(&sizes, iterations)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?
-            );
+            write_stdout_line(&serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
             Ok(())
         }
     }
 }
 
+/// Argument-validation failures on stdin-driven commands must still
+/// consume (bounded) stdin: the caller writes its payload before reading
+/// our exit status, and exiting early surfaces as EPIPE on their side.
+fn detect_arg_error(err: String) -> Result<(), String> {
+    let mut sink = Vec::new();
+    let _ = std::io::Read::take(std::io::stdin(), 16 * 1024 * 1024).read_to_end(&mut sink);
+    Err(err)
+}
+
 fn roots_or_default(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    if roots.is_empty() {
-        crate::discovery::default_roots()
-    } else {
-        roots
+    // Each distinct root gets its own walk budget; cap repetitions at
+    // the MCP MAX_TOOL_ROOTS parity bound so a huge --root list cannot
+    // multiply discovery work (#144 r16).
+    const MAX_CLI_ROOTS: usize = 32;
+    let mut roots = roots;
+    if roots.len() > MAX_CLI_ROOTS {
+        write_stderr_line(&format!(
+            "skill-graph: {} --root entries ignored (max {MAX_CLI_ROOTS})",
+            roots.len() - MAX_CLI_ROOTS
+        ));
+        roots.truncate(MAX_CLI_ROOTS);
     }
+    crate::discovery::resolve_roots(roots, crate::discovery::default_roots)
 }
 
 fn graph_for(roots: Vec<PathBuf>) -> Result<crate::resolver::Graph, String> {
-    Ok(build(discover(&roots)))
+    let discovery = discover(&roots);
+    // recommend/resolve output stays clean JSON, but invalid or
+    // truncated roots must not vanish silently — surface a bounded
+    // diagnostics sample on stderr (same info `discover` reports).
+    for err in discovery.errors.iter().take(10) {
+        write_stderr_line(&format!("skill-graph: {err}"));
+    }
+    if discovery.errors.len() > 10 {
+        write_stderr_line(&format!(
+            "skill-graph: ... and {} more discovery errors",
+            discovery.errors.len() - 10
+        ));
+    }
+    Ok(build(discovery))
 }
 
 pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveResult {
@@ -276,24 +383,121 @@ pub fn resolve_target(graph: &crate::resolver::Graph, target: &str) -> ResolveRe
             skills: indexes.iter().map(|i| graph.skills[*i].summary()).collect(),
         };
     }
-    let path = crate::resolver::normalize_path(&std::path::PathBuf::from(target));
-    if let Some(index) = graph.by_path.get(&path) {
-        return ResolveResult::Path {
-            skill: graph.skills[*index].summary(),
+    // `file://` targets (RFC 8089) map to a local path; only the empty or
+    // `localhost` authority is local. Lookup still goes through by_path,
+    // so resolution stays bounded to discovered skills.
+    let raw = if let Some(path) = file_uri_to_path(target) {
+        path
+    } else if target.starts_with("file://") {
+        return ResolveResult::Unresolved {
+            target: target.to_string(),
         };
+    } else {
+        std::path::PathBuf::from(target)
+    };
+    // by_path keys are absolute (discovery canonicalizes roots); a
+    // relative or non-normalized target must be absolutized first or it
+    // can never match.
+    let abs = if raw.is_absolute() {
+        raw
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(&raw))
+            .unwrap_or(raw)
+    };
+    let mut candidates = vec![crate::resolver::normalize_path(&abs)];
+    if let Ok(canon) = std::fs::canonicalize(&abs) {
+        let p = crate::resolver::normalize_path(&canon);
+        if !candidates.contains(&p) {
+            candidates.push(p);
+        }
+    }
+    // A directory target completes to <dir>/SKILL.md, mirroring the
+    // resolver's directory completion for Markdown links.
+    let skill_md: Vec<PathBuf> = candidates
+        .iter()
+        .map(|dir| dir.join("SKILL.md"))
+        .filter(|p| !candidates.contains(p))
+        .collect();
+    candidates.extend(skill_md);
+    for path in candidates {
+        if let Some(index) = graph.by_path.get(&path) {
+            return ResolveResult::Path {
+                skill: graph.skills[*index].summary(),
+            };
+        }
     }
     ResolveResult::Unresolved {
         target: target.to_string(),
     }
 }
 
+/// Map a `file://` URI to a local path (RFC 8089). Only the empty or
+/// `localhost` authority denotes a local file; remote authorities,
+/// malformed percent-encoding, and non-UTF-8 paths yield `None`.
+fn file_uri_to_path(target: &str) -> Option<PathBuf> {
+    let rest = target.strip_prefix("file://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, "/"),
+    };
+    if !authority.is_empty() && authority != "localhost" {
+        return None;
+    }
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
+        {
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            decoded.push((hi * 16 + lo) as u8);
+            i += 3;
+            continue;
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(decoded).ok().map(PathBuf::from)
+}
+
+/// Write one line to stdout. `BrokenPipe` is success: consumers
+/// legitimately close the pipe early (`discover | head`), and Rust's
+/// `println!` panics on write errors — which would violate the hook's
+/// fail-open exit-0 contract and crash CLI output paths.
+pub fn write_stdout_line(s: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    match writeln!(std::io::stdout().lock(), "{s}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// stderr counterpart of `write_stdout_line` — `2>&1 | head` merges
+/// stderr into the same closed pipe, so `eprintln!` panics there too.
+pub fn write_stderr_line(s: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr().lock(), "{s}").or_else(|e| {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    });
+}
+
 fn print_result(value: impl serde::Serialize, format: &str) -> Result<(), String> {
     match format {
-        "json" => println!(
-            "{}",
-            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?
-        ),
-        "human" => println!("{}", human(value)),
+        "json" => {
+            write_stdout_line(&serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?
+        }
+        "human" => write_stdout_line(&human(value)).map_err(|e| e.to_string())?,
         _ => return Err(format!("unsupported format: {format}")),
     }
     Ok(())

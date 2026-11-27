@@ -11,6 +11,9 @@
   "bin": {
     "skill-graph": "bin/skill-graph.js"
   },
+  "scripts": {
+    "prepack": "node -e \"for (const d of ['plugin','contracts']) { if (!require('fs').existsSync(d)) { console.error('missing generated dir: ' + d + ' — run the npm-publish bundle step before packing'); process.exit(1); } }\""
+  },
   "files": [
     "bin/",
     "plugin/",

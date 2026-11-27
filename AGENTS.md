@@ -27,9 +27,8 @@
 
 ## 実装境界
 
-- 初期実装はオンメモリの Discovery / Parser / Resolver / Recommendation に限定する。
-- 永続キャッシュ、グラフDB、Embedding、常駐サービス、MCP Server は効果実証前に追加しない。
-- CLI / Hook / Plugin は共通エンジンへの薄い入口として設計する。
+- コアエンジンはオンメモリの Discovery / Parser / Resolver / Search / Recommendation に限定する。公開インターフェースは CLI・`hook`・`adapter`・OpenCode plugin・MCP server（stdio・read-only）・`observe` で、いずれも共通エンジンへの薄い入口とする。
+- 永続キャッシュ、グラフDB、Embedding、常駐サービスは v1.0.0 spec §6 の判定により不採用。MCP Server は ADR-0005 / v1.0.0 spec §1 により read-only stdio server として採用・実装済み（`src/mcp.rs`）。
 - PATH 登録、グローバルインストール、shell 起動ファイル変更を前提にしない。
 
 ## 検証

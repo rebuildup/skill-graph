@@ -102,6 +102,49 @@ fn claude_file_read_is_file_read_with_tool_result() {
     assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&1));
 }
 
+/// One tool output covering several SKILL.md reads: the single
+/// frontmatter block belongs to the first file emitted, so only the
+/// first Read access may claim it — later reads fall back to
+/// path-derived classification instead of inheriting the wrong name.
+#[test]
+fn claude_multi_file_output_attributes_frontmatter_to_first_read() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "multi.jsonl",
+        &[
+            r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cat .agents/skills/alpha/SKILL.md .agents/skills/beta/SKILL.md"}}]}}"#,
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"---\nname: alpha-real\n---\nalpha body\n---\nname: beta-real\n---\nbeta body"}]}}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    let loads: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .collect();
+    assert_eq!(loads.len(), 2, "events: {:?}", obs.events);
+    let first = loads
+        .iter()
+        .find(|e| e.skill_name.as_deref() == Some("alpha-real"))
+        .expect("first read keeps frontmatter name");
+    assert_eq!(
+        first.detection.map(|d| serde_json::to_value(d).unwrap()),
+        Some(serde_json::json!("file_read"))
+    );
+    // The second file must NOT inherit alpha-real: it falls back to its
+    // directory name at path_reference confidence.
+    let second = loads
+        .iter()
+        .find(|e| e.skill_path.as_deref() == Some(".agents/skills/beta/SKILL.md"))
+        .expect("second read present");
+    assert_eq!(second.skill_name.as_deref(), Some("beta"));
+    assert_eq!(
+        second.detection.map(|d| serde_json::to_value(d).unwrap()),
+        Some(serde_json::json!("path_reference"))
+    );
+}
+
 #[test]
 fn codex_rollout_normalizes_exec_loads_and_injection() {
     let dir = TempDir::new().unwrap();
@@ -328,4 +371,634 @@ fn summary_computes_funnel_metrics() {
     assert_eq!(v2["unnecessary_loads"], 1);
     assert_eq!(v2["by_runtime"]["codex"]["load_grade_loads"], 1);
     assert!(v2["by_runtime"].get("claude-code").is_none());
+}
+
+/// Session ids are only unique within a runtime: the same id under
+/// claude-code and codex must not merge into one funnel session, and
+/// events with an empty session id count toward top-level counters but
+/// never join a session join (conversion/unnecessary).
+#[test]
+fn summary_isolates_sessions_across_runtimes() {
+    use skill_graph::events::Runtime;
+    use skill_graph::observe::{Observation, summary};
+
+    // claude-code "s1": emitted rec for alpha, then alpha loads -> converted.
+    // codex "s1": same ids but a load of beta with NO prior recommendation
+    // in that session -> unnecessary, and must not convert claude's rec.
+    let mut codex_load = load_event("s1", "2026-01-01T00:01:30Z", "beta");
+    codex_load.runtime = Runtime::Codex;
+    let obs = Observation {
+        events: vec![
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha"], true),
+            load_event("s1", "2026-01-01T00:01:00Z", "alpha"),
+            codex_load,
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["sessions"], 2, "runtime:session pairs are distinct");
+    assert_eq!(v["converted_recommendations"], 1);
+    assert_eq!(v["unnecessary_loads"], 1);
+    assert_eq!(
+        v["by_session"]["claude-code:s1"]["converted_recommendations"],
+        1
+    );
+    assert_eq!(v["by_session"]["codex:s1"]["unnecessary_loads"], 1);
+    assert_eq!(v["by_session"]["codex:s1"]["converted_recommendations"], 0);
+
+    // Empty session id: still counted at top level, absent from by_session.
+    let mut no_sid = load_event("", "2026-01-01T00:02:00Z", "gamma");
+    no_sid.session_id = String::new();
+    let obs2 = Observation {
+        events: vec![no_sid],
+        ..Default::default()
+    };
+    let v2 = summary(&obs2);
+    assert_eq!(v2["load_grade_loads"], 1);
+    assert_eq!(v2["sessions"], 0);
+    assert_eq!(v2["unnecessary_loads"], 0, "no session -> no join");
+    assert_eq!(v2["by_session"].as_object().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn observe_survives_symlink_cycle() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "a.jsonl",
+        &[
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hi"}}"#,
+        ],
+    );
+    // loop -> . creates a directory cycle; must not recurse forever
+    std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 1);
+}
+
+/// summary() must surface collection errors and by_session truncation
+/// rather than returning partial aggregates indistinguishable from clean
+/// ones.
+#[test]
+fn summary_reports_errors_and_session_cap() {
+    use skill_graph::observe::{Observation, summary};
+
+    let mut obs = Observation {
+        errors: (0..105).map(|i| format!("err-{i}")).collect(),
+        ..Default::default()
+    };
+    // 501 distinct sessions exceed MAX_SUMMARY_SESSIONS (500).
+    for i in 0..501 {
+        obs.events.push(load_event(
+            &format!("sess-{i}"),
+            "2026-01-01T00:00:00Z",
+            "alpha",
+        ));
+    }
+    let v = summary(&obs);
+    assert_eq!(v["collection_errors"], 105);
+    assert_eq!(v["errors"].as_array().unwrap().len(), 100);
+    assert_eq!(v["errors_omitted"], 5);
+    assert_eq!(v["by_session"].as_object().unwrap().len(), 500);
+    assert_eq!(v["by_session_omitted"], 1);
+}
+
+/// Passthrough events are untrusted log input: session_id is normalized
+/// to the constructor bounds, oversized fields are capped, and a
+/// skill_load with an empty skill_name is counted in lines_skipped
+/// rather than vanishing silently.
+#[test]
+fn passthrough_normalizes_fields_and_counts_empty_name() {
+    let dir = TempDir::new().unwrap();
+    let long_sid = "a".repeat(200);
+    let event = format!(
+        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{long_sid}","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
+    );
+    write_transcript(
+        &dir,
+        "events.jsonl",
+        &[
+            event.as_str(),
+            // empty skill_name: present but unattributable -> skipped
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"s1","timestamp":"2026-01-01T00:00:01Z","observed_via":"hook","skill_name":"","detection":"file_read","confidence":"high"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.events.len(), 1);
+    assert_eq!(obs.lines_skipped, 1);
+    assert_eq!(obs.events[0].session_id.len(), 128);
+    assert!(
+        obs.events[0]
+            .session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    );
+}
+
+/// Recommendation events with an empty `recommended` list must pass
+/// through (the hook emits `recommended: []` for dedup/no_recommendations
+/// outcomes), while explicit JSON nulls for required fields are rejected
+/// rather than re-serialized into schema-invalid output.
+#[test]
+fn passthrough_accepts_empty_recommended_rejects_null_required() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "events.jsonl",
+        &[
+            // valid: emitted=false with recommended: []
+            r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:00Z","observed_via":"hook","trigger":"prompt_submit","recommended":[],"emitted":false,"reason":"dedup_skip"}"#,
+            // invalid: emitted is explicit null — must be skipped
+            r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:01Z","observed_via":"hook","trigger":"prompt_submit","recommended":[],"emitted":null,"reason":"x"}"#,
+            // invalid: recommended item name empty
+            r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:02Z","observed_via":"hook","trigger":"prompt_submit","recommended":[{"name":""}],"emitted":true,"reason":"recommended"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.events.len(), 1, "events: {:?}", obs.events);
+    assert_eq!(obs.lines_skipped, 2);
+    assert_eq!(
+        obs.events[0].kind,
+        skill_graph::events::EventKind::Recommendation
+    );
+    assert_eq!(obs.events[0].emitted, Some(false));
+}
+
+/// RFC 3339 boundary timestamps must parse: leap-year-aware February,
+/// hour 23, leap second 60, fractional seconds, and bounded `±hh:mm`
+/// offsets (colon required — `+0900` is not RFC 3339).
+#[test]
+fn summary_accepts_rfc3339_boundary_timestamps() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // s1: leap day 2024-02-29 -> next day = 1s.
+            rec_event("s1", "2024-02-29T23:59:59Z", &["alpha"], true),
+            load_event("s1", "2024-03-01T00:00:00Z", "alpha"),
+            // s2: same instants expressed with -05:00 / +05:00 offsets = 2s.
+            rec_event("s2", "2024-02-29T18:59:59-05:00", &["beta"], true),
+            load_event("s2", "2024-03-01T05:00:01+05:00", "beta"),
+            // s3: leap second 23:59:60 == next midnight; +1s load = 1s.
+            rec_event("s3", "2024-06-30T23:59:60Z", &["gamma"], true),
+            load_event("s3", "2024-07-01T00:00:01Z", "gamma"),
+            // s4: fractional seconds and a zero offset = 2s.
+            rec_event("s4", "2026-01-01T09:00:00.250+09:00", &["delta"], true),
+            load_event("s4", "2026-01-01T00:00:02+00:00", "delta"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // deltas: 1000, 2000, 1000, 1750 (s4 keeps its .250 fraction) ->
+    // sorted [1000,1000,1750,2000]; p50 index = round((4-1)*0.5) = 2.
+    assert_eq!(v["timeliness_ms"]["count"], 4);
+    assert_eq!(v["timeliness_ms"]["p50"], 1750);
+    assert_eq!(v["timeliness_ms"]["max"], 2000);
+    assert_eq!(v["converted_recommendations"], 4);
+}
+
+/// Out-of-range or non-calendar timestamps (Feb 30, Apr 31, month 13,
+/// hour 25, minute/second overflow, non-leap Feb 29, bad offsets,
+/// trailing garbage) are rejected by the strict RFC 3339 parser. The
+/// events remain valid contract events — they still count toward
+/// conversions via input-order fallback — but contribute no timeliness
+/// delta, so `timeliness_ms` cannot be distorted by bogus timestamps.
+#[test]
+fn summary_rejects_invalid_rfc3339_timestamps() {
+    use skill_graph::observe::{Observation, summary};
+
+    let invalid_load_ts = [
+        "2026-02-30T00:01:00Z",      // February has no 30th
+        "2026-04-31T00:01:00Z",      // April has 30 days
+        "2026-13-01T00:01:00Z",      // month 13
+        "2026-01-01T25:00:00Z",      // hour 25
+        "2026-01-01T00:60:00Z",      // minute 60
+        "2026-01-01T00:00:61Z",      // second 61
+        "2023-02-29T00:01:00Z",      // 2023 is not a leap year
+        "2026-01-01T00:01:00+24:00", // offset hour 24
+        "2026-01-01T00:01:00+05:60", // offset minute 60
+        "2026-01-01T00:01:00Zjunk",  // trailing garbage after Z
+        "2026-01-01T00:01:00.Z",     // decimal point with no digits
+        "2026/01/01T00:01:00Z",      // wrong date separators
+        "2026-01-01T00:01:00",       // missing offset — not RFC 3339
+        "2026-01-01T00:01:00+0900",  // colon-less offset — not RFC 3339
+    ];
+    let mut events = Vec::new();
+    for (i, ts) in invalid_load_ts.iter().enumerate() {
+        let session = format!("bad-{i}");
+        events.push(rec_event(
+            &session,
+            "2026-01-01T00:00:00Z",
+            &["alpha"],
+            true,
+        ));
+        events.push(load_event(&session, ts, "alpha"));
+    }
+    // Both endpoints invalid: still ordered by input position.
+    events.push(rec_event(
+        "bad-both",
+        "2026-02-30T00:00:00Z",
+        &["beta"],
+        true,
+    ));
+    events.push(load_event("bad-both", "2026-04-31T00:01:00Z", "beta"));
+
+    let obs = Observation {
+        events,
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // Every pair still converts via input-order fallback...
+    assert_eq!(
+        v["converted_recommendations"],
+        invalid_load_ts.len() + 1,
+        "invalid timestamps fall back to position ordering"
+    );
+    // ...but none contributes a timeliness delta.
+    assert_eq!(v["timeliness_ms"]["count"], 0);
+    assert_eq!(v["timeliness_ms"]["p50"], serde_json::Value::Null);
+    assert_eq!(v["timeliness_ms"]["max"], serde_json::Value::Null);
+}
+
+/// Unattributable loads (empty session id) still count toward
+/// `load_grade_loads` and `loads_per_session`, but both sides of
+/// `unnecessary_load_rate_pct` are session-scoped: they are excluded
+/// from numerator AND denominator rather than deflating the rate.
+#[test]
+fn summary_scopes_unnecessary_rate_to_session_loads() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha"], true),
+            load_event("s1", "2026-01-01T00:01:00Z", "alpha"),
+            // Unattributable: no session id -> outside every funnel.
+            load_event("", "2026-01-01T00:02:00Z", "ghost"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["load_grade_loads"], 2);
+    assert_eq!(v["session_attributed_loads"], 1);
+    assert_eq!(v["unnecessary_loads"], 0);
+    assert_eq!(v["unnecessary_load_rate_pct"], 0.0);
+    // loads_per_session is a top-level metric over ALL loads.
+    assert_eq!(v["loads_per_session"], 2.0);
+}
+
+/// RFC 3339 fractional seconds keep millisecond precision — a 500ms
+/// rec→load delta must not quantize to zero or a full second.
+#[test]
+fn summary_timeliness_uses_millisecond_precision() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            rec_event("s", "2026-01-01T00:00:00.000Z", &["a"], true),
+            load_event("s", "2026-01-01T00:00:00.500Z", "a"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["timeliness_ms"]["count"], 1);
+    assert_eq!(v["timeliness_ms"]["p50"], 500);
+    assert_eq!(v["timeliness_ms"]["max"], 500);
+}
+
+/// Mixed valid/invalid timestamps: the conversion fallback compares
+/// input (encounter) order, not timestamp-sorted position — an
+/// unparseable timestamp sorts to i64::MAX and would otherwise
+/// fabricate "missing ts = latest" and invert real ordering.
+#[test]
+fn summary_mixed_timestamps_use_input_order() {
+    use skill_graph::observe::{Observation, summary};
+
+    // Load precedes the recommendation in log order but carries an
+    // invalid timestamp: it must NOT convert — the old position
+    // fallback sorted it last and credited a backwards conversion.
+    let obs = Observation {
+        events: vec![
+            load_event("s", "not-a-time", "alpha"),
+            rec_event("s", "2026-01-01T00:00:00Z", &["alpha"], true),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 0);
+
+    // Recommendation precedes the load in log order; the rec's own
+    // timestamp is invalid — input order still pairs them.
+    let obs = Observation {
+        events: vec![
+            rec_event("s", "not-a-time", &["alpha"], true),
+            load_event("s", "2026-01-01T00:00:01Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+    // No timeliness delta without two valid timestamps.
+    assert_eq!(v["timeliness_ms"]["count"], 0);
+}
+
+/// Round-9: the conversion scan indexes loads by name — verify greedy
+/// pairing still agrees with the naive O(recs × loads) scan on a
+/// larger same-name session (each load converts at most one rec).
+#[test]
+fn summary_conversion_pairs_greedily_at_scale() {
+    use skill_graph::observe::{Observation, summary};
+
+    let mut events = Vec::new();
+    for i in 0..500 {
+        let sec = i;
+        let ts = format!("2026-01-01T00:{:02}:{:02}Z", sec / 60, sec % 60);
+        events.push(rec_event("big", &ts, &["a"], true));
+        let load_ts = format!("2026-01-01T00:{:02}:{:02}.500Z", sec / 60, sec % 60);
+        events.push(load_event("big", &load_ts, "a"));
+    }
+    let obs = Observation {
+        events,
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 500);
+    assert_eq!(v["unnecessary_loads"], 0);
+    assert_eq!(v["load_grade_loads"], 500);
+}
+
+/// #144 round-11: passthrough `skill_load.skill_name` must satisfy the
+/// same valid-skill-name charset as `recommended[].name` — a foreign
+/// log line with an impossible name is skipped, not admitted into
+/// funnel join keys.
+#[test]
+fn passthrough_skill_name_charset_is_validated() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "events.jsonl",
+        &[
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:01Z","observed_via":"hook","skill_name":"!!! not a name !!!","detection":"file_read","confidence":"high"}"#,
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"codex","session_id":"s1","timestamp":"2026-11-26T00:00:02Z","observed_via":"hook","skill_name":"alpha-skill","detection":"file_read","confidence":"high"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.lines_skipped, 1);
+    assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&1));
+    assert_eq!(obs.skill_loads.len(), 1);
+}
+
+/// Round-12: non-regular files must not become observables — a FIFO
+/// named `*.jsonl` would block `read_to_string` forever.
+#[cfg(unix)]
+#[test]
+fn fifo_is_not_an_observable() {
+    let dir = TempDir::new().unwrap();
+    let fifo = dir.path().join("evil.jsonl");
+    let st = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // Returns promptly; the FIFO is skipped rather than opened.
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 0);
+    assert!(obs.loads.is_empty());
+}
+
+/// Round-13: a single JSONL line above the per-record byte cap must be
+/// skipped before serde_json::Value materialization (~16-30x
+/// amplification would otherwise turn one line into gigabytes).
+#[test]
+fn oversized_jsonl_line_is_skipped() {
+    let dir = TempDir::new().unwrap();
+    let big = format!("{{\"pad\":\"{}\"}}", "x".repeat(5 * 1024 * 1024));
+    let path = dir.path().join("big.jsonl");
+    fs::write(&path, format!("{big}\n{{\"type\":\"user\"}}\n")).unwrap();
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 1);
+    assert_eq!(obs.lines_skipped, 1);
+    assert!(obs.events.is_empty());
+}
+
+/// Round-13: an untimestamped recommendation sorts last but uses
+/// encounter-order eligibility; a load that timestamp-kills discarded
+/// for an earlier rec must still be convertible by it.
+#[test]
+fn funnel_mixed_timestamps_convert_via_encounter_order() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // Untimestamped rec FIRST in encounter order.
+            rec_event("s1", "", &["alpha"], true),
+            // Timestamped rec recommending the same skill.
+            rec_event("s1", "2026-01-01T00:00:00Z", &["alpha"], true),
+            // Old-timestamped load LAST in encounter order: dead for the
+            // 2026 rec by timestamp, positionally after the untimestamped one.
+            load_event("s1", "2020-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+}
+
+/// Round-14 M1: a symlinked .jsonl whose target also appears in the
+/// scan must still be read — observables store the canonical path so
+/// O_NOFOLLOW guards only the final component and read_dir order can
+/// no longer decide whether the file is seen.
+#[cfg(unix)]
+#[test]
+fn symlinked_jsonl_observable_is_scanned_once() {
+    let dir = TempDir::new().unwrap();
+    let real = write_transcript(
+        &dir,
+        "real.jsonl",
+        &[
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":"hi"}}"#,
+        ],
+    );
+    std::os::unix::fs::symlink(&real, dir.path().join("link.jsonl")).unwrap();
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.files_scanned, 1);
+    assert_eq!(obs.sessions, 1);
+    assert!(obs.errors.is_empty(), "{:?}", obs.errors);
+}
+
+/// Round-14 H1/H2: a rollout carrying a huge session_id plus many
+/// exec calls must stay bounded — session/timestamp/call_id are
+/// sanitized+interned at ingest instead of cloned per access.
+#[test]
+fn codex_rollout_with_oversized_session_id_stays_bounded() {
+    let dir = TempDir::new().unwrap();
+    let big_sid = "s".repeat(200 * 1024);
+    let mut lines = vec![format!(
+        r#"{{"type":"session_meta","timestamp":"2026-01-01T00:00:00Z","payload":{{"session_id":"{big_sid}"}}}}"#
+    )];
+    for i in 0..50 {
+        lines.push(format!(
+            r#"{{"type":"response_item","timestamp":"2026-01-01T00:00:{i:02}Z","payload":{{"type":"custom_tool_call","name":"exec","call_id":"c{i}","input":"cat /x/skills/alpha-skill/SKILL.md"}}}}"#
+        ));
+    }
+    write_transcript(
+        &dir,
+        "rollout.jsonl",
+        &lines.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    assert_eq!(obs.skill_loads.get("alpha-skill"), Some(&50));
+    assert_eq!(obs.sessions, 1);
+}
+
+/// Round-14 CodeRabbit: format is judged on the INPUT path's extension.
+/// A `link.db -> storage.sqlite` symlink must still be scanned as a
+/// database even though the canonical target has no `.db` suffix.
+#[cfg(unix)]
+#[test]
+fn db_symlink_to_different_extension_is_still_scanned_as_db() {
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("storage.sqlite");
+    let conn = rusqlite::Connection::open(&real).unwrap();
+    conn.execute(
+        "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m1','ses_1','user',1,1793321018917,1793321018917,?)",
+        [serde_json::json!({"time":{"created":1793321018917i64},"text":"hello"}).to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    std::os::unix::fs::symlink(&real, dir.path().join("link.db")).unwrap();
+
+    let obs = observe_path(dir.path()).unwrap();
+    assert!(obs.errors.is_empty(), "errors: {:?}", obs.errors);
+    assert!(obs.events.iter().any(|e| e.kind == EventKind::PromptSubmit));
+}
+
+/// Round-15: duplicate/missing tool_use_id must not let multiple uses
+/// claim the same captured frontmatter (codex parity, #144 r15).
+#[test]
+fn claude_duplicate_tool_use_id_claims_frontmatter_once() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "c.jsonl",
+        &[
+            r#"{"type":"assistant","sessionId":"s1","timestamp":"2026-01-01T00:00:00Z","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"path":"/repo/.agents/skills/alpha/SKILL.md"}},{"type":"tool_use","id":"t1","name":"Read","input":{"path":"/repo/.agents/skills/beta/SKILL.md"}}]}}"#,
+            r#"{"type":"user","sessionId":"s1","timestamp":"2026-01-01T00:00:01Z","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"---\nname: real-skill\n---\nbody"}]}}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    let loads: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .collect();
+    assert_eq!(loads.len(), 2, "events: {:?}", obs.events);
+    let claimed = loads
+        .iter()
+        .filter(|e| e.skill_name.as_deref() == Some("real-skill"))
+        .count();
+    assert_eq!(claimed, 1, "frontmatter must be claimed exactly once");
+    // The losing use falls back to its path-derived name.
+    assert!(
+        loads
+            .iter()
+            .any(|e| e.skill_name.as_deref() == Some("beta"))
+    );
+}
+
+/// Round-17 M2: an untimestamped recommendation admits loads by
+/// encounter order (`li > ri`), so the conversion winner must be
+/// ranked by encounter order too. Timestamp-sorted position would let
+/// an old-but-valid timestamp encountered LAST win over an
+/// earlier-encountered untimestamped load, inflating `converted`.
+#[test]
+fn funnel_untimestamped_rec_ranks_loads_by_encounter_order() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // Untimestamped rec recommending {alpha, beta}.
+            rec_event("s1", "", &["alpha", "beta"], true),
+            // Second untimestamped rec recommending beta only.
+            rec_event("s1", "", &["beta"], true),
+            // Untimestamped beta load, encountered before alpha's.
+            load_event("s1", "", "beta"),
+            // Old-timestamped alpha load encountered LAST: sorts FIRST
+            // by timestamp but must lose the encounter-order ranking.
+            load_event("s1", "2020-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // Encounter-order greedy: rec1 consumes beta (earliest eligible),
+    // rec2 finds nothing -> converted = 1. Timestamp-position ranking
+    // would consume alpha for rec1 and leave beta for rec2 -> 2.
+    assert_eq!(v["converted_recommendations"], 1);
+}
+
+/// Round-17 M1: transcript-derived and contract-log passthrough events
+/// share one (timestamp, feed-line) ordering, so a transcript event on
+/// an earlier line is not displaced by a passthrough event recorded
+/// later in the same file.
+#[test]
+fn mixed_passthrough_and_transcript_events_keep_feed_order() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "mixed.jsonl",
+        &[
+            // Transcript-derived load on line 0 (untimestamped).
+            r#"{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x/skills/beta-skill/SKILL.md"}}]}}"#,
+            // Passthrough contract load on line 1 (untimestamped).
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"s1","timestamp":"","observed_via":"hook","skill_name":"alpha-skill","detection":"file_read","confidence":"high"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    let names: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .filter_map(|e| e.skill_name.clone())
+        .collect();
+    // Feed order: transcript load (line 0) must precede the
+    // passthrough load (line 1); inline recording used to invert this.
+    assert_eq!(
+        names,
+        vec!["beta-skill".to_string(), "alpha-skill".to_string()]
+    );
+}
+
+/// Round-17 CR: an untimestamped recommendation must compare ALL
+/// same-name candidates, not stop at the first eligible one — the
+/// timestamp-ordered candidate list can place a later-encountered
+/// load first, and consuming it would steal the conversion from a
+/// later rec that could only use the earlier-encountered load.
+#[test]
+fn funnel_untimestamped_rec_compares_all_same_name_candidates() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // R1 (untimestamped) -> alpha
+            rec_event("s1", "", &["alpha"], true),
+            // L1 (untimestamped) alpha, encountered before R2
+            load_event("s1", "", "alpha"),
+            // R2 (untimestamped) -> alpha
+            rec_event("s1", "", &["alpha"], true),
+            // L2 timestamped alpha, encountered LAST: sorts first in
+            // the timestamp-ordered candidate list.
+            load_event("s1", "2026-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // Encounter-order greedy: R1 takes L1 (earliest eligible), R2
+    // takes L2 -> 2 conversions. First-eligible-in-list-order would
+    // give R1 the timestamped L2 and leave R2 nothing -> 1.
+    assert_eq!(v["converted_recommendations"], 2);
 }

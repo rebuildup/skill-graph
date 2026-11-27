@@ -4,9 +4,17 @@
 //! `recommend`, `discover`, `resolve`. No writes, no event log, no dedup
 //! state, no config mutation — package install or MCP registration alone
 //! activates nothing; each client's config entry is the opt-in path.
+//!
+//! There is deliberately no graph cache: a stdio MCP server stays alive
+//! for the whole agent session, so any memoization would serve stale
+//! skills after a SKILL.md is added, edited, or deleted. Cold
+//! discover+build is ~7.7 ms at 500 skills (release), so every tool call
+//! rebuilds the graph in memory — skill edits are visible on the very
+//! next call with no freshness bound to document.
 
-use crate::discovery::{default_roots, discover, output as discovery_output};
-use crate::resolver::build;
+use crate::discovery::{discover, resolve_roots};
+use crate::model::{DiscoveryOutput, Skill};
+use crate::resolver::{Graph, build};
 use crate::search::recommend;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
@@ -19,34 +27,78 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-struct SkillGraphMcp;
+/// Upper bound on roots a single tool call may request. The env var and
+/// defaults are operator-controlled; this only caps agent-supplied lists.
+const MAX_TOOL_ROOTS: usize = 32;
 
-/// Roots resolution shared with hook/CLI semantics: SKILL_GRAPH_ROOTS
-/// (colon-separated) wins, then explicit tool `roots`, then defaults.
-fn resolve_roots(arg_roots: Option<&Value>) -> Vec<PathBuf> {
-    if let Ok(spec) = std::env::var("SKILL_GRAPH_ROOTS") {
-        let roots: Vec<PathBuf> = spec
-            .split(':')
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect();
-        if !roots.is_empty() {
-            return roots;
+/// Cap on skills returned by `discover`; larger corpora are truncated and
+/// noted in `errors` so a hostile or accidental `roots: ["/"]` cannot turn
+/// the tool into an unbounded filesystem enumeration oracle.
+const MAX_DISCOVER_SKILLS: usize = 512;
+
+struct SkillGraphMcp {
+    /// Serializes tool computations. spawn_blocking has no concurrency
+    /// bound of its own, and MCP clients may pipeline calls: without
+    /// this, N queued calls each build a full in-memory graph (up to
+    /// the 512 MiB discovery bound) simultaneously (#144 r19). One
+    /// permit keeps peak memory at a single graph; queued calls wait
+    /// asynchronously without consuming blocking-pool threads.
+    compute_permit: Arc<tokio::sync::Semaphore>,
+}
+
+impl SkillGraphMcp {
+    fn new() -> Self {
+        Self {
+            compute_permit: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
-    if let Some(arr) = arg_roots.and_then(Value::as_array) {
-        let roots: Vec<PathBuf> = arr
-            .iter()
-            .filter_map(Value::as_str)
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect();
-        if !roots.is_empty() {
-            return roots;
+}
+
+/// Roots resolution shared by every entry point: SKILL_GRAPH_ROOTS wins,
+/// then explicit tool `roots` (capped at MAX_TOOL_ROOTS), then defaults.
+///
+/// A present `roots` array defines the scope even when every entry is
+/// invalid: entries pass through verbatim (no `is_dir` pre-filter) so
+/// `discover` reports "root is not a directory" diagnostics and returns
+/// an empty scan — silently dropping them would widen the query to the
+/// default corpus, the same violation #177 fixed for SKILL_GRAPH_ROOTS.
+fn tool_roots(arg_roots: Option<&Value>) -> Result<(Vec<PathBuf>, Vec<String>), String> {
+    let Some(value) = arg_roots else {
+        return Ok((
+            resolve_roots(Vec::new(), crate::discovery::default_roots),
+            Vec::new(),
+        ));
+    };
+    let Some(arr) = value.as_array() else {
+        return Err("roots must be an array of strings".to_string());
+    };
+    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut dropped = 0usize;
+    for item in arr {
+        match item.as_str() {
+            Some(s) if roots.len() < MAX_TOOL_ROOTS => roots.push(PathBuf::from(s)),
+            _ => dropped += 1,
         }
     }
-    default_roots().into_iter().filter(|p| p.is_dir()).collect()
+    let mut diagnostics = Vec::new();
+    if dropped > 0 {
+        diagnostics.push(format!(
+            "roots: {dropped} entr(ies) ignored (non-string or beyond {MAX_TOOL_ROOTS})"
+        ));
+    }
+    if roots.is_empty() {
+        // A present `roots` array defines the scope even when empty or
+        // entirely invalid — `resolve_roots` would treat an empty
+        // explicit list as "use defaults" and silently widen the query
+        // to the full corpus (the #177 violation). An empty PathBuf is
+        // never a directory, so discovery diagnoses it and returns an
+        // empty scan instead.
+        roots.push(PathBuf::new());
+    }
+    Ok((
+        resolve_roots(roots, crate::discovery::default_roots),
+        diagnostics,
+    ))
 }
 
 fn arg_str<'a>(args: &'a JsonObject, key: &str) -> Option<&'a str> {
@@ -87,7 +139,7 @@ fn tools() -> Vec<Tool> {
     let roots_prop = json!({
         "type": "array",
         "items": {"type": "string"},
-        "description": "Skill roots to search. Default: SKILL_GRAPH_ROOTS or the standard user/project roots."
+        "description": "Skill roots to search. SKILL_GRAPH_ROOTS (when set) overrides this; otherwise these roots are used instead of the standard user/project roots."
     });
     vec![
         Tool::new(
@@ -159,42 +211,130 @@ impl ServerHandler for SkillGraphMcp {
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
         let args = request.arguments.clone().unwrap_or_default();
-        let result = match request.name.as_ref() {
-            "recommend" => {
-                let Some(query) = arg_str(&args, "query") else {
-                    return Ok(tool_error("missing required argument: query"));
-                };
-                let roots = resolve_roots(args.get("roots"));
-                let graph = build(discover(&roots));
-                let recs = recommend(
-                    &graph,
-                    query,
-                    arg_str(&args, "context").unwrap_or(""),
-                    arg_usize(&args, "max", 3),
-                );
-                tool_result(&json!(recs))
+        let name = request.name.clone();
+        // Discovery/recommend/resolve do synchronous filesystem scans and
+        // CPU-bound scoring; run them on the blocking pool so a slow or
+        // huge corpus cannot stall the stdio server's async runtime.
+        // The permit serializes computations across pipelined calls —
+        // see compute_permit (#144 r19).
+        let permit = self
+            .compute_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| McpError::internal_error(format!("compute permit: {e}"), None))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            compute_tool(name.as_ref(), &args)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("tool task failed: {e}"), None))?
+    }
+}
+
+/// One fresh in-memory scan per tool call. Cold discover+build costs
+/// ~7.7 ms at 500 skills (release; see docs/evidence/
+/// 2026-11-25-c03-performance-benchmark.md), far below any interactive
+/// budget, and it keeps every call consistent with the filesystem —
+/// no staleness window for a long-lived stdio server.
+fn build_graph(roots: &[PathBuf]) -> Graph {
+    let discovery = discover(roots);
+    // recommend/resolve return bare result JSON, so discovery
+    // diagnostics would vanish; stderr is the MCP logging channel
+    // (stdout carries the protocol). Bounded like the CLI surface.
+    for err in discovery.errors.iter().take(10) {
+        crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
+    }
+    build(discovery)
+}
+
+fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpError> {
+    let result = match name {
+        "recommend" => {
+            let Some(query) = arg_str(args, "query") else {
+                return Ok(tool_error("missing required argument: query"));
+            };
+            let (roots, diagnostics) =
+                tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
+            for err in &diagnostics {
+                crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
             }
-            "discover" => {
-                let roots = resolve_roots(args.get("roots"));
-                tool_result(&json!(discovery_output(&discover(&roots))))
+            let graph = build_graph(&roots);
+            // `max` is operator/agent supplied; clamp so a huge value
+            // cannot materialize an unbounded response (#144 r15).
+            let recs = recommend(
+                &graph,
+                query,
+                arg_str(args, "context").unwrap_or(""),
+                arg_usize(args, "max", 3).min(64),
+            );
+            tool_result(&json!(recs))
+        }
+        "discover" => {
+            let (roots, diagnostics) =
+                tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
+            // discover needs only skill summaries + errors — skip
+            // resolver::build entirely: add_mentions clones every
+            // body_text and the backlinks pass is O(links), work this
+            // tool would discard (#144 r15).
+            let discovery = discover(&roots);
+            for err in discovery.errors.iter().take(10) {
+                crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
             }
-            "resolve" => {
-                let Some(target) = arg_str(&args, "target") else {
-                    return Ok(tool_error("missing required argument: target"));
-                };
-                let roots = resolve_roots(args.get("roots"));
-                let graph = build(discover(&roots));
-                tool_result(&json!(crate::cli::resolve_target(&graph, target)))
+            // skills is capped; errors need the same bound — and take()
+            // avoids cloning the whole discovery error vector before
+            // truncation (a hostile corpus can produce ~1k entries).
+            const MAX_DISCOVER_ERRORS: usize = 256;
+            let mut errors: Vec<String> = diagnostics;
+            // Reserve two slots for the truncation markers pushed below
+            // so the final vector never exceeds the cap (#144 r20).
+            let room = MAX_DISCOVER_ERRORS
+                .saturating_sub(errors.len())
+                .saturating_sub(2);
+            errors.extend(discovery.errors.iter().take(room).cloned());
+            if discovery.errors.len() > room {
+                errors.push(format!("errors truncated at {MAX_DISCOVER_ERRORS}"));
             }
-            other => {
-                return Err(McpError::invalid_params(
-                    format!("unknown tool: {other}"),
-                    None,
+            // Take before mapping: Skill::summary clones name/description/
+            // paths per skill, so mapping all ~10k discovered skills only
+            // to truncate to 512 wastes the clones (#144 r20).
+            let skills_truncated = discovery.skills.len() > MAX_DISCOVER_SKILLS;
+            let mut output = DiscoveryOutput {
+                skills: discovery
+                    .skills
+                    .iter()
+                    .take(MAX_DISCOVER_SKILLS)
+                    .map(Skill::summary)
+                    .collect(),
+                errors,
+            };
+            if skills_truncated {
+                output.errors.push(format!(
+                    "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
                 ));
             }
-        };
-        Ok(result)
-    }
+            tool_result(&json!(output))
+        }
+        "resolve" => {
+            let Some(target) = arg_str(args, "target") else {
+                return Ok(tool_error("missing required argument: target"));
+            };
+            let (roots, diagnostics) =
+                tool_roots(args.get("roots")).map_err(|e| McpError::invalid_params(e, None))?;
+            for err in &diagnostics {
+                crate::cli::write_stderr_line(&format!("skill-graph-mcp: {err}"));
+            }
+            let graph = build_graph(&roots);
+            tool_result(&json!(crate::cli::resolve_target(&graph, target)))
+        }
+        other => {
+            return Err(McpError::invalid_params(
+                format!("unknown tool: {other}"),
+                None,
+            ));
+        }
+    };
+    Ok(result)
 }
 
 /// Entry point for `skill-graph mcp`. Runs the stdio server until the
@@ -205,7 +345,7 @@ pub fn run() -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
     runtime.block_on(async {
-        let server = SkillGraphMcp
+        let server = SkillGraphMcp::new()
             .serve(rmcp::transport::stdio())
             .await
             .map_err(|e| format!("mcp serve: {e}"))?;

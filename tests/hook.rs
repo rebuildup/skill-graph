@@ -278,7 +278,7 @@ fn skill_load_uses_session_recommended_as_context() {
     std::fs::create_dir_all(&state).unwrap();
     // Seed session context whose terms hit beta-skill's description
     // ("tests", "verification harnesses") — admits it via context alone.
-    std::fs::write(state.join("s1.recommended"), "tests harness\n").unwrap();
+    std::fs::write(state.join("s1.recommended"), "tests\nharness\n").unwrap();
     let payload = json!({
         "session_id":"s1",
         "tool_name":"Skill",
@@ -336,4 +336,160 @@ fn nostate_records_no_session_recommendations() {
     );
     assert_eq!(rc, 0);
     assert!(!dir.path().join("state").join("s1.recommended").exists());
+}
+
+#[test]
+fn skill_load_accepts_name_key_tool_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    // OpenCode-style payloads may carry the tool name under `name`.
+    let payload = json!({
+        "session_id":"s1",
+        "name":"Skill",
+        "input":{"skill":"kappa-skill"}
+    });
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "skill-load"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    assert!(
+        events.iter().any(|e| e["kind"] == "skill_load"),
+        "expected skill_load event, got: {events:?}"
+    );
+    let _ = out;
+}
+
+#[test]
+fn non_object_stdin_writes_no_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let bin = env!("CARGO_BIN_EXE_skill-graph");
+    for raw in ["42", "\"x\"", "[1,2]", "true"] {
+        let mut child = std::process::Command::new(bin)
+            .args(["hook", "claude-code", "prompt"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .envs(envs.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(raw.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        assert!(out.stdout.is_empty());
+    }
+    assert!(!dir.path().join("events.jsonl").exists());
+}
+
+/// Every event line the hook actually writes must validate against
+/// contracts/v1/skill-usage-event.schema.json — including non-emitted
+/// recommendation events whose `recommended` list is empty (issue #144:
+/// skip_serializing_if used to drop the key and observe then skipped
+/// the lines, inflating the funnel delivery rate).
+#[test]
+fn emitted_events_validate_against_event_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let payload = json!({"session_id":"s1","prompt":"use alpha-skill please"});
+    let args = &["hook", "claude-code", "prompt"];
+    let (_, rc) = run_hook(args, &payload, &env_pairs(&envs));
+    assert_eq!(rc, 0);
+    // Second identical submit produces a dedup_skip recommendation with
+    // recommended: [] — the exact shape that used to be schema-invalid.
+    let (_, rc) = run_hook(args, &payload, &env_pairs(&envs));
+    assert_eq!(rc, 0);
+
+    let schema: Value = serde_json::from_str(include_str!(
+        "../contracts/v1/skill-usage-event.schema.json"
+    ))
+    .unwrap();
+    let validator = jsonschema::options().build(&schema).unwrap();
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    assert!(
+        events.len() >= 3,
+        "expected prompt_submit+2 recommendations: {events:?}"
+    );
+    let mut saw_empty_recommended = false;
+    for (i, event) in events.iter().enumerate() {
+        if event["kind"] == "recommendation" && event["recommended"] == json!([]) {
+            saw_empty_recommended = true;
+        }
+        assert!(
+            validator.is_valid(event),
+            "event[{i}] failed schema: {}\nerrors: {:?}",
+            serde_json::to_string_pretty(event).unwrap(),
+            validator.iter_errors(event).collect::<Vec<_>>()
+        );
+    }
+    assert!(saw_empty_recommended, "dedup_skip event missing from log");
+}
+
+/// Round-9: payload session ids that sanitize to empty must not
+/// collapse distinct sessions into one `""` key — they get distinct
+/// `unknown-<hash>` ids instead.
+#[test]
+fn degenerate_session_ids_stay_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    for (i, raw) in ["!!!", "???", "日本語のみ"].iter().enumerate() {
+        let payload = json!({"session_id": raw, "prompt": format!("alpha task {i}")});
+        let (out, rc) = run_hook(
+            &["hook", "claude-code", "prompt"],
+            &payload,
+            &env_pairs(&envs),
+        );
+        assert_eq!(rc, 0, "rc for {raw:?}: out={out}");
+    }
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    let ids: Vec<&str> = events
+        .iter()
+        .filter(|e| e["kind"] == "recommendation")
+        .map(|e| e["session_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 3);
+    for id in &ids {
+        assert!(id.starts_with("unknown-"), "session_id {id}");
+    }
+    let mut sorted = ids.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 3, "degenerate ids must not collide: {ids:?}");
+}
+
+/// Round-13: env-supplied hook paths must be absolute — a relative
+/// SKILL_GRAPH_EVENT_LOG/SKILL_GRAPH_HOOK_STATE/TMPDIR would resolve
+/// against the hook's cwd (the project tree) and drop state there.
+#[test]
+fn relative_hook_env_paths_fall_back_to_tmpdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let envs: Vec<(String, String)> = vec![
+        ("SKILL_GRAPH_ROOTS".to_string(), fixture_roots()),
+        ("TMPDIR".to_string(), tmp.path().to_string_lossy().into()),
+        (
+            "SKILL_GRAPH_EVENT_LOG".to_string(),
+            "relative-events.jsonl".to_string(),
+        ),
+        (
+            "SKILL_GRAPH_HOOK_STATE".to_string(),
+            "relative-state".to_string(),
+        ),
+    ];
+    let payload = json!({"session_id":"s1","prompt":"alpha task"});
+    let (_out, rc) = run_hook(
+        &["hook", "claude-code", "prompt"],
+        &payload,
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0);
+    // Relative values are ignored: the log lands under TMPDIR instead.
+    assert!(tmp.path().join("skill-graph-events.jsonl").exists());
+    assert!(!std::path::Path::new("relative-events.jsonl").exists());
 }

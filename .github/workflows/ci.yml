@@ -2,6 +2,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -14,5 +15,61 @@ jobs:
           toolchain: 1.100.0
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - uses: oven-sh/setup-bun@v2
+      - name: OpenCode plugin bundles
+        # Syntax/bundle check for the embedded plugin source; type
+        # resolution against @opencode/plugin is out of scope here.
+        run: |
+          bun build src/assets/opencode-plugin.ts \
+            --external '@opencode/plugin' \
+            --outfile /tmp/opencode-plugin.js
+      - name: Package versions agree
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re, sys
+          cargo = pathlib.Path("Cargo.toml").read_text()
+          version = re.search(r'^version = "([^"]+)"', cargo, re.M).group(1)
+          paths = [pathlib.Path("plugins/skill-graph/plugin.json")]
+          paths += sorted(pathlib.Path("npm").glob("*/package.json"))
+          bad = [
+              f"{p}: {json.loads(p.read_text()).get('version')} != {version}"
+              for p in paths
+              if json.loads(p.read_text()).get("version") != version
+          ]
+          # optionalDependencies pins must track the release version too:
+          # a stale pin silently resolves npm installs to the old binary.
+          for p in paths:
+              if p.name != "package.json":
+                  continue
+              deps = json.loads(p.read_text()).get("optionalDependencies") or {}
+              stale = {k: v for k, v in deps.items() if v != version}
+              if stale:
+                  bad.append(f"{p}: optionalDependencies not at {version}: {stale}")
+          # The optionalDependencies name set must equal the set of
+          # platform packages that actually ship: a missing or renamed
+          # dep passes every version check but 404s at install time
+          # (#144 r17).
+          meta = json.loads(pathlib.Path("npm/skill-graph/package.json").read_text())
+          dep_names = set((meta.get("optionalDependencies") or {}).keys())
+          pkg_names = {
+              json.loads(p.read_text())["name"]
+              for p in pathlib.Path("npm").glob("skill-graph-*/package.json")
+          }
+          if dep_names != pkg_names:
+              bad.append(
+                  "optionalDependencies "
+                  f"{sorted(dep_names)} != platform packages {sorted(pkg_names)}"
+              )
+          if bad:
+              sys.exit("version mismatch: " + "; ".join(bad))
+          PY
+      - name: Crate contains only intended files
+        run: |
+          cargo package --list --allow-dirty | sort > /tmp/crate-files.txt
+          if grep -Eq '^(tests|evals|npm|docs|plugins|adapters|experiments|\.github|\.agents|\.claude|\.devin)/' /tmp/crate-files.txt; then
+            echo "unexpected files in crate package:" >&2
+            grep -E '^(tests|evals|npm|docs|plugins|adapters|experiments|\.github|\.agents|\.claude|\.devin)/' /tmp/crate-files.txt >&2
+            exit 1
+          fi

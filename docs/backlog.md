@@ -1,6 +1,6 @@
 # Issue Drafts
 
-GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C07 / X01–X04 / P01 / P02 / R01–R03 を登録・完了済み（R03 = Issue #50、v0.1.0 候補確定）。v0.1.0 は `release-0-1-0` @ `80f8424` を実験的初期リリース候補とする。O01 / O02 / I01 は発動条件未達のため deferred を維持する。v0.2.0 の要求は GitHub Issue を正本とし、下表は対応関係である。
+GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C07 / X01–X04 / P01 / P02 / R01–R03 を登録・完了済み（R03 = Issue #50、v0.1.0 候補確定）。v0.1.0 は `release-0-1-0` @ `80f8424` を実験的初期リリース候補とする。v0.2.0 の要求は GitHub Issue を正本とし、下表は対応関係である。O01 / O02 / I01 の最終判定は v1.0.0 spec §6 を正本とする（O02 は採用済み、O01 / I01 は不採用・対象外が確定）。
 
 ## v0.1.0 (release-0-1-0) — 完了
 
@@ -35,7 +35,7 @@ GitHub repository `rebuildup/skill-graph` にて E01–E03 / S01–S04 / C01–C
 | #80 / W05 | project-init / dotfiles / pc-setup 疎結合統合設計 | #77 |
 | #81 / W06 | 実運用観測パイロットと継続改善サイクル | #77, #79 |
 
-O01 / O02 / I01 は v0.2.0/v0.3.0 でも deferred を維持（永続キャッシュ・MCP・高度なグラフ処理・上流標準化は効果実証まで着手しない）。
+O01 / I01 は v0.2.0/v0.3.0 では deferred を維持したが、v1.0.0 spec §6 で最終判定が確定した: O01 永続キャッシュは実測性能（warm recommend p95 ≈0.7ms / process p95 ≈13ms @500 skills）を根拠に**不採用**、I01 上流標準化は pilot 実績不足を根拠に**v1.0.0 対象外（確定判定）**。O02 MCP は**採用**され、ADR-0005 と v1.0.0 spec §1 に基づき `skill-graph mcp`（stdio・read-only 3 tools）として v0.4.0 で実装済み。
 
 ## v0.1.0 draft→issue 対応（履歴）
 
@@ -56,6 +56,6 @@ O01 / O02 / I01 は v0.2.0/v0.3.0 でも deferred を維持（永続キャッシ
 | E03 | 比較評価とMVP方式の確定 | X01–X03 | 採用方式、残課題、製品化 Issue を決定 |
 | P01 | CLI・標準 Plugin 配布 | E03 (#13) | Issue #28: Agent Plugins v1.0.0 準拠 package を検証 |
 | P02 | 必要なランタイム Adapter の製品化 | E03 (#13), P01 (#28) | Issue #29: 実測で必要性が確認された adapter のみ実装 |
-| O01 | 永続キャッシュ | 性能不足が確認された場合 | cache key、無効化、意味同値性を検証 |
-| O02 | MCP 連携 | 利用価値が確認された場合 | read-only tool surface と権限境界を設計 |
-| I01 | 相互運用仕様と上流標準化 | 実装・運用実績確立後 | 実装実績を根拠に提案 |
+| O01 | 永続キャッシュ | ~~性能不足が確認された場合~~ → v1.0.0 spec §6 で**不採用**確定 | warm/process p95 が目標内（evidence 2026-11-25-c03）。process 内 memoization のみ（MCP graph cache） |
+| O02 | MCP 連携 | ~~利用価値が確認された場合~~ → **採用**（ADR-0005 / v1.0.0 spec §1） | `skill-graph mcp` として実装済み: stdio・read-only `recommend`/`discover`/`resolve`、観測イベント非発行 |
+| I01 | 相互運用仕様と上流標準化 | 実装・運用実績確立後 → v1.0.0 spec §6 で**対象外（確定判定）** | pilot 実績が前提条件。契約は `contracts/v1` と Agent Plugins v1.0.0 準拠で配布済み |

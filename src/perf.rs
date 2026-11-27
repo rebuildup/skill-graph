@@ -18,6 +18,22 @@ pub fn run(sizes: &[usize], iterations: usize) -> Result<Value, String> {
     if iterations == 0 {
         return Err("perf iterations must be > 0".to_string());
     }
+    if sizes.len() > 16 || sizes.iter().any(|&s| s > 10_000) {
+        return Err("perf sizes are capped at 16 entries of <= 10000".to_string());
+    }
+    if iterations > 1_000 {
+        return Err("perf iterations are capped at 1000".to_string());
+    }
+    // Bound total work: corpus generation is O(sum of sizes) skill
+    // parses and benchmarking is O(sizes × iterations) recommend()
+    // calls over up-to-10k-skill graphs. Without a product cap the
+    // flags alone permit ~160k recommendations.
+    if sizes.iter().sum::<usize>() > 50_000 {
+        return Err("perf total corpus capped at 50000 skills".to_string());
+    }
+    if sizes.len().saturating_mul(iterations) > 2_000 {
+        return Err("perf total recommend calls capped at 2000 (sizes × iterations)".to_string());
+    }
     let mut results = Vec::new();
     for &size in sizes {
         if size == 0 {
@@ -30,8 +46,20 @@ pub fn run(sizes: &[usize], iterations: usize) -> Result<Value, String> {
 
 fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
     let root = corpus_root(size)?;
+    // corpus_root keep()s the TempDir, so any error below would leak the
+    // corpus — remove it on the failure path explicitly.
+    match run_size_inner(&root, size, iterations) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let _ = fs::remove_dir_all(root);
+            Err(err)
+        }
+    }
+}
+
+fn run_size_inner(root: &PathBuf, size: usize, iterations: usize) -> Result<Value, String> {
     let cold_started = Instant::now();
-    let discovery = discover(std::slice::from_ref(&root));
+    let discovery = discover(std::slice::from_ref(root));
     let cold_discover = cold_started.elapsed();
     let build_started = Instant::now();
     let graph = build(discovery);
@@ -57,6 +85,8 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
             .args([
                 "recommend",
                 QUERY,
+                "--context",
+                CONTEXT,
                 "--root",
                 root_arg,
                 "--max",
@@ -64,6 +94,9 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
                 "--format",
                 "json",
             ])
+            // resolve_roots gives SKILL_GRAPH_ROOTS precedence over
+            // --root; a set env var would silently measure the wrong corpus.
+            .env_remove("SKILL_GRAPH_ROOTS")
             .output()
             .map_err(|err| format!("spawn perf cli: {err}"))?;
         if !output.status.success() {
@@ -76,7 +109,7 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
         std::hint::black_box(&output.stdout);
     }
 
-    let cleanup_ok = fs::remove_dir_all(&root).is_ok();
+    let cleanup_ok = fs::remove_dir_all(root).is_ok();
     let recommended_count = recommend(&graph, QUERY, CONTEXT, 5).len();
 
     Ok(json!({
@@ -96,11 +129,15 @@ fn run_size(size: usize, iterations: usize) -> Result<Value, String> {
 }
 
 fn corpus_root(size: usize) -> Result<PathBuf, String> {
-    let root = std::env::temp_dir().join(format!("skill-graph-perf-{}-{size}", std::process::id()));
-    if root.exists() {
-        fs::remove_dir_all(&root).map_err(|err| err.to_string())?;
-    }
-    fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+    // Private tempdir: a predictable shared-/tmp path would let another
+    // local user pre-plant SKILL.md symlinks and redirect the writes.
+    let tmp = tempfile::Builder::new()
+        .prefix("skill-graph-perf-")
+        .tempdir()
+        .map_err(|e| e.to_string())?;
+    // Keep the TempDir guard until success: keep()ing up front would leak
+    // the corpus into /tmp when corpus generation fails partway.
+    let root = tmp.path();
     for index in 0..size {
         let name = format!("perf-skill-{index:04}");
         let description = if index == 0 {
@@ -125,7 +162,7 @@ fn corpus_root(size: usize) -> Result<PathBuf, String> {
         fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
         fs::write(dir.join("SKILL.md"), content).map_err(|err| err.to_string())?;
     }
-    Ok(root)
+    Ok(tmp.keep())
 }
 
 fn percentile(samples: &[Duration], p: f64) -> f64 {

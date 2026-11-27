@@ -15,11 +15,16 @@ struct Case {
     #[serde(default)]
     context: String,
     skill_root: PathBuf,
-    #[serde(default)]
+    // Bounded during deserialization: a single ~64 MiB dataset line of
+    // `""` elements would otherwise materialize ~21M Strings (~1 GB
+    // transient) before the MAX_EVAL_EXPECTED check runs (#144 r20).
+    // The visitor allows one element past the cap so the post-check
+    // below still reports the friendly per-case error.
+    #[serde(default, deserialize_with = "de_bounded_names")]
     expected_required: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bounded_names")]
     expected_optional: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_bounded_names")]
     forbidden: Vec<String>,
     #[serde(default)]
     timing: Option<String>,
@@ -29,9 +34,89 @@ struct Case {
     case_kind: Option<String>,
 }
 
-pub fn run(dataset: &Path) -> Result<Value, String> {
-    let text =
-        fs::read_to_string(dataset).map_err(|e| format!("read {}: {e}", dataset.display()))?;
+/// Deserialize a skill-name list with bounded retention: errors once
+/// `MAX_EVAL_EXPECTED + 1` elements have been seen, so a hostile line
+/// cannot amplify one 64 MiB input line into ~1 GB of `String`s. The
+/// `+1` slack lets the caller's post-check still fire for exactly
+/// `MAX_EVAL_EXPECTED + 1`-length lists.
+fn de_bounded_names<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct NamesVisitor;
+    impl<'de> serde::de::Visitor<'de> for NamesVisitor {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a list of skill names")
+        }
+        fn visit_seq<A>(self, mut seq: A) -> Result<Vec<String>, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut names = Vec::new();
+            while let Some(name) = seq.next_element::<String>()? {
+                if names.len() > MAX_EVAL_EXPECTED {
+                    return Err(serde::de::Error::custom(format!(
+                        "name list exceeds {} entries",
+                        MAX_EVAL_EXPECTED
+                    )));
+                }
+                names.push(name);
+            }
+            Ok(names)
+        }
+    }
+    deserializer.deserialize_seq(NamesVisitor)
+}
+
+/// Dataset bound: `bench` is a maintainer-invoked dev tool, but an
+/// unbounded JSONL read is the one remaining uncapped CLI input — a
+/// multi-GB or hostile dataset would OOM the process (#144 r17).
+const MAX_DATASET_BYTES: u64 = 64 * 1024 * 1024;
+/// Case-count bound: the byte cap limits input size, not case count —
+/// ~1.5M minimal cases would each run `recommend` and retain a result
+/// object, hanging or OOMing the run (#144 r18).
+const MAX_EVAL_CASES: usize = 10_000;
+/// Distinct `skill_root` graphs retained at once. Each Graph can itself
+/// be large, and a dataset naming thousands of roots would otherwise
+/// build and retain all of them simultaneously (#144 r18).
+const MAX_EVAL_GRAPHS: usize = 32;
+/// Per-case expected/forbidden list bound: hits are computed against at
+/// most `fetch` recommended names, so longer lists only burn CPU.
+const MAX_EVAL_EXPECTED: usize = 1024;
+/// Recommendation cutoff bound: `max` flows into `fetch` and the
+/// per-case `recommended` name list, so an unbounded `--max` would
+/// materialize ~#skills names × #cases result entries (#144 r19).
+const MAX_EVAL_MAX: usize = 64;
+/// Total graph builds across the whole run. The LRU bounds *retained*
+/// graphs, but a dataset naming a fresh `skill_root` per case still
+/// pays a full discover+build per case — 10k hostile builds is a
+/// hang, not just memory (#144 r19).
+const MAX_EVAL_BUILDS: usize = 256;
+/// Total discovery-error strings retained across all builds: each
+/// build can contribute ~1k errors, so builds × errors is unbounded
+/// without a run-level cap (#144 r19).
+const MAX_EVAL_DISCOVERY_ERRORS: usize = 4096;
+
+/// `max` is the primary recommendation cutoff scored by `required_recall`.
+/// It defaults to the top-N the runtime actually injects (hook/plugin
+/// surface top-3); recall@3 and recall@5 are additionally reported from
+/// the same `recommend` pass so metric drift stays visible.
+pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
+    use std::io::Read;
+    let max = max.min(MAX_EVAL_MAX);
+    let file = fs::File::open(dataset).map_err(|e| format!("read {}: {e}", dataset.display()))?;
+    let mut text = String::new();
+    file.take(MAX_DATASET_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("read {}: {e}", dataset.display()))?;
+    if text.len() as u64 > MAX_DATASET_BYTES {
+        return Err(format!(
+            "{}: dataset exceeds {} bytes",
+            dataset.display(),
+            MAX_DATASET_BYTES
+        ));
+    }
     let mut cases = Vec::new();
     for (line_no, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
@@ -39,14 +124,62 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         }
         let case: Case = serde_json::from_str(line)
             .map_err(|e| format!("{}:{}: {e}", dataset.display(), line_no + 1))?;
+        for (what, list) in [
+            ("expected_required", &case.expected_required),
+            ("expected_optional", &case.expected_optional),
+            ("forbidden", &case.forbidden),
+        ] {
+            if list.len() > MAX_EVAL_EXPECTED {
+                return Err(format!(
+                    "case {}: {what} exceeds {} entries",
+                    case.id, MAX_EVAL_EXPECTED
+                ));
+            }
+        }
+        if cases.len() >= MAX_EVAL_CASES {
+            return Err(format!(
+                "{}: dataset exceeds {} cases",
+                dataset.display(),
+                MAX_EVAL_CASES
+            ));
+        }
         cases.push(case);
     }
 
+    // `skill_root` is repository-relative per evals/dataset/schema.md.
+    // Resolve it against the repo root (nearest ancestor of the dataset
+    // containing Cargo.toml), falling back to the dataset's parent —
+    // never silently against an arbitrary cwd. Absolutize first: a
+    // relative dataset path would otherwise stop the ancestor walk at
+    // the dataset directory itself.
+    let dataset_abs = std::path::absolute(dataset).unwrap_or_else(|_| dataset.to_path_buf());
+    let repo_root = dataset_abs
+        .parent()
+        .and_then(|d| d.ancestors().find(|a| a.join("Cargo.toml").exists()))
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dataset_abs.parent().unwrap_or(Path::new(".")).to_path_buf());
+
+    // Canonical repo root for the containment check below: a committed
+    // symlink inside the repo could otherwise point skill_root outside
+    // it while passing the lexical checks.
+    let repo_canon = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+
     let mut graphs: HashMap<PathBuf, crate::resolver::Graph> = HashMap::new();
+    // Insertion-ordered LRU for the graph cache: datasets cluster cases
+    // by root, so the working set stays tiny while the retained count
+    // stays bounded (#144 r18).
+    let mut graph_lru: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
+    let mut discovery_errors: Vec<String> = Vec::new();
+    let mut discovery_errors_capped = false;
+    let mut graph_builds = 0usize;
     let mut results = Vec::new();
     let mut totals = json!({
         "cases": cases.len(),
         "required_hits": 0,
+        "required_hits_at3": 0,
+        "required_hits_at5": 0,
         "required_total": 0,
         "forbidden_hits": 0,
         "optional_hits": 0,
@@ -54,48 +187,113 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
         "recommended_total": 0,
         "empty_recommendations": 0,
         "elapsed_ms": 0,
+        "max": max,
     });
     let started = Instant::now();
 
     for case in cases {
-        let cwd_root = std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(&case.skill_root);
-        let root = if case.skill_root.is_absolute() {
-            case.skill_root.clone()
-        } else if cwd_root.exists() {
-            cwd_root
+        // Dataset contract (evals/dataset/schema.md): skill_root stays
+        // inside the repository — no absolute paths, no `..` segments.
+        // A violating case is a dataset bug; fail loudly rather than
+        // scanning outside the repo.
+        if case.skill_root.is_absolute()
+            || case
+                .skill_root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!(
+                "case {}: skill_root must be a repository-relative path without '..': {}",
+                case.id,
+                case.skill_root.display()
+            ));
+        }
+        let root = repo_root.join(&case.skill_root);
+        // Lexical checks pass for a symlinked path; resolve it so a
+        // repo-committed link cannot smuggle an outside-repo scan.
+        // A root that does not exist falls through — discovery reports
+        // it as an error either way.
+        if let Ok(canon) = root.canonicalize()
+            && !canon.starts_with(&repo_canon)
+        {
+            return Err(format!(
+                "case {}: skill_root resolves outside the repository: {}",
+                case.id,
+                case.skill_root.display()
+            ));
+        }
+        if graphs.contains_key(&root) {
+            // Refresh recency: move the key to the back of the LRU.
+            if let Some(pos) = graph_lru.iter().position(|p| p == &root) {
+                graph_lru.remove(pos);
+            }
+            graph_lru.push_back(root.clone());
         } else {
-            dataset
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join(case.skill_root)
-        };
-        if !graphs.contains_key(&root) {
-            graphs.insert(root.clone(), build(discover(std::slice::from_ref(&root))));
+            if graphs.len() >= MAX_EVAL_GRAPHS
+                && let Some(oldest) = graph_lru.pop_front()
+            {
+                graphs.remove(&oldest);
+            }
+            // The LRU bounds retained graphs, not total work: cap the
+            // number of discover+build passes a dataset can trigger —
+            // including rebuilds after LRU eviction, so the count is
+            // builds, not distinct roots (#144 r19).
+            if graph_builds >= MAX_EVAL_BUILDS {
+                return Err(format!(
+                    "dataset triggers more than {MAX_EVAL_BUILDS} graph builds"
+                ));
+            }
+            graph_builds += 1;
+            let discovery = discover(std::slice::from_ref(&root));
+            if !discovery_errors_capped {
+                let room = MAX_EVAL_DISCOVERY_ERRORS.saturating_sub(discovery_errors.len());
+                discovery_errors.extend(discovery.errors.iter().take(room).cloned());
+                if discovery.errors.len() > room {
+                    discovery_errors_capped = true;
+                }
+            }
+            graphs.insert(root.clone(), build(discovery));
+            graph_lru.push_back(root.clone());
         }
         let graph = graphs
             .get(&root)
             .ok_or_else(|| "missing graph".to_string())?;
-        let recs = recommend(graph, &case.query, &case.context, 5);
-        let names: Vec<String> = recs.iter().map(|r| r.skill.name.clone()).collect();
+        // One recommend() pass deep enough for the primary cutoff and the
+        // diagnostic recall@3/recall@5 cutoffs; ranking is a prefix, so
+        // slicing names_all reproduces each cutoff exactly.
+        let fetch = max.max(5);
+        let recs = recommend(graph, &case.query, &case.context, fetch);
+        let names_all: Vec<String> = recs.iter().map(|r| r.skill.name.clone()).collect();
+        let names: Vec<String> = names_all.iter().take(max).cloned().collect();
+        let hits_at = |cutoff: usize| -> usize {
+            case.expected_required
+                .iter()
+                .filter(|n| names_all.iter().take(cutoff).any(|m| m == *n))
+                .count()
+        };
         let required_hits = case
             .expected_required
             .iter()
             .filter(|n| names.contains(n))
             .count();
+        let required_hits_at3 = hits_at(3);
+        let required_hits_at5 = hits_at(5);
         let forbidden_hits = case.forbidden.iter().filter(|n| names.contains(n)).count();
         let optional_hits = case
             .expected_optional
             .iter()
             .filter(|n| names.contains(n))
             .count();
-        if recs.is_empty() {
+        if names.is_empty() {
             totals["empty_recommendations"] =
                 json!(totals["empty_recommendations"].as_u64().unwrap_or(0) + 1);
         }
         totals["required_hits"] =
             json!(totals["required_hits"].as_u64().unwrap_or(0) + required_hits as u64);
+        totals["required_hits_at3"] =
+            json!(totals["required_hits_at3"].as_u64().unwrap_or(0) + required_hits_at3 as u64);
+        totals["required_hits_at5"] =
+            json!(totals["required_hits_at5"].as_u64().unwrap_or(0) + required_hits_at5 as u64);
         totals["required_total"] = json!(
             totals["required_total"].as_u64().unwrap_or(0) + case.expected_required.len() as u64
         );
@@ -114,6 +312,8 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
             "recommended": names,
             "recommended_count": recommended_count,
             "required_hits": required_hits,
+            "required_hits_at3": required_hits_at3,
+            "required_hits_at5": required_hits_at5,
             "required_total": case.expected_required.len(),
             "forbidden_hits": forbidden_hits,
             "optional_hits": optional_hits,
@@ -131,6 +331,16 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     } else {
         required_hits as f64 / required_total as f64
     });
+    for cutoff in [3usize, 5usize] {
+        let hits = totals[format!("required_hits_at{cutoff}")]
+            .as_u64()
+            .unwrap_or(0);
+        totals[format!("required_recall_at{cutoff}")] = json!(if required_total == 0 {
+            1.0
+        } else {
+            hits as f64 / required_total as f64
+        });
+    }
     let recommended_total = totals["recommended_total"].as_u64().unwrap_or(0);
     let optional_hits = totals["optional_hits"].as_u64().unwrap_or(0);
     totals["precision_required"] = json!(if recommended_total == 0 {
@@ -145,5 +355,14 @@ pub fn run(dataset: &Path) -> Result<Value, String> {
     });
     totals["cases"] = json!(results.len());
 
-    Ok(json!({ "summary": totals, "cases": results }))
+    let mut out = json!({ "summary": totals, "cases": results });
+    if !discovery_errors.is_empty() || discovery_errors_capped {
+        if discovery_errors_capped {
+            discovery_errors.push(format!(
+                "discovery_errors truncated at {MAX_EVAL_DISCOVERY_ERRORS}"
+            ));
+        }
+        out["discovery_errors"] = json!(discovery_errors);
+    }
+    Ok(out)
 }

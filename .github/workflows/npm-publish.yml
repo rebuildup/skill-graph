@@ -33,6 +33,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.100.0
+      - name: Verify tag passes tests
+        run: cargo test --locked
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -43,6 +48,19 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
         run: |
           tag="${INPUT_TAG:-$REF_NAME}"
+          # Fail fast on malformed or nonexistent tags before the
+          # release-asset wait loop.
+          [[ "$tag" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $tag" >&2; exit 1; }
+          # Peel annotated tags to the commit: refs/tags/<tag> alone
+          # resolves to the tag object for annotated tags, which would
+          # never equal HEAD's commit SHA.
+          tag_sha="$(git rev-parse --verify "refs/tags/$tag^{commit}")" || { echo "tag $tag does not exist" >&2; exit 1; }
+          # The checked-out ref must actually be this tag: checkout's
+          # ref resolution can prefer a same-named branch over the tag,
+          # which would publish the branch under the tag's provenance
+          # (#144 r19).
+          [ "$(git rev-parse HEAD)" = "$tag_sha" ] || {
+            echo "checked-out HEAD is not tag $tag" >&2; exit 1; }
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
       - name: Verify manifest versions match tag
         run: |
@@ -56,6 +74,30 @@ jobs:
               exit 1
             fi
           done
+          pver="$(node -p "require('./plugins/skill-graph/plugin.json').version")"
+          [ "$pver" = "$want" ] || {
+            echo "plugins/skill-graph/plugin.json is $pver but tag is $want" >&2
+            exit 1
+          }
+          # Cargo.toml parity too: cross-compiled payloads cannot be
+          # executed here, so a wrong-version binary inside a tarball
+          # would ship undetected (#144 r17).
+          cver="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
+          [ "$cver" = "$want" ] || {
+            echo "Cargo.toml is $cver but tag is $want" >&2
+            exit 1
+          }
+          # The metapackage's optionalDependencies must pin the release
+          # version — a stale pin silently ships the previous binary.
+          stale="$(node -e "
+            const d = require('./npm/skill-graph/package.json').optionalDependencies || {};
+            const bad = Object.entries(d).filter(([,v]) => v !== process.argv[1]);
+            if (bad.length) console.log(bad.map(([k,v]) => k + '@' + v).join(','));
+          " "$want")"
+          [ -z "$stale" ] || {
+            echo "optionalDependencies not at $want: $stale" >&2
+            exit 1
+          }
       - name: Download release binaries
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,7 +106,8 @@ jobs:
           # release assets to appear.
           mkdir -p dist
           for i in $(seq 1 60); do
-            if gh release download "$RELEASE_TAG" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber 2>/dev/null; then
+            if gh release download "$RELEASE_TAG" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber 2>/dev/null \
+              && gh release download "$RELEASE_TAG" --pattern 'sha256sums.txt' --dir dist --clobber 2>/dev/null; then
               break
             fi
             if [ "$i" = "60" ]; then
@@ -91,10 +134,29 @@ jobs:
             chmod +x "$pkg/bin/skill-graph"
             rm -rf /tmp/sg-pkg
             if [ "$target" = "linux-x64" ]; then
-              "$pkg/bin/skill-graph" --version
+              got="$("$pkg/bin/skill-graph" --version)"
+              want="${RELEASE_TAG#v}"
+              [[ "$got" == *"$want"* ]] || {
+                echo "version mismatch: binary reports '$got', expected $want" >&2
+                exit 1
+              }
             else
-              # cross-compiled binaries cannot exec on this runner
-              file "$pkg/bin/skill-graph" | grep -q .
+              # cross-compiled binaries cannot exec on this runner;
+              # verify the object format AND architecture match the
+              # target rather than trusting any non-empty `file` output —
+              # an x86-64 ELF inside linux-arm64 still contains 'ELF'.
+              case "$target" in
+                linux-arm64)
+                  file "$pkg/bin/skill-graph" | grep -q 'ELF' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'aarch64' ;;
+                darwin-x64)
+                  file "$pkg/bin/skill-graph" | grep -q 'Mach-O' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'x86_64' ;;
+                darwin-arm64)
+                  file "$pkg/bin/skill-graph" | grep -q 'Mach-O' \
+                    && file "$pkg/bin/skill-graph" | grep -q 'arm64' ;;
+                *) echo "unknown npm target: $target" >&2; exit 1 ;;
+              esac
             fi
           done <<< "$TARGETS"
       - name: Bundle portable plugin into metapackage
@@ -118,7 +180,7 @@ jobs:
               echo "$name@$ver already published, skipping"
               continue
             fi
-            npm publish "$pkg" --access public --provenance
+            npm publish "./$pkg" --access public --provenance
           done <<< "$TARGETS"
       - name: Publish metapackage
         env:
@@ -130,4 +192,4 @@ jobs:
             echo "@rebuildup/skill-graph@$ver already published, skipping"
             exit 0
           fi
-          npm publish npm/skill-graph --access public --provenance
+          npm publish ./npm/skill-graph --access public --provenance

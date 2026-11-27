@@ -1,20 +1,66 @@
 use crate::model::{LinkKind, Recommendation};
 use crate::resolver::Graph;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 struct Evidence {
     direct: f64,
     weak: f64,
     necessity: f64,
-    name_hits: Vec<(String, usize)>,
-    description_hits: Vec<(String, usize)>,
-    context_hits: Vec<(String, usize)>,
+    // Hit terms as indices into `query_terms` (name/description hits)
+    // and `context_terms` (context hits): storing the term strings
+    // themselves would retain up to ~3xMAX_RECOMMEND_TERMS cloned
+    // Strings per signal skill simultaneously (#144 r17). Document
+    // frequency is attached later, computed just for the union of hit
+    // terms rather than every query term.
+    name_hits: Vec<u32>,
+    description_hits: Vec<u32>,
+    context_hits: Vec<u32>,
     reasons: Vec<String>,
 }
 
+impl Evidence {
+    fn empty() -> Self {
+        Evidence {
+            direct: 0.0,
+            weak: 0.0,
+            necessity: 0.0,
+            name_hits: Vec::new(),
+            description_hits: Vec::new(),
+            context_hits: Vec::new(),
+            reasons: Vec::new(),
+        }
+    }
+}
+
+// Agent-controlled input (hook stdin, --query-stdin, MCP args) must not
+// turn term extraction into unbounded work: cap raw text and unique terms.
+const MAX_RECOMMEND_INPUT_CHARS: usize = 32 * 1024;
+const MAX_RECOMMEND_TERMS: usize = 1024;
+
+/// Global term×byte work budget for the matching/admission phase.
+/// Input caps bound query size and corpus size independently, but
+/// skills × terms × field_bytes can still reach hundreds of GB of
+/// substring scans before admission or the body budget is reached.
+/// Past this budget later skills are skipped in deterministic index
+/// order, uncomputed df terms count as non-rare, and glossary
+/// expansion is skipped corpus-wide — under-admission on absurd
+/// inputs beats a hang (#144 round-10).
+const MAX_MATCH_TERM_WORK: usize = 1024 * 1024 * 1024;
+
 pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<Recommendation> {
-    let query = query.trim().to_lowercase();
-    let context = context.trim().to_lowercase();
+    let query = query
+        .trim()
+        .chars()
+        .take(MAX_RECOMMEND_INPUT_CHARS)
+        .collect::<String>()
+        .to_lowercase();
+    let context = context
+        .trim()
+        .chars()
+        .take(MAX_RECOMMEND_INPUT_CHARS)
+        .collect::<String>()
+        .to_lowercase();
     if query.is_empty() && context.is_empty() {
         return Vec::new();
     }
@@ -23,30 +69,28 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // substring they were derived from, so admission can tell independent
     // evidence from one substring's bigram+gloss cluster (#78).
     let query_tagged = terms_tagged(&query);
+    let query_tagged: Vec<(String, Rc<str>)> =
+        query_tagged.into_iter().take(MAX_RECOMMEND_TERMS).collect();
     let query_terms: Vec<String> = query_tagged.iter().map(|(t, _)| t.clone()).collect();
     let query_sources = term_sources(&query_tagged);
-    let context_terms = terms(&context);
+    // Context terms carry provenance too: a single CJK run's bigram
+    // cluster must not satisfy context admission by itself, same rule
+    // as description admission (#144 round-10).
+    let context_tagged: Vec<(String, Rc<str>)> = terms_tagged(&context)
+        .into_iter()
+        .take(MAX_RECOMMEND_TERMS)
+        .collect();
+    let context_terms: Vec<String> = context_tagged.iter().map(|(t, _)| t.clone()).collect();
+    let context_sources = term_sources(&context_tagged);
+    // Three lowercased corpus-text copies are retained per call
+    // (names, base descriptions, expanded descriptions — ~3x corpus
+    // description bytes, worst ~150MB on a max corpus). They are
+    // outside every documented work budget but bounded by discovery
+    // caps; this dominates small-query latency on max corpora (#144 r17).
     let skill_names: Vec<String> = graph
         .skills
         .iter()
         .map(|skill| skill.name.to_lowercase())
-        .collect();
-    // Match text for description-level evidence: the description plus any
-    // declared `keywords` (e.g. translations or aliases). Keywords are
-    // opt-in frontmatter, so corpus df stays honest. CJK substrings are
-    // additionally expanded through the built-in glossary so Japanese
-    // descriptions remain reachable from English query terms (#78).
-    let skill_descriptions: Vec<String> = graph
-        .skills
-        .iter()
-        .map(|skill| {
-            let mut text = skill.description.to_lowercase();
-            for keyword in &skill.keywords {
-                text.push(' ');
-                text.push_str(&keyword.to_lowercase());
-            }
-            expand_gloss(&text)
-        })
         .collect();
     // Unexpanded description text: context-level admission counts hits here
     // only, so glossary expansion cannot inflate the weakest signal (#78).
@@ -62,14 +106,31 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             text
         })
         .collect();
-    // Body text gets the same glossary expansion so English query terms can
-    // reach Japanese-heavy skill bodies. Expansion is appended, never
-    // rewritten, so original text still matches verbatim.
-    let skill_bodies: Vec<String> = graph
-        .skills
-        .iter()
-        .map(|skill| expand_gloss(&skill.body_text.to_lowercase()))
-        .collect();
+    // Glossary expansion costs ~|GLOSS| substring scans per CJK-containing
+    // description; on a max-size corpus that alone can dwarf the match
+    // budget. Estimate first and degrade uniformly (literal text only)
+    // rather than hanging or expanding an arbitrary prefix.
+    let skill_descriptions: Vec<String> = {
+        // gloss_terms scans every GLOSS key for ANY non-ASCII text
+        // (its fast path is is_ascii, not is_cjk) — count all of it.
+        let cjk_work: usize = skill_descriptions_base
+            .iter()
+            .filter(|d| !d.is_ascii())
+            .map(|d| d.len().saturating_mul(GLOSS.len()))
+            .fold(0usize, usize::saturating_add);
+        if cjk_work <= MAX_MATCH_TERM_WORK {
+            skill_descriptions_base
+                .iter()
+                .map(|d| expand_gloss(d))
+                .collect()
+        } else {
+            skill_descriptions_base.clone()
+        }
+    };
+    // Body text is expanded lazily inside the admitted-only loop below:
+    // expand_gloss runs ~290 substring scans per body and bodies can be
+    // ~1 MiB each, so building this for every corpus skill up front would
+    // dominate recommend() even though non-admitted bodies are never read.
     // Recommendation identity is the skill name: duplicate installs of the
     // same skill across roots collapse to one candidate. The representative is
     // the first copy without a parse error (discovery order is deterministic).
@@ -85,20 +146,104 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     }
     let mut candidates: Vec<usize> = rep_of_name.values().copied().collect();
     candidates.sort_unstable();
-
-    let document_frequency = document_frequency(
-        graph,
-        &candidates,
-        &skill_names,
-        &skill_descriptions,
-        query_terms.iter().chain(context_terms.iter()),
-    );
+    // "Rare term" bound for admission: a term stays specific evidence while
+    // it appears in at most ~10% of distinct skill names, with a floor of 2.
+    // The floor keeps a single same-domain addition from flipping admission
+    // (the df==1 -> 2 failure reported in #170); the relative cap keeps the
+    // bound meaningful as the corpus grows. Ranking is unaffected — scores
+    // never consulted df, so rarer terms are not promoted, only gated.
+    let df_bound = (candidates.len() / 10).max(2);
 
     let mut infos: Vec<Option<Evidence>> = Vec::new();
     infos.resize_with(graph.skills.len(), || None);
+    let mut match_work = 0usize;
+    let mut budget_noted = false;
+    // field_score's whitespace-free whole-query bonus costs O(field
+    // bytes) per scored field — name once for `query`, description once
+    // for `query` and once for `context` — not O(query length). The
+    // per-link whole-query scans are already covered by `link_bytes`.
+    let query_whole = !query.contains(char::is_whitespace);
+    let context_whole = !context.contains(char::is_whitespace);
+    // Exact needle bytes for the per-term preprocessing charge: CJK
+    // bigrams and glossary terms are NOT substrings of the query, so
+    // query.len() undercounts them (#144 r16).
+    let query_term_bytes: usize = query_terms.iter().map(|t| t.len()).sum();
+    let context_term_bytes: usize = context_terms.iter().map(|t| t.len()).sum();
 
     for (index, skill) in graph.skills.iter().enumerate() {
         if skill.parse_error.is_some() {
+            continue;
+        }
+        // Charge this skill's estimated term×byte scan cost against the
+        // global budget before matching anything: name+description are
+        // scanned once per query term and once per context term for
+        // scoring AND again for the hit lists, and every link target is
+        // matched against the whole query. Skills past the budget keep
+        // `infos[index] = None`, so direct admission is skipped —
+        // deterministic index order, same degrade direction as the body
+        // budget. Explicit `requires` propagation below can still admit
+        // such a skill structurally (bounded link iteration only).
+        let scan_terms = query_terms.len() + context_terms.len();
+        let link_bytes: usize = skill.links.iter().map(|l| l.target.len()).sum();
+        // Whole-query matches are O(field bytes) needle work per call
+        // and are NOT covered by the per-term charge: field_score runs
+        // a whitespace-free `term_matches(field, query)` bonus on the
+        // name and description fields, plus one on the description for
+        // `context`. Per-link whole-query scans cost O(target bytes) =
+        // `link_bytes`, already counted.
+        let desc_len = skill_descriptions[index].len();
+        let whole_query_work = (if query_whole {
+            skill_names[index].len() + desc_len
+        } else {
+            0
+        })
+        .saturating_add(if context_whole { desc_len } else { 0 });
+        // Every term_matches/matches_query call builds a Two-Way
+        // searcher over its needle — O(needle len) preprocessing per
+        // call ON TOP of the O(field) scan. Per skill the main loop
+        // issues ~4 query-term and ~2 context-term matches plus one
+        // whole-query bonus per whitespace-free field_score call, and
+        // matches_query once per link target (#144 r15).
+        let preprocess_work = skill
+            .links
+            .len()
+            .saturating_mul(query.len())
+            .saturating_add(query_term_bytes.saturating_mul(4))
+            .saturating_add(context_term_bytes.saturating_mul(2))
+            .saturating_add(if query_whole {
+                query.len().saturating_mul(2)
+            } else {
+                0
+            })
+            .saturating_add(if context_whole { context.len() } else { 0 });
+        // matches_query lowercases non-lowercase-ASCII targets before
+        // scanning — the allocation and the scan of the lowered text
+        // can each reach ~3x target.len() (#144 r16).
+        let skill_work = scan_terms
+            .saturating_mul(2)
+            .saturating_mul(skill_names[index].len() + skill_descriptions[index].len())
+            .saturating_add(link_bytes.saturating_mul(3))
+            .saturating_add(whole_query_work)
+            .saturating_add(preprocess_work);
+        match_work = match_work.saturating_add(skill_work);
+        if match_work > MAX_MATCH_TERM_WORK {
+            // An exact name match is the strongest possible signal and
+            // must not be silently dropped by budget exhaustion: admit
+            // it with minimal evidence instead of scanning fields. Only
+            // skills whose whole name equals the query qualify, so the
+            // number of exemptions is bounded by duplicate-name copies.
+            if !query.is_empty() && skill_names[index] == query {
+                infos[index] = Some(Evidence {
+                    direct: 20.0,
+                    reasons: vec!["exact name match".to_string()],
+                    ..Evidence::empty()
+                });
+            } else if !budget_noted {
+                budget_noted = true;
+                crate::cli::write_stderr_line(
+                    "skill-graph: match work budget exhausted; remaining skills skipped",
+                );
+            }
             continue;
         }
         let name_lower = &skill_names[index];
@@ -110,10 +255,11 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         let direct = field_score(
             &query,
             &query_terms,
-            &skill.name,
+            &skill_names[index],
             20.0,
             "name",
             &mut direct_reasons,
+            query_whole,
         ) + field_score(
             &query,
             &query_terms,
@@ -121,6 +267,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             8.0,
             "description",
             &mut direct_reasons,
+            query_whole,
         ) + field_score(
             &context,
             &context_terms,
@@ -128,25 +275,15 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             4.0,
             "context+description",
             &mut direct_reasons,
+            context_whole,
         );
 
-        // Weak relatedness evidence: body text and link targets. This can rank
-        // an admitted skill but cannot admit one by itself.
-        let mut weak = field_score(
-            &query,
-            &query_terms,
-            &skill_bodies[index],
-            2.0,
-            "body",
-            &mut weak_reasons,
-        ) + field_score(
-            &context,
-            &context_terms,
-            &skill_bodies[index],
-            1.0,
-            "context+body",
-            &mut weak_reasons,
-        );
+        // Weak relatedness evidence: link targets here; body text is
+        // scored only for admitted skills after admission (below) — body
+        // fields can be ~1 MiB each, so scanning them for every corpus
+        // skill would make recommend() quadratic in corpus size. Body
+        // evidence can rank an admitted skill but never admit one.
+        let mut weak = 0.0;
         for link in &skill.links {
             match link.kind {
                 LinkKind::Requires | LinkKind::Markdown if matches_query(&query, &link.target) => {
@@ -155,11 +292,15 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                     } else {
                         1.0
                     };
-                    weak_reasons.push(format!("{:?} link target: {}", link.kind, link.target));
+                    if weak_reasons.len() < MAX_REASONS_PER_SKILL {
+                        weak_reasons.push(format!("{:?} link target: {}", link.kind, link.target));
+                    }
                 }
                 LinkKind::Mention if matches_query(&query, &link.target) => {
                     weak += 1.0;
-                    weak_reasons.push(format!("mention: {}", link.target));
+                    if weak_reasons.len() < MAX_REASONS_PER_SKILL {
+                        weak_reasons.push(format!("mention: {}", link.target));
+                    }
                 }
                 _ => {}
             }
@@ -172,45 +313,68 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
 
         let name_hits = query_terms
             .iter()
-            .filter(|term| name_lower.contains(term.as_str()))
-            .map(|term| {
-                (
-                    term.clone(),
-                    *document_frequency.get(term).unwrap_or(&usize::MAX),
-                )
-            })
+            .enumerate()
+            .filter(|(_, term)| term_matches(name_lower, term))
+            .map(|(i, _)| i as u32)
             .collect::<Vec<_>>();
         let description_hits = query_terms
             .iter()
-            .filter(|term| description_lower.contains(term.as_str()))
-            .map(|term| {
-                (
-                    term.clone(),
-                    *document_frequency.get(term).unwrap_or(&usize::MAX),
-                )
-            })
+            .enumerate()
+            .filter(|(_, term)| term_matches(description_lower, term))
+            .map(|(i, _)| i as u32)
             .collect::<Vec<_>>();
         let context_hits = context_terms
             .iter()
-            .filter(|term| skill_descriptions_base[index].contains(term.as_str()))
-            .map(|term| {
-                (
-                    term.clone(),
-                    *document_frequency.get(term).unwrap_or(&usize::MAX),
-                )
-            })
+            .enumerate()
+            .filter(|(_, term)| term_matches(&skill_descriptions_base[index], term))
+            .map(|(i, _)| i as u32)
             .collect::<Vec<_>>();
 
-        infos[index] = Some(Evidence {
-            direct,
-            weak,
-            necessity: 0.0,
-            name_hits,
-            description_hits,
-            context_hits,
-            reasons,
-        });
+        // Materialize Evidence only for skills carrying signal: direct or
+        // weak score > 0 covers every hit (each hit field is a subset of a
+        // scored field), and skills with no signal can never be admitted or
+        // ranked — requires-admitted targets get a zeroed Evidence on
+        // demand in the propagation loop below. This keeps per-skill hit
+        // and reason vectors from being retained for the whole corpus.
+        if direct > 0.0 || weak > 0.0 {
+            infos[index] = Some(Evidence {
+                direct,
+                weak,
+                necessity: 0.0,
+                name_hits,
+                description_hits,
+                context_hits,
+                reasons,
+            });
+        }
     }
+
+    // Document frequency is needed only for admission decisions on terms
+    // that actually hit a field; computing it for every query term would
+    // scan the corpus once per term even when nothing matches.
+    let hit_terms: Vec<&str> = infos
+        .iter()
+        .flatten()
+        .flat_map(|info| {
+            info.name_hits
+                .iter()
+                .chain(&info.description_hits)
+                .map(|&i| query_terms[i as usize].as_str())
+                .chain(
+                    info.context_hits
+                        .iter()
+                        .map(|&i| context_terms[i as usize].as_str()),
+                )
+        })
+        .collect();
+    let document_frequency = document_frequency(
+        graph,
+        &candidates,
+        &skill_names,
+        &skill_descriptions,
+        hit_terms.iter().copied(),
+        &mut match_work,
+    );
 
     // Admission is structural, not score-based:
     // - a name hit admits when it is specific enough (multiple name terms or a
@@ -224,17 +388,51 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // - Markdown links, mentions, body text, and backlinks never admit.
     let mut admitted: HashMap<usize, Vec<String>> = HashMap::new();
     let mut seeds = Vec::new();
+    // Cache the directly_admitted verdict per skill: requires propagation
+    // below re-checks it per (seed, link, copy) triple, and recomputing
+    // builds two HashSets over up to ~1k hit terms each time (#144 r17).
+    // `None` = not yet evaluated (exact-name seeds skip the check during
+    // admission); resolved lazily on first requires-target use.
+    let mut direct_flags: Vec<Option<bool>> = vec![None; infos.len()];
     for (index, info) in infos.iter().enumerate() {
-        if info
-            .as_ref()
-            .is_some_and(|info| directly_admitted(info, &query_sources))
-        {
+        // An exact name match is the strongest possible signal and admits
+        // even names too short to survive term extraction (e.g. a 1-char
+        // ASCII name produces no query terms at all). Parse-error skills
+        // never admit on ANY path — otherwise a malformed skill could
+        // still seed requires-propagation (#144 r13).
+        let exact_name = !query.is_empty()
+            && graph.skills[index].parse_error.is_none()
+            && skill_names[index] == query;
+        let direct = !exact_name
+            && info.as_ref().is_some_and(|info| {
+                let d = directly_admitted(
+                    info,
+                    &query_terms,
+                    &context_terms,
+                    &query_sources,
+                    &context_sources,
+                    &document_frequency,
+                    df_bound,
+                );
+                direct_flags[index] = Some(d);
+                d
+            });
+        if exact_name || direct {
             admitted.insert(index, Vec::new());
             seeds.push(index);
         }
     }
 
-    for seed in &seeds {
+    // Bound the (seed × requires-link × same-name copies) fan-out: every
+    // installed copy of a required name is a distinct target, so a
+    // hostile corpus could otherwise materialize O(seeds × links ×
+    // copies) reason strings with no cap (#144 r17). Iteration order is
+    // deterministic (index order → declaration order → by_name order),
+    // so truncation is stable across runs.
+    const MAX_PROPAGATION_CHECKS: usize = 4 * 1024 * 1024;
+    let mut propagation_checks = 0usize;
+    'propagation: for seed in &seeds {
+        let seed_reason = format!("required by {}", graph.skills[*seed].name);
         for link in &graph.skills[*seed].links {
             if link.kind != LinkKind::Requires {
                 continue;
@@ -246,19 +444,163 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 continue;
             };
             for &target in targets {
+                // Charge before the parse-error skip: `by_name` also
+                // holds parse-error copies, and iterating them must
+                // consume the same budget or a corpus of same-name
+                // parse-error copies could exceed the cap's intent
+                // (#144 r17 CR).
+                propagation_checks += 1;
+                if propagation_checks > MAX_PROPAGATION_CHECKS {
+                    break 'propagation;
+                }
                 if graph.skills[target].parse_error.is_some() {
                     continue;
                 }
-                let is_seed = infos[target]
-                    .as_ref()
-                    .is_some_and(|info| directly_admitted(info, &query_sources));
+                let is_seed = match direct_flags[target] {
+                    Some(d) => d,
+                    None => {
+                        let d = infos[target].as_ref().is_some_and(|info| {
+                            directly_admitted(
+                                info,
+                                &query_terms,
+                                &context_terms,
+                                &query_sources,
+                                &context_sources,
+                                &document_frequency,
+                                df_bound,
+                            )
+                        });
+                        direct_flags[target] = Some(d);
+                        d
+                    }
+                };
                 let entry = admitted.entry(target).or_default();
-                entry.push(format!("required by {}", graph.skills[*seed].name));
-                if !is_seed && let Some(info) = infos[target].as_mut() {
+                // Propagated reasons share the per-skill cap: distinct
+                // seed names would otherwise grow the Vec without bound
+                // before the final dedup (#144 r17).
+                if entry.len() < MAX_REASONS_PER_SKILL && !entry.contains(&seed_reason) {
+                    entry.push(seed_reason.clone());
+                }
+                if !is_seed {
+                    // A requires target with no query signal has no stored
+                    // Evidence; materialize a zeroed one so the necessity
+                    // bump and recommendation emission behave exactly as
+                    // before the deferred-materialization change.
+                    let info = infos[target].get_or_insert_with(Evidence::empty);
                     info.necessity += 2.0;
                 }
             }
         }
+    }
+
+    // Body-text weak evidence applies only to admitted skills: it can
+    // raise an admitted skill's rank but cannot admit a skill by itself,
+    // so expanding ~1 MiB bodies for non-admitted skills is wasted work.
+    // Glossary expansion is appended, never rewritten, so original text
+    // still matches verbatim.
+    //
+    // The admitted set itself is unbounded, so scanning every admitted
+    // body is O(corpus) memory traffic per call. Bound the total body
+    // bytes scored per recommend() under a fixed budget, visited in
+    // deterministic (index) order. Body evidence can rank but never
+    // admit, so skills past the budget keep a slightly lower possible
+    // rank — the admitted set itself is unaffected.
+    const MAX_BODY_SCAN_BYTES: usize = 8 * 1024 * 1024;
+    // term_matches cost is O(query terms × field bytes): the byte cap
+    // alone would let a max-length query (1024 terms) multiply 8 MiB
+    // into tens of GiB of scanning. Bound total term×byte work too.
+    const MAX_BODY_TERM_WORK: usize = 256 * 1024 * 1024;
+    let term_count = query_terms.len() + context_terms.len();
+    // expand_gloss appends at most the sum of every glossary term's
+    // bytes (dedup only shrinks it); compute that bound once so the
+    // per-body estimate covers the EXPANDED field the scorer scans,
+    // not just body_text.len() (#144 r16).
+    let max_gloss_bytes: usize = GLOSS
+        .iter()
+        .flat_map(|(_, g)| g.split_whitespace())
+        .map(|t| t.len() + 1)
+        .sum();
+    let mut body_scanned = 0usize;
+    let mut body_work = 0usize;
+    let mut body_order: Vec<usize> = admitted.keys().copied().collect();
+    body_order.sort_unstable();
+    for index in body_order {
+        if body_scanned >= MAX_BODY_SCAN_BYTES {
+            break;
+        }
+        let raw_body = &graph.skills[index].body_text;
+        let body_len = raw_body.len();
+        let non_ascii = !raw_body.is_ascii();
+        // est_field upper-bounds the expanded+lowercased text field_score
+        // scans; non-ASCII bodies additionally pay GLOSS.len() substring
+        // scans inside expand_gloss plus the to_lowercase copy. A char
+        // can expand to several times its UTF-8 length under
+        // to_lowercase (combining marks), so the scanned field is
+        // charged at 4x body bytes, not body_len (#144 r17).
+        let est_field = if non_ascii {
+            body_len.saturating_mul(4).saturating_add(max_gloss_bytes)
+        } else {
+            body_len.saturating_add(max_gloss_bytes)
+        };
+        // expand_gloss/gloss_terms run their ~|GLOSS| `contains` scans
+        // and the to_lowercase copy on the LOWERED text, whose byte
+        // length can reach ~4x body_len for non-ASCII (same factor as
+        // est_field) — charging raw body_len undercounts ~4x (#144 r20).
+        let lowered_bound = if non_ascii {
+            body_len.saturating_mul(4)
+        } else {
+            body_len
+        };
+        let work = term_count
+            .saturating_mul(est_field)
+            .saturating_add(if query_whole { est_field } else { 0 })
+            .saturating_add(if context_whole { est_field } else { 0 })
+            .saturating_add(if non_ascii {
+                GLOSS.len().saturating_mul(lowered_bound)
+            } else {
+                0
+            })
+            // term_matches/matches_query build a Two-Way searcher per
+            // call — O(needle len) preprocessing ON TOP of the field
+            // scan. The two field_score calls below iterate query_terms
+            // and context_terms once each, plus one whole-query needle
+            // per whitespace-free field (#144 r19).
+            .saturating_add(query_term_bytes)
+            .saturating_add(context_term_bytes)
+            .saturating_add(if query_whole { query.len() } else { 0 })
+            .saturating_add(if context_whole { context.len() } else { 0 })
+            .saturating_add(lowered_bound);
+        // saturating_add: `work` tops out at usize::MAX on 32-bit, and
+        // a plain add here could overflow before the budget check
+        // (#144 r19 CR).
+        if body_scanned.saturating_add(body_len) > MAX_BODY_SCAN_BYTES
+            || body_work.saturating_add(work) > MAX_BODY_TERM_WORK
+        {
+            continue;
+        }
+        body_scanned += body_len;
+        body_work += work;
+        let Some(info) = infos[index].as_mut() else {
+            continue;
+        };
+        let body = expand_gloss(&graph.skills[index].body_text.to_lowercase());
+        info.weak += field_score(
+            &query,
+            &query_terms,
+            &body,
+            2.0,
+            "body",
+            &mut info.reasons,
+            query_whole,
+        ) + field_score(
+            &context,
+            &context_terms,
+            &body,
+            1.0,
+            "context+body",
+            &mut info.reasons,
+            context_whole,
+        );
     }
 
     let mut out: Vec<Recommendation> = infos
@@ -273,10 +615,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             }
             let mut reasons = std::mem::take(&mut info.reasons);
             reasons.append(&mut extra_reasons);
-            if let Some(backlinks) = graph.backlinks.get(&index)
-                && !backlinks.is_empty()
-            {
-                reasons.push(format!("backlinks: {}", backlinks.len()));
+            // The map only holds positive counts (#144 r18).
+            if let Some(&backlink_count) = graph.backlinks.get(&index) {
+                reasons.push(format!("backlinks: {backlink_count}"));
             }
             reasons.sort();
             reasons.dedup();
@@ -316,13 +657,29 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     out
 }
 
-fn directly_admitted(info: &Evidence, query_sources: &HashMap<String, String>) -> bool {
+fn directly_admitted(
+    info: &Evidence,
+    query_terms: &[String],
+    context_terms: &[String],
+    query_sources: &HashMap<String, Rc<str>>,
+    context_sources: &HashMap<String, Rc<str>>,
+    document_frequency: &HashMap<String, usize>,
+    df_bound: usize,
+) -> bool {
+    let qterm = |i: u32| query_terms[i as usize].as_str();
+    let cterm = |i: u32| context_terms[i as usize].as_str();
+    let df = |term: &str| document_frequency.get(term).copied().unwrap_or(usize::MAX);
+    // Corpus-relative rarity: a term counts as specific evidence while its
+    // document frequency stays within df_bound (see recommend()). df==1 made
+    // admission flip the moment a second same-domain skill appeared (#170).
+    let rare = |term: &str| df(term) <= df_bound;
     // The skill name is the skill's identity: two or more query terms inside
     // one name is specific regardless of corpus-wide document frequency.
     // A single name hit stays conservative (low df, meaningful length).
     let multiple_name_hits = info.name_hits.len() >= 2;
-    let unique_name_hit =
-        info.name_hits.len() == 1 && info.name_hits[0].1 == 1 && info.name_hits[0].0.len() >= 4;
+    let unique_name_hit = info.name_hits.len() == 1
+        && rare(qterm(info.name_hits[0]))
+        && qterm(info.name_hits[0]).len() >= 4;
     // A name hit plus independent description evidence admits: the name anchors
     // identity while the description confirms topical fit. This keeps high-df
     // description terms from admitting alone but lets e.g. "PR review" reach
@@ -335,17 +692,26 @@ fn directly_admitted(info: &Evidence, query_sources: &HashMap<String, String>) -
     let description_sources: HashSet<&str> = info
         .description_hits
         .iter()
-        .map(|(term, _)| {
-            query_sources
-                .get(term)
-                .map(String::as_str)
-                .unwrap_or(term.as_str())
+        .map(|&i| {
+            let term = qterm(i);
+            query_sources.get(term).map(|s| &**s).unwrap_or(term)
         })
         .collect();
     let description_admitted = info.description_hits.len() >= 2
         && description_sources.len() >= 2
-        && info.description_hits.iter().any(|(_, df)| *df == 1);
-    let context_admitted = info.context_hits.len() >= 2;
+        && info.description_hits.iter().any(|&i| rare(qterm(i)));
+    // Context admission applies the same independence rule: hits must
+    // come from at least two distinct provenance sources, so one CJK
+    // run's bigram cluster cannot self-admit through context (#144).
+    let context_hit_sources: HashSet<&str> = info
+        .context_hits
+        .iter()
+        .map(|&i| {
+            let term = cterm(i);
+            context_sources.get(term).map(|s| &**s).unwrap_or(term)
+        })
+        .collect();
+    let context_admitted = info.context_hits.len() >= 2 && context_hit_sources.len() >= 2;
     multiple_name_hits
         || unique_name_hit
         || name_plus_description
@@ -358,14 +724,44 @@ fn document_frequency<'a>(
     candidates: &[usize],
     skill_names: &[String],
     skill_descriptions: &[String],
-    terms: impl Iterator<Item = &'a String>,
+    terms: impl Iterator<Item = &'a str>,
+    match_work: &mut usize,
 ) -> HashMap<String, usize> {
     let mut unique = HashSet::new();
     for term in terms {
-        unique.insert(term.as_str());
+        unique.insert(term);
     }
+    // Deterministic degradation order under budget exhaustion.
+    let mut unique: Vec<&str> = unique.into_iter().collect();
+    unique.sort_unstable();
+    // df counts distinct skill NAMES but the scan walks every installed
+    // COPY of each candidate name — charge the bytes actually scanned
+    // (all parse-ok skills) or a duplicate-heavy corpus makes the
+    // budget meaningless: per-name charging under-counts by the copy
+    // factor and the term loop would never trip (#144 round-12).
+    let field_bytes: usize = graph
+        .skills
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.parse_error.is_none())
+        .map(|(i, _)| skill_names[i].len() + skill_descriptions[i].len())
+        .sum();
+    // Each term_matches call also builds a Two-Way searcher over the
+    // needle — up to 2 calls per installed copy per term — so charge
+    // term.len() preprocessing on top of the field-byte scan (#144 r16).
+    let n_copies = graph
+        .skills
+        .iter()
+        .filter(|s| s.parse_error.is_none())
+        .count();
     let mut frequencies = HashMap::new();
     for term in unique {
+        *match_work = match_work
+            .saturating_add(field_bytes)
+            .saturating_add(term.len().saturating_mul(2).saturating_mul(n_copies));
+        if *match_work > MAX_MATCH_TERM_WORK {
+            break;
+        }
         // df counts distinct skill names: a term matches a name when any
         // installed copy of that name contains it, so duplicate installs do
         // not inflate frequency.
@@ -377,8 +773,8 @@ fn document_frequency<'a>(
                 };
                 copies.iter().any(|&copy| {
                     graph.skills[copy].parse_error.is_none()
-                        && (skill_names[copy].contains(term)
-                            || skill_descriptions[copy].contains(term))
+                        && (term_matches(&skill_names[copy], term)
+                            || term_matches(&skill_descriptions[copy], term))
                 })
             })
             .count();
@@ -387,6 +783,14 @@ fn document_frequency<'a>(
     frequencies
 }
 
+/// Per-skill reason strings are retained in `Evidence` for every
+/// admitted candidate; a query with thousands of terms would otherwise
+/// produce thousands of reason entries per skill (#144 r15).
+const MAX_REASONS_PER_SKILL: usize = 64;
+
+/// `field` must already be lowercase — callers pass pre-lowered
+/// descriptions/bodies/names. Lowercasing inside this per-skill hot loop
+/// would copy up to ~1 MiB per field per recommend() call.
 fn field_score(
     query: &str,
     query_terms: &[String],
@@ -394,27 +798,97 @@ fn field_score(
     weight: f64,
     label: &str,
     reasons: &mut Vec<String>,
+    query_whole: bool,
 ) -> f64 {
     if query.is_empty() || field.is_empty() {
         return 0.0;
     }
-    let field_lower = field.to_lowercase();
     let mut score = 0.0;
     for term in query_terms {
-        if field_lower.contains(term.as_str()) {
+        if term_matches(field, term) {
             score += weight;
-            reasons.push(format!("{label}: {term}"));
+            if reasons.len() < MAX_REASONS_PER_SKILL {
+                reasons.push(format!("{label}: {term}"));
+            }
         }
     }
-    if !query.contains(char::is_whitespace) && field_lower.contains(query) {
+    if query_whole && term_matches(field, query) {
         score += weight * 2.0;
-        reasons.push(format!("{label}: {query}"));
+        if reasons.len() < MAX_REASONS_PER_SKILL {
+            // The bonus embeds the whole query (up to 32K chars) per
+            // reason; cap it so 64 reasons cannot retain ~2MB per skill
+            // (#144 r17).
+            let shown: String = query.chars().take(512).collect();
+            reasons.push(format!("{label}: {shown}"));
+        }
     }
     score
 }
 
 fn matches_query(query: &str, target: &str) -> bool {
-    !query.is_empty() && target.to_lowercase().contains(query)
+    if query.is_empty() {
+        return false;
+    }
+    // Link targets are scanned once per candidate skill per call; skip
+    // the lowercase allocation when the target is already lowercase
+    // ASCII (the common case: valid skill names are lowercase).
+    if target.is_ascii() && !target.bytes().any(|b| b.is_ascii_uppercase()) {
+        term_matches(target, query)
+    } else {
+        term_matches(&target.to_lowercase(), query)
+    }
+}
+
+/// Single matching rule for query terms against skill text (#170, audit
+/// I-02):
+/// - ASCII terms match on word boundaries — the match must not be flanked by
+///   ASCII alphanumerics, with a single trailing plural `s`/`es` tolerated so
+///   "changelog" still reaches "changelogs". This stops "pr" from hitting
+///   "improve"/"project"/"production" and "test" from hitting "latest".
+///   Hyphens, underscores, dots, and whitespace all count as boundaries, so
+///   "code-naming" still answers "code naming".
+/// - Non-ASCII terms (CJK bigrams) keep substring semantics: CJK has no word
+///   boundaries and bigrams are the matching unit by design (#61).
+///
+/// Neighbors are checked with `is_ascii_alphanumeric`, so a CJK character
+/// next to ASCII (e.g. "PRをレビュー") counts as a boundary and abbreviations
+/// inside Japanese text remain reachable.
+fn term_matches(field: &str, term: &str) -> bool {
+    if term.is_ascii() {
+        ascii_word_match(field, term)
+    } else {
+        field.contains(term)
+    }
+}
+
+fn ascii_word_match(field: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    field.match_indices(needle).any(|(start, found)| {
+        let end = start + found.len();
+        let left_ok = field[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        if !left_ok {
+            return false;
+        }
+        let rest = &field[end..];
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => true,
+            Some(c) if !c.is_ascii_alphanumeric() => true,
+            // Plural tolerance: "changelog" matches "changelogs" and
+            // "class" matches "classes".
+            Some('s') => chars.next().is_none_or(|c| !c.is_ascii_alphanumeric()),
+            Some('e') if rest.starts_with("es") => rest[2..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_ascii_alphanumeric()),
+            _ => false,
+        }
+    })
 }
 
 // English function words and generic prompt filler carry no skill-selection
@@ -538,6 +1012,7 @@ const STOPWORDS: &[&str] = &[
     "up",
     "very",
     "was",
+    "want",
     "we",
     "were",
     "what",
@@ -560,6 +1035,7 @@ const STOPWORDS: &[&str] = &[
     "yourselves",
 ];
 
+#[cfg(test)]
 fn terms(text: &str) -> Vec<String> {
     terms_tagged(text)
         .into_iter()
@@ -568,8 +1044,11 @@ fn terms(text: &str) -> Vec<String> {
 }
 
 // term -> provenance source. Glossary-derived terms share the CJK key they
-// came from; all other terms are their own source.
-fn term_sources(tagged: &[(String, String)]) -> HashMap<String, String> {
+// came from; all other terms are their own source. Sources are Rc-shared:
+// a 32K-char CJK run emits ~32K bigrams that all point at the SAME run/gap
+// source, so cloning the source string per term would be O(run²) memory
+// before MAX_RECOMMEND_TERMS ever applies (#144 r13).
+fn term_sources(tagged: &[(String, Rc<str>)]) -> HashMap<String, Rc<str>> {
     let mut sources = HashMap::new();
     for (term, source) in tagged {
         sources
@@ -579,32 +1058,175 @@ fn term_sources(tagged: &[(String, String)]) -> HashMap<String, String> {
     sources
 }
 
-fn terms_tagged(text: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
+fn terms_tagged(text: &str) -> Vec<(String, Rc<str>)> {
+    let mut out: Vec<(String, Rc<str>)> = Vec::new();
     let mut ascii_run = String::new();
     let mut cjk_run = String::new();
     let mut flush = |ascii: &mut String, cjk: &mut String| {
         if ascii.chars().count() >= 2 {
             let lower = ascii.to_lowercase();
             if !STOPWORDS.contains(&lower.as_str()) {
-                out.push((lower.clone(), lower));
+                out.push((lower.clone(), Rc::from(lower.as_str())));
             }
         }
         ascii.clear();
         // CJK has no whitespace and no case: emit character bigrams so
         // substring matching works against Japanese descriptions (#61),
         // plus English glossary terms for known dev vocabulary so queries
-        // can reach English-only skill text (#78). Gloss terms carry their
-        // CJK key as provenance so one substring cannot self-admit.
-        let chars: Vec<char> = cjk.chars().collect();
-        for window in chars.windows(2) {
-            let bigram: String = window.iter().collect();
-            out.push((bigram.clone(), bigram));
+        // can reach English-only skill text (#78). Provenance is scoped
+        // to the evidence unit: a bigram inside a recognized dictionary
+        // word shares that word's source, bigrams inside a contentful
+        // uncovered gap (kanji/katakana present) share that gap as ONE
+        // source, pure-hiragana gaps (particles, する) and boundary-
+        // spanning bigrams are dropped, and gloss expansions keep their
+        // key. One CJK word's literal bigrams and its gloss expansion
+        // are therefore ONE evidence unit and cannot satisfy the
+        // two-independent-sources admission rule by themselves;
+        // distinct dictionary words or contentful gaps in one run
+        // remain independent (#144).
+        let run: String = cjk.chars().collect();
+        // Interned once per run: every bigram in a keyless run shares
+        // this single allocation instead of cloning ~96KB per term.
+        let run_src: Rc<str> = Rc::from(run.as_str());
+        let gloss = gloss_terms(&run);
+        // Coverage keys come from GLOSS membership, NOT from gloss_terms
+        // output: term-level dedup can hide a key whose expansions were
+        // all already emitted by another key, leaving its chars
+        // "uncovered" and minting spurious gap provenance (#144 r12).
+        let keys: Vec<&'static str> = gloss_keys(&run);
+        let chars: Vec<char> = run.chars().collect();
+        // cover_key[i] = index into `keys` owning char i, or -1. Longer
+        // keys claim shared chars first so プルリクエスト wins over
+        // プルリク on the overlap. Work is bounded by total key-match
+        // length, not run length.
+        let mut cover_key = vec![-1i32; chars.len()];
+        // effective_key[ki] = index of the key whose source gloss
+        // expansions of keys[ki] should carry. Computed below.
+        let mut effective_key: Vec<usize> = Vec::new();
+        if !keys.is_empty() {
+            // Byte offset -> char index; match_indices only yields
+            // char-boundary starts, so interior bytes are never read.
+            let mut byte_to_char = vec![0usize; run.len() + 1];
+            for (ci, (b, _)) in run.char_indices().enumerate() {
+                byte_to_char[b] = ci;
+            }
+            let mut order: Vec<usize> = (0..keys.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(keys[i].chars().count()));
+            for &ki in &order {
+                let key = keys[ki];
+                for (b, _) in run.match_indices(key) {
+                    let start = byte_to_char[b];
+                    let end = (start + key.chars().count()).min(chars.len());
+                    for slot in cover_key.iter_mut().take(end).skip(start) {
+                        if *slot < 0 {
+                            *slot = ki as i32;
+                        }
+                    }
+                }
+            }
+            // A key whose EVERY occurrence is subsumed by longer keys
+            // has no independent literal evidence: its gloss expansions
+            // must inherit the covering key's source, or the literal
+            // bigrams and the expansions of ONE dictionary word mint two
+            // "independent" sources (`根本原因` containing `原因` would
+            // self-admit a skill describing just `原因`). A key with at
+            // least one self-covered occurrence keeps its own source.
+            effective_key = vec![0usize; keys.len()];
+            for (ki, key) in keys.iter().enumerate() {
+                let klen = key.chars().count();
+                let mut self_covered = false;
+                let mut covering = ki;
+                for (b, _) in run.match_indices(key) {
+                    let start = byte_to_char[b];
+                    let end = (start + klen).min(chars.len());
+                    if cover_key[start..end].iter().all(|&c| c == ki as i32) {
+                        self_covered = true;
+                        break;
+                    }
+                    if covering == ki && cover_key[start] >= 0 {
+                        covering = cover_key[start] as usize;
+                    }
+                }
+                effective_key[ki] = if self_covered { ki } else { covering };
+            }
         }
-        let run: String = chars.iter().collect();
-        for (gloss, key) in gloss_terms(&run) {
+        // Gap segments: maximal runs of uncovered chars. A gap is
+        // "contentful" when it contains a non-hiragana CJK char (kanji
+        // or katakana) — pure-hiragana stretches are particles and
+        // okurigana, i.e. grammatical filler that must not become an
+        // independent evidence unit (`レビューする` stays ONE source).
+        // Each contentful gap is itself a single evidence unit, so
+        // `不具合報告をトリアージして` yields key + gap = two sources.
+        let mut gap_of = vec![usize::MAX; chars.len()];
+        let mut gap_text: Vec<Rc<str>> = Vec::new();
+        let mut gap_contentful: Vec<bool> = Vec::new();
+        {
+            let mut i = 0;
+            while i < chars.len() {
+                if cover_key[i] >= 0 {
+                    i += 1;
+                    continue;
+                }
+                let start = i;
+                let mut contentful = false;
+                let mut text = String::new();
+                while i < chars.len() && cover_key[i] < 0 {
+                    text.push(chars[i]);
+                    if !is_hiragana(chars[i]) {
+                        contentful = true;
+                    }
+                    i += 1;
+                }
+                let id = gap_text.len();
+                gap_text.push(Rc::from(text.as_str()));
+                gap_contentful.push(contentful);
+                for slot in gap_of.iter_mut().take(i).skip(start) {
+                    *slot = id;
+                }
+            }
+        }
+        for (w, window) in chars.windows(2).enumerate() {
+            let bigram: String = window.iter().collect();
+            // A bigram gets key provenance only when BOTH chars belong
+            // to the same key occurrence — positional coverage also fixes
+            // the substring check's cross-position misattribution (a
+            // bigram merely *equal* to key text elsewhere in the run no
+            // longer inherits that key's source).
+            if cover_key[w] >= 0
+                && cover_key[w] == cover_key[w + 1]
+                && keys[cover_key[w] as usize].contains(bigram.as_str())
+            {
+                out.push((bigram, Rc::from(keys[cover_key[w] as usize])));
+            } else if keys.is_empty() {
+                // Only a run with NO recognized dictionary word falls
+                // back to run-level provenance.
+                out.push((bigram, run_src.clone()));
+            } else if cover_key[w] < 0
+                && cover_key[w + 1] < 0
+                && gap_of[w] == gap_of[w + 1]
+                && gap_contentful[gap_of[w]]
+            {
+                // Both chars sit inside the same contentful gap: the
+                // whole gap is one evidence unit.
+                out.push((bigram, gap_text[gap_of[w]].clone()));
+            }
+            // else: bigram inside a keyed run that is covered, spans a
+            // key/gap boundary, or sits in a pure-hiragana gap —
+            // dropped so it cannot mint an independent source.
+        }
+        // Gloss expansions carry the EFFECTIVE source of their key: a
+        // key fully subsumed by a longer dictionary word inherits that
+        // word's provenance so literal+expansion of one word cannot
+        // count as two independent sources.
+        let key_index: HashMap<&str, usize> =
+            keys.iter().enumerate().map(|(i, k)| (*k, i)).collect();
+        for (gloss, key) in gloss {
             if !STOPWORDS.contains(&gloss.as_str()) {
-                out.push((gloss, key.to_string()));
+                let source = key_index
+                    .get(key.as_str())
+                    .map(|&ki| keys[effective_key[ki]])
+                    .unwrap_or(key.as_str());
+                out.push((gloss, Rc::from(source)));
             }
         }
         cjk.clear();
@@ -634,16 +1256,33 @@ fn terms_tagged(text: &str) -> Vec<(String, String)> {
     }
     // Common abbreviation expansion: "pull request" is routinely shortened
     // to "PR"/"pr" in skill text, so emit the abbreviation as an extra term.
-    // Substring matching means "pr" is noisy, but it only adds evidence on
-    // queries that actually contain the phrase.
+    // Boundary-aware matching keeps "pr" from hitting "improve"/"project",
+    // but it still matches a standalone "pr" token such as "PR review".
     let lower = text.to_lowercase();
     if lower.contains("pull request")
         || lower.contains("pull-request")
         || lower.contains("pull_request")
     {
-        out.push(("pr".to_string(), "pull-request".to_string()));
+        out.push(("pr".to_string(), Rc::from("pull-request")));
     }
-    out
+    // Repeated terms would inflate hit counts and scores; keep first
+    // occurrence of each term. Provenance prefers an explicitly typed
+    // (self-sourced) occurrence over a glossary-derived one: when a CJK
+    // run expands to "bug" and the user also typed "bug", the literal
+    // term is independent evidence and must keep its own source (#144).
+    let mut index_of: HashMap<String, usize> = HashMap::new();
+    let mut deduped: Vec<(String, Rc<str>)> = Vec::with_capacity(out.len());
+    for (term, source) in out {
+        if let Some(&i) = index_of.get(&term) {
+            if source.as_ref() == term {
+                deduped[i].1 = Rc::from(term.as_str());
+            }
+            continue;
+        }
+        index_of.insert(term.clone(), deduped.len());
+        deduped.push((term, source));
+    }
+    deduped
 }
 
 fn is_cjk(c: char) -> bool {
@@ -651,6 +1290,13 @@ fn is_cjk(c: char) -> bool {
         c as u32,
         0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7AF | 0x1100..=0x11FF
     )
+}
+
+/// Hiragana (U+3040–U+309F): particles, okurigana, and inflectional
+/// endings. A CJK gap made only of these is grammatical filler, not a
+/// content word, so it must not count as independent evidence.
+fn is_hiragana(c: char) -> bool {
+    matches!(c as u32, 0x3040..=0x309F)
 }
 
 // Minimal Japanese↔English dev glossary for #78. This is deliberately
@@ -962,12 +1608,31 @@ const GLOSS: &[(&str, &str)] = &[
     ("ログ", "log logging"),
 ];
 
+/// Every glossary key present in `text`, independent of term-level
+/// dedup: `gloss_terms` dedups by emitted term, so a key whose gloss
+/// was fully claimed by an earlier key would otherwise be invisible to
+/// provenance coverage even though its chars are a recognized word.
+fn gloss_keys(text: &str) -> Vec<&'static str> {
+    if text.is_ascii() {
+        return Vec::new();
+    }
+    GLOSS
+        .iter()
+        .filter(|(key, gloss)| !gloss.is_empty() && text.contains(key))
+        .map(|(key, _)| *key)
+        .collect()
+}
+
 // Returns (English term, CJK key) pairs for every glossary key present in
 // `text`, deduplicated by term. Used in both directions: query terms emit
-// these into the term list (key becomes the provenance source), and skill
-// match text gets the terms appended.
+// these into the term list, and skill match text gets the terms appended.
 fn gloss_terms(text: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
+    // Every glossary key is CJK; ASCII-only text can never contain one,
+    // so skip the ~290-entry scan for English descriptions/bodies.
+    if text.is_ascii() {
+        return out;
+    }
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (key, gloss) in GLOSS {
         if gloss.is_empty() || !text.contains(key) {
@@ -1001,10 +1666,18 @@ mod tests {
 
     #[test]
     fn cjk_query_produces_bigrams() {
+        // A run with no glossary key still emits every bigram with
+        // run-level provenance.
+        let t = terms("あいうえおかきくけこ");
+        assert!(t.iter().any(|x| x == "あい"), "{t:?}");
+        assert!(t.iter().any(|x| x == "けこ"), "{t:?}");
+        // Inside a keyed run, bigrams inside a contentful uncovered gap
+        // survive (shared gap provenance) while pure-hiragana filler
+        // like する is dropped so it cannot mint an independent source.
         let t = terms("不具合報告をトリアージして");
-        eprintln!("terms={t:?}");
-        assert!(t.iter().any(|x| x == "不具"), "{t:?}");
         assert!(t.iter().any(|x| x == "報告"), "{t:?}");
+        let t = terms("レビューする");
+        assert!(!t.iter().any(|x| x == "する"), "{t:?}");
     }
 
     #[test]
@@ -1017,15 +1690,52 @@ mod tests {
     }
 
     #[test]
-    fn gloss_terms_carry_cjk_key_as_source() {
+    fn cjk_provenance_splits_bigrams_from_gloss_keys() {
         let tagged = terms_tagged("文章を自然にしたい");
         let sources = term_sources(&tagged);
-        // "prose"/"writing" come from the 文章 key; the bigram 文章 is its
-        // own source but shares the same string, so all three collapse to
-        // one provenance group for admission purposes.
-        assert_eq!(sources.get("prose").map(String::as_str), Some("文章"));
-        assert_eq!(sources.get("natural").map(String::as_str), Some("自然"));
-        assert_eq!(sources.get("文章").map(String::as_str), Some("文章"));
+        // Round-10/11: provenance is scoped to the evidence unit — a
+        // bigram inside a recognized dictionary word shares that word's
+        // source (so the word's literal bigrams and its gloss expansion
+        // count as ONE evidence unit), and distinct words in one run
+        // stay independent. Boundary-spanning bigrams and pure-hiragana
+        // gaps are dropped entirely — giving them run-level provenance
+        // would recreate the `レビューする` self-admission hole.
+        assert_eq!(sources.get("文章").map(|s| &**s), Some("文章"));
+        assert_eq!(sources.get("章を"), None);
+        assert_eq!(sources.get("自然").map(|s| &**s), Some("自然"));
+        // A contentful gap is a single evidence unit: every bigram in
+        // `報告をトリアージして` shares the gap text as its source.
+        let tagged = terms_tagged("不具合報告をトリアージして");
+        let gap_sources = term_sources(&tagged);
+        let gap = "報告をトリアージして";
+        assert_eq!(gap_sources.get("報告").map(|s| &**s), Some(gap));
+        assert_eq!(gap_sources.get("トリ").map(|s| &**s), Some(gap));
+        assert_eq!(gap_sources.get("不具").map(|s| &**s), Some("不具合"));
+        assert_eq!(sources.get("prose").map(|s| &**s), Some("文章"));
+        assert_eq!(sources.get("natural").map(|s| &**s), Some("自然"));
+    }
+
+    /// #144 round-12 (CodeRabbit): a dictionary key fully contained in a
+    /// longer key must not keep an independent source for its gloss
+    /// expansions — `原因` inside `根本原因` is ONE evidence unit, so a
+    /// skill whose description is just `原因` (literal + `root cause`
+    /// expansion) cannot self-admit on query `根本原因`.
+    #[test]
+    fn contained_key_gloss_inherits_covering_source() {
+        let tagged = terms_tagged("根本原因");
+        let sources = term_sources(&tagged);
+        // The bigram 原因 is covered by 根本原因; the gloss terms that
+        // 原因 would emit (root, cause) must carry the SAME source.
+        assert_eq!(sources.get("原因").map(|s| &**s), Some("根本原因"));
+        assert_eq!(sources.get("root").map(|s| &**s), Some("根本原因"));
+        assert_eq!(sources.get("cause").map(|s| &**s), Some("根本原因"));
+        // A standalone 原因 elsewhere in the run is a genuinely
+        // independent dictionary word and keeps its own source.
+        let tagged = terms_tagged("根本原因と原因");
+        let sources = term_sources(&tagged);
+        assert_eq!(sources.get("原因").map(|s| &**s), Some("原因"));
+        assert_eq!(sources.get("root").map(|s| &**s), Some("原因"));
+        assert_eq!(sources.get("根本").map(|s| &**s), Some("根本原因"));
     }
 
     #[test]
@@ -1044,5 +1754,14 @@ mod tests {
         assert!(t.iter().any(|x| x == "pr"), "{t:?}");
         let t = terms("review the changes");
         assert!(!t.iter().any(|x| x == "pr"), "{t:?}");
+    }
+
+    #[test]
+    fn modal_filler_is_stopworded() {
+        // #184: "want" is modal filler like "please"; letting it match
+        // description text admitted unrelated skills (e.g. code-review via
+        // "the user wants") on verification-setup phrasing.
+        let t = terms("i want a repeatable way to confirm the project works");
+        assert!(!t.iter().any(|x| x == "want"), "{t:?}");
     }
 }

@@ -67,7 +67,7 @@ pub enum Trigger {
 /// How strongly the observation supports "the skill was loaded".
 /// Ordered weakest→strongest is NOT the declaration order; rank via
 /// `load_rank` where needed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Detection {
     /// Runtime-native skill mechanism fired (e.g. Claude `Skill` tool).
@@ -80,14 +80,15 @@ pub enum Detection {
     /// Weaker heuristic signal (e.g. runtime skill-selection list).
     Inferred,
     /// Name/path mentioned without read evidence. Emitted by `observe`
-    /// only; hooks do not produce this.
+    /// transcript scanning and by hook/plugin detection for
+    /// reference-only accesses; never load-grade.
     Mention,
     /// Reserved: explicit confirmation that the skill was applied.
     /// No emitter produces this yet.
     Applied,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Confidence {
     High,
@@ -116,7 +117,7 @@ pub struct SkillUsageEvent {
     pub prompt_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<Trigger>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub recommended: Vec<RecommendedSkill>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub emitted: Option<bool>,
@@ -138,6 +139,48 @@ pub struct SkillUsageEvent {
     pub tool: Option<String>,
 }
 
+/// Bound on `recommended` items retained per event. Constructors cap
+/// their input and the observe passthrough truncates to the same bound,
+/// so a hostile payload cannot retain an unbounded name list.
+pub(crate) const MAX_RECOMMENDED: usize = 32;
+
+/// Session ids come from agent-controlled payloads and transcripts;
+/// bound them like `tool`/`skill_path` so a hostile payload cannot write
+/// unbounded strings into every event line. Charset matches the hook's
+/// sanitizer so hook- and detect-emitted events agree.
+pub(crate) fn sanitize_session_id(session_id: &str) -> String {
+    // Materialize at most 129 filtered chars: the overflow branch only
+    // needs a 119-char head plus a hash of the ORIGINAL input, so a
+    // hostile multi-MB session id cannot force a full-size allocation.
+    let mut filtered = String::new();
+    let mut chars = session_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-');
+    for c in chars.by_ref().take(129) {
+        filtered.push(c);
+    }
+    if filtered.chars().count() > 128 {
+        // Truncation must not merge distinct ids that share a 128-char
+        // prefix: keep a bounded head plus a hash suffix of the original,
+        // mirroring the plugin's safeSessionID exactly.
+        let head: String = filtered.chars().take(119).collect();
+        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
+    }
+    let safe = filtered;
+    if safe.is_empty() && !session_id.is_empty() {
+        // Distinct invalid ids must not collapse into one "unknown"
+        // funnel session: derive a deterministic suffix from the
+        // original bytes so different ids stay distinct while the same
+        // id remains joinable. SHA-256 (truncated) is used rather than
+        // DefaultHasher because the OpenCode plugin must produce the
+        // identical id for the same payload — the hash is part of the
+        // cross-entrypoint event contract.
+        format!("unknown-{}", &sha256_hex(session_id.as_bytes())[..16])
+    } else {
+        safe
+    }
+}
+
 impl SkillUsageEvent {
     pub fn prompt_submit(
         runtime: Runtime,
@@ -150,8 +193,8 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::PromptSubmit,
             runtime,
-            session_id: session_id.to_string(),
-            timestamp: timestamp.to_string(),
+            session_id: sanitize_session_id(session_id),
+            timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: Some(sha256_hex(prompt.as_bytes())),
             trigger: None,
@@ -185,14 +228,22 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::Recommendation,
             runtime,
-            session_id: session_id.to_string(),
-            timestamp: timestamp.to_string(),
+            session_id: sanitize_session_id(session_id),
+            timestamp: timestamp.chars().take(64).collect(),
             observed_via,
-            prompt_hash,
+            prompt_hash: prompt_hash.map(|h| h.chars().take(128).collect()),
             trigger: Some(trigger),
-            recommended: names,
+            recommended: names
+                .into_iter()
+                .take(MAX_RECOMMENDED)
+                .map(|mut item| {
+                    item.name = item.name.chars().take(256).collect();
+                    item.digest = item.digest.map(|d| d.chars().take(128).collect());
+                    item
+                })
+                .collect(),
             emitted: Some(emitted),
-            reason: Some(reason.to_string()),
+            reason: Some(reason.chars().take(1024).collect()),
             recommend_ms,
             skill_name: None,
             skill_path: None,
@@ -215,12 +266,14 @@ impl SkillUsageEvent {
         detection: Detection,
         confidence: Confidence,
     ) -> Self {
+        // tool/skill_path are payload-controlled; cap them so a hostile
+        // payload cannot write unbounded strings into every event line.
         Self {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::SkillLoad,
             runtime,
-            session_id: session_id.to_string(),
-            timestamp: timestamp.to_string(),
+            session_id: sanitize_session_id(session_id),
+            timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: None,
             trigger: None,
@@ -229,11 +282,11 @@ impl SkillUsageEvent {
             reason: None,
             recommend_ms: None,
             skill_name,
-            skill_path,
+            skill_path: skill_path.map(|p| p.chars().take(1024).collect()),
             skill_digest: None,
             detection: Some(detection),
             confidence: Some(confidence),
-            tool,
+            tool: tool.map(|t| t.chars().take(256).collect()),
         }
     }
 
@@ -291,45 +344,62 @@ fn unix_secs_to_rfc3339(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}Z")
 }
 
-/// Extract the `name:` field from a YAML frontmatter block, wherever it
-/// appears in `text` (tool output may carry a prefix such as `Output:`).
+/// Extract the `name:` field from a YAML frontmatter block. Mirrors
+/// `parser::split_frontmatter`: a BOM and leading blank lines are
+/// tolerated, then the opening `---` fence must be the first content —
+/// a `---/name:/---` block appearing later in the body is prose, not
+/// frontmatter, and must not spoof the skill name. Only a bounded head
+/// is scanned and fences must be `---` alone on their line.
+///
+/// Deliberate divergences from the canonical parser, all in the
+/// conservative direction for truncated tool output: an unterminated
+/// frontmatter still yields the name (runtimes routinely truncate tool
+/// results mid-block, and the name line precedes the close fence), the
+/// 8 KB scan window may cut a long value short, and the first `name:`
+/// wins where YAML duplicate-key semantics would differ.
 pub fn frontmatter_name(text: &str) -> Option<String> {
-    let mut rest = text;
-    loop {
-        let start = rest.find("---")?;
-        // The opening fence must be at a line boundary.
-        let line_start =
-            start == 0 || rest[..start].ends_with('\n') || rest[..start].ends_with("\r\n");
-        if !line_start {
-            rest = &rest[start + 3..];
+    const MAX_SCAN: usize = 8 * 1024;
+    let head: String = text.chars().take(MAX_SCAN).collect();
+    let head = head.strip_prefix('\u{feff}').unwrap_or(head.as_str());
+    // Mirror split_frontmatter: it trims leading \n/\r chars (not just
+    // blank lines), so a lone-\r opening still counts as frontmatter.
+    let head = head.trim_start_matches(['\n', '\r']);
+    let mut lines = head.lines();
+    // Skip leading blank lines, then require the opening fence.
+    let mut opened = false;
+    for line in lines.by_ref() {
+        if line.is_empty() {
             continue;
         }
-        let after = &rest[start + 3..];
-        let end_rel = find_line_fence(after)?;
-        let block = &after[..end_rel];
-        for line in block.lines() {
-            let line = line.trim_end();
-            if let Some(value) = line.strip_prefix("name:") {
-                let value = value.trim().trim_matches('"').trim_matches('\'');
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
+        if line == "---" {
+            opened = true;
         }
+        break;
+    }
+    if !opened {
         return None;
     }
-}
-
-/// Find the offset of the next line that is exactly `---` (the closing
-/// fence), relative to `text` which starts just after the opening fence.
-fn find_line_fence(text: &str) -> Option<usize> {
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_end_matches(['\n', '\r']);
-        if trimmed == "---" {
-            return Some(offset);
+    for line in lines {
+        // Fence must be exactly `---` on its line — `lines()` already
+        // strips \n/\r, so a trailing space (`--- `) must not close a
+        // fence the canonical parser (split_frontmatter) would reject.
+        if line == "---" {
+            return None;
         }
-        offset += line.len();
+        if let Some(rest) = line.trim_end().strip_prefix("name:") {
+            // YAML requires separation after the colon: `name:foo` is a
+            // plain scalar, not a mapping — the canonical parser would
+            // not see a name there, so neither may we.
+            if !rest.is_empty() && !rest.starts_with(|c: char| c.is_whitespace()) {
+                continue;
+            }
+            let value = rest.trim().trim_matches('"').trim_matches('\'');
+            // Only spec-conforming names may flow into events/state;
+            // anything else is treated as absent.
+            if !value.is_empty() && crate::parser::valid_skill_name(value) {
+                return Some(value.to_string());
+            }
+        }
     }
     None
 }
@@ -343,12 +413,12 @@ pub fn is_skill_md_path(path: &str) -> bool {
 }
 
 /// Skill name implied by a SKILL.md path: the parent directory name.
+/// Returns `None` when the directory name violates the Agent Skills
+/// spec charset — an unvalidated path-derived name must never reach
+/// events or LLM-facing context (prompt-injection vector).
 pub fn skill_name_from_path(path: &str) -> Option<String> {
-    Path::new(path)
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .filter(|n| !n.is_empty())
+    let name = Path::new(path).parent()?.file_name()?.to_string_lossy();
+    crate::parser::valid_skill_name(&name).then(|| name.into_owned())
 }
 
 /// Raw `...SKILL.md` path candidates occurring in free text, in order.
@@ -379,23 +449,49 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     }
     let bytes = text.as_bytes();
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut pos = 0usize;
-    while pos + NEEDLE.len() <= bytes.len() {
+    // Start of the contiguous path-byte run ending at `pos`, tracked
+    // forward: every byte is classified exactly once (needle bodies are
+    // path bytes, so `pos = end` jumps never break the run), giving each
+    // SKILL.md hit its candidate start in O(1). The previous per-hit
+    // backward rescan made dense `,SKILL.md`-style input ~500x slower
+    // than the input — overlapping ~4 KiB scans per 8-byte hit with no
+    // retention cap able to preempt the work (#144 r22). Over-long runs
+    // still reject via the length check below: the tracked start is the
+    // TRUE run start, which only makes over-length candidates longer —
+    // accepted candidates (<= MAX_CANDIDATE_BYTES) are identical to the
+    // old floor-bounded scan.
+    let mut run_start = 0usize;
+    // Distinct candidates and per-candidate length are both bounded: a
+    // max-size payload could otherwise materialize hundreds of MB of
+    // path strings before any downstream cap applies.
+    const MAX_CANDIDATES: usize = 256;
+    const MAX_CANDIDATE_BYTES: usize = 4096;
+    while pos + NEEDLE.len() <= bytes.len() && out.len() < MAX_CANDIDATES {
         if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
+            if !is_path_byte(bytes[pos]) {
+                run_start = pos + 1;
+            }
             pos += 1;
             continue;
         }
         let end = pos + NEEDLE.len();
-        let mut start = pos;
-        while start > 0 && is_path_byte(bytes[start - 1]) {
-            start -= 1;
+        // Forward boundary: `SKILL.mdx`, `SKILL.md.bak`, `SKILL.md-old`,
+        // and `SKILL.md/…` are not the SKILL.md file. Delimiters that
+        // legitimately follow a filename in prose (`,`, `)`, `"`, space)
+        // are not in this set.
+        if end < bytes.len()
+            && (bytes[end].is_ascii_alphanumeric()
+                || matches!(bytes[end], b'.' | b'_' | b'-' | b'/'))
+        {
+            pos = end;
+            continue;
         }
-        // Trim a leading run that cannot begin a path (e.g. `foo=bar/SKILL.md`
-        // keeps `bar/SKILL.md` only if `=` were allowed — it is, so instead we
-        // accept the whole run; `is_skill_md_path` filters non-SKILL.md names).
-        if let Ok(candidate) = std::str::from_utf8(&bytes[start..end])
+        if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
+            && candidate.len() <= MAX_CANDIDATE_BYTES
             && !candidate.is_empty()
-            && !out.iter().any(|p| p == candidate)
+            && seen.insert(candidate)
         {
             out.push(candidate.to_string());
         }
@@ -405,7 +501,7 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
 }
 
 /// How a shell command segment treats a SKILL.md reference.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Access {
     /// A read-like verb accesses the file (content likely enters context).
     Read,
@@ -424,26 +520,64 @@ const TRANSPARENT_PREFIXES: &[&str] = &[
     "sudo", "env", "time", "nice", "nohup", "command", "builtin", "xargs", "exec", "doas",
 ];
 
-/// Classify how `command` accesses SKILL.md files. Returns `None` when no
-/// SKILL.md path is referenced at all.
-pub fn classify_command(command: &str) -> Option<(String, Access)> {
-    let paths: Vec<String> = skill_md_paths(command)
-        .into_iter()
-        .filter(|p| is_skill_md_path(p))
-        .collect();
-    let path = paths.into_iter().next()?;
-    let access = if command_has_read_verb(command) {
-        Access::Read
-    } else {
-        Access::Reference
-    };
-    Some((path, access))
-}
-
-fn command_has_read_verb(command: &str) -> bool {
-    command
-        .split(['&', ';', '|', '\n'])
-        .any(segment_has_read_verb)
+/// Classify how `command` accesses SKILL.md files. Returns every
+/// `(path, access)` pair — each command segment is classified on its own
+/// read verbs, so `cat a/SKILL.md; grep b/SKILL.md` yields a Read for `a`
+/// and a Reference for `b`. Empty when no SKILL.md path is referenced.
+pub fn classify_command(command: &str) -> Vec<(String, Access)> {
+    let mut out: Vec<(String, Access)> = Vec::new();
+    // path -> index into `out`; keeps dedup O(1) per candidate so a
+    // command stuffed with distinct SKILL.md paths cannot go quadratic.
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // path -> segment index of the access that determined its strength.
+    // A path first mentioned by `ls` but read later (`ls a; cat b; cat a`)
+    // is ordered by its READ segment, not its first mention — tool output
+    // follows command order, so this is the order files' contents appear.
+    let mut decisive: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Bound the retained access list: events per payload are capped at
+    // MAX_EVENTS_PER_PAYLOAD, so accumulating more classifications than
+    // that can never change the emitted output.
+    const MAX_COMMAND_ACCESSES: usize = MAX_EVENTS_PER_PAYLOAD * 4;
+    for (seq, segment) in command.split(['&', ';', '|', '\n']).enumerate() {
+        if out.len() >= MAX_COMMAND_ACCESSES {
+            break;
+        }
+        // Cheap reject before allocating skill_md_paths' buffers: most
+        // segments in a large command never mention SKILL.md.
+        if !segment.contains("SKILL.md") {
+            continue;
+        }
+        let access = if segment_has_read_verb(segment) {
+            Access::Read
+        } else {
+            Access::Reference
+        };
+        for path in skill_md_paths(segment) {
+            if !is_skill_md_path(&path) {
+                continue;
+            }
+            // Same path seen earlier: keep the stronger access so
+            // `ls x/SKILL.md && cat x/SKILL.md` still counts as a Read.
+            match index.get(&path) {
+                Some(&i) => {
+                    if access == Access::Read && out[i].1 == Access::Reference {
+                        out[i].1 = Access::Read;
+                        decisive.insert(path, seq);
+                    }
+                }
+                None => {
+                    index.insert(path.clone(), out.len());
+                    decisive.insert(path.clone(), seq);
+                    out.push((path, access));
+                }
+            }
+        }
+    }
+    // Order by decisive-access position (stable: same-segment paths keep
+    // argument order). Consumers that attribute a single tool output to
+    // the first-read file depend on this matching emission order.
+    out.sort_by_key(|(path, _)| decisive.get(path).copied().unwrap_or(usize::MAX));
+    out
 }
 
 fn segment_has_read_verb(segment: &str) -> bool {
@@ -459,9 +593,18 @@ fn segment_has_read_verb(segment: &str) -> bool {
             }
         }
         let w = match words.next() {
-            Some(w) => w.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == '`'),
+            Some(w) => {
+                w.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == '`' || c == '$')
+            }
             None => return false,
         };
+        // Skip flags interleaved with transparent wrappers
+        // (`sudo -E cat`, `xargs -I{} cat`). Flag *values* are not
+        // skipped — `sudo -u root cat` still resolves `root` as the
+        // verb; that residual is accepted (documented heuristic).
+        if w.len() > 1 && w.starts_with('-') {
+            continue;
+        }
         // Skip transparent wrappers (sudo, env, xargs, ...); `xargs cat`
         // style still resolves to the inner verb.
         if TRANSPARENT_PREFIXES.contains(&w) {
@@ -494,8 +637,13 @@ fn is_command_tool(tool: &str) -> bool {
 ///
 /// `tool` is the runtime tool name; `input` its arguments object; `output`
 /// the captured tool output text when available (may be empty).
-/// Returns `None` when the access is not skill-related at all.
-pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<LoadClassification> {
+/// Returns every distinct skill access — a command touching several
+/// SKILL.md files yields one classification per file.
+pub fn classify_tool_access_all(
+    tool: &str,
+    input: &Value,
+    output: &str,
+) -> Vec<LoadClassification> {
     let lower = tool.to_ascii_lowercase();
     if lower == "skill" {
         let raw = input
@@ -504,41 +652,91 @@ pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<L
             .or_else(|| input.get("skill_name"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        return Some(LoadClassification {
+        return vec![LoadClassification {
             skill_name: normalize_skill_name(raw),
             skill_path: None,
             detection: Detection::NativeInvocation,
             confidence: Confidence::High,
-        });
+        }];
     }
     if is_read_tool(&lower) {
-        for key in ["path", "file_path", "notebook_path"] {
+        for key in [
+            "path",
+            "file_path",
+            "filePath",
+            "notebook_path",
+            "notebookPath",
+        ] {
             if let Some(path) = input.get(key).and_then(Value::as_str)
                 && is_skill_md_path(path)
             {
-                return Some(classify_file_read(path, output));
+                return vec![classify_file_read(path, output)];
             }
         }
-        return None;
+        return Vec::new();
     }
     if is_command_tool(&lower) {
-        for key in ["command", "cmd", "input"] {
-            if let Some(command) = input.get(key).and_then(Value::as_str)
-                && let Some((path, access)) = classify_command(command)
-            {
-                return Some(match access {
-                    Access::Read => classify_file_read(&path, output),
-                    Access::Reference => LoadClassification {
-                        skill_name: skill_name_from_path(&path),
-                        skill_path: Some(path),
-                        detection: Detection::Mention,
-                        confidence: Confidence::Low,
-                    },
-                });
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashSet<(Option<String>, Detection)> =
+            std::collections::HashSet::new();
+        // One tool output can cover several SKILL.md files (`cat a b`); its
+        // single frontmatter block belongs to the first file emitted, so
+        // only the first Read access may claim it — attributing it to every
+        // path would stamp the wrong skill name on the rest.
+        let mut frontmatter_available = true;
+        // Parity with detect_all_from_payload's per-payload cap: observe
+        // scanners emit one event per classification, so an uncapped
+        // per-use list would fan out ~(uses × ~1.5K classes) before any
+        // downstream budget runs (#144 r18).
+        'keys: for key in ["command", "cmd", "input"] {
+            if let Some(command) = input.get(key).and_then(Value::as_str) {
+                for (path, access) in classify_command(command) {
+                    let c = match access {
+                        Access::Read => {
+                            let verify = frontmatter_available;
+                            frontmatter_available = false;
+                            if verify {
+                                classify_file_read(&path, output)
+                            } else {
+                                classify_file_read_unverified(&path)
+                            }
+                        }
+                        Access::Reference => LoadClassification {
+                            skill_name: skill_name_from_path(&path),
+                            skill_path: Some(path),
+                            detection: Detection::Mention,
+                            confidence: Confidence::Low,
+                        },
+                    };
+                    // Unnamed classifications are dropped downstream
+                    // (detect_all_from_payload emits no event for
+                    // them); counting them against the cap would let
+                    // 64 junk paths starve a later valid one (#144 r18
+                    // CR). Frontmatter consumption above already ran,
+                    // so ordering semantics are unchanged.
+                    if c.skill_name.is_none() {
+                        continue;
+                    }
+                    if out.len() >= MAX_EVENTS_PER_PAYLOAD {
+                        break 'keys;
+                    }
+                    if seen.insert((c.skill_path.clone(), c.detection)) {
+                        out.push(c);
+                    }
+                }
             }
         }
+        return out;
     }
-    None
+    Vec::new()
+}
+
+/// Single best classification for callers that can only carry one event.
+/// Kept for compatibility; prefer `classify_tool_access_all`.
+pub fn classify_tool_access(tool: &str, input: &Value, output: &str) -> Option<LoadClassification> {
+    classify_tool_access_all(tool, input, output)
+        .into_iter()
+        .max_by_key(rank)
 }
 
 #[derive(Clone, Debug)]
@@ -550,7 +748,6 @@ pub struct LoadClassification {
 }
 
 fn classify_file_read(path: &str, output: &str) -> LoadClassification {
-    let dir_name = skill_name_from_path(path);
     if let Some(name) = frontmatter_name(output) {
         LoadClassification {
             skill_name: Some(name),
@@ -559,22 +756,27 @@ fn classify_file_read(path: &str, output: &str) -> LoadClassification {
             confidence: Confidence::High,
         }
     } else {
-        LoadClassification {
-            skill_name: dir_name,
-            skill_path: Some(path.to_string()),
-            detection: Detection::PathReference,
-            confidence: Confidence::Medium,
-        }
+        classify_file_read_unverified(path)
+    }
+}
+
+/// Path-derived classification for reads whose output cannot be tied to
+/// this specific file (multi-file tool output, or no frontmatter found).
+fn classify_file_read_unverified(path: &str) -> LoadClassification {
+    LoadClassification {
+        skill_name: skill_name_from_path(path),
+        skill_path: Some(path.to_string()),
+        detection: Detection::PathReference,
+        confidence: Confidence::Medium,
     }
 }
 
 /// Normalize a skill name: strip namespace/path prefixes (`plugin:foo/bar`
-/// -> `bar`).
+/// -> `bar`). Returns `None` for names outside the Agent Skills spec
+/// charset — they must never reach events, dedup state, or `.recommended`.
 pub fn normalize_skill_name(raw: &str) -> Option<String> {
-    raw.rsplit(['/', ':'])
-        .next()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+    let name = raw.rsplit(['/', ':']).next().filter(|s| !s.is_empty())?;
+    crate::parser::valid_skill_name(name).then(|| name.to_string())
 }
 
 /// Extract `exec_command({cmd: "..."})` command strings from Codex `exec`
@@ -582,9 +784,17 @@ pub fn normalize_skill_name(raw: &str) -> Option<String> {
 /// fragments conservatively (returns empty when nothing parses).
 pub fn extract_exec_commands(js: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let bytes = js.as_bytes();
     let mut pos = 0usize;
-    while let Some(found) = find_subslice(&bytes[pos..], b"exec_command") {
+    // A payload can repeat `exec_command` millions of times; bound the
+    // number of occurrences inspected (events are capped separately).
+    const MAX_OCCURRENCES: usize = 256;
+    let mut occurrences = 0usize;
+    while occurrences < MAX_OCCURRENCES
+        && let Some(found) = find_subslice(&bytes[pos..], b"exec_command")
+    {
+        occurrences += 1;
         let base = pos + found;
         // Look for `cmd` then `:` then a quoted string within a window.
         let window_end = (base + 4096).min(bytes.len());
@@ -594,7 +804,7 @@ pub fn extract_exec_commands(js: &str) -> Vec<String> {
         };
         if let Some(cmd) = extract_cmd_param(window)
             && !cmd.trim().is_empty()
-            && !out.contains(&cmd)
+            && seen.insert(cmd.clone())
         {
             out.push(cmd);
         }
@@ -611,47 +821,57 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// by a single- or double-quoted string; return its unescaped contents.
 fn extract_cmd_param(window: &str) -> Option<String> {
     let bytes = window.as_bytes();
-    let mut pos = 0usize;
-    while pos + 3 < bytes.len() {
-        if &bytes[pos..pos + 3] == b"cmd" {
-            let mut i = pos + 3;
+    // Jump between `cmd` occurrences with memcmp-speed search instead of
+    // a per-byte scan; identifier-boundary checks run only on hits.
+    let mut search_from = 0usize;
+    while search_from + 3 <= bytes.len() {
+        let rel = find_subslice(&bytes[search_from..], b"cmd")?;
+        let pos = search_from + rel;
+        // `cmd` must start at an identifier boundary so `{mycmd: ...}` or
+        // `subcmd=` is not mistaken for the command parameter.
+        let boundary = pos == 0
+            || !(bytes[pos - 1].is_ascii_alphanumeric() || matches!(bytes[pos - 1], b'_' | b'$'));
+        if !boundary {
+            search_from = pos + 3;
+            continue;
+        }
+        let mut i = pos + 3;
+        while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'=') {
+            i += 1;
             while i < bytes.len() && (bytes[i] as char).is_whitespace() {
                 i += 1;
             }
-            if i < bytes.len() && (bytes[i] == b':' || bytes[i] == b'=') {
+            if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
+                let quote = bytes[i];
                 i += 1;
-                while i < bytes.len() && (bytes[i] as char).is_whitespace() {
-                    i += 1;
-                }
-                if i < bytes.len() && (bytes[i] == b'"' || bytes[i] == b'\'') {
-                    let quote = bytes[i];
-                    i += 1;
-                    let start = i;
-                    let mut result = String::new();
-                    while i < bytes.len() {
-                        let b = bytes[i];
-                        if b == quote {
-                            if start == i && result.is_empty() {
-                                return Some(String::new());
-                            }
-                            result.push_str(&window[start..i]);
-                            return Some(unescape_js(&result));
+                let start = i;
+                let mut result = String::new();
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    if b == quote {
+                        if start == i && result.is_empty() {
+                            return Some(String::new());
                         }
-                        if b == b'\\' && i + 1 < bytes.len() {
-                            // Keep escape sequences verbatim-ish: copy both
-                            // bytes; unescape_js handles common cases.
-                            i += 2;
-                            continue;
-                        }
-                        i += 1;
+                        result.push_str(&window[start..i]);
+                        return Some(unescape_js(&result));
                     }
-                    // Unterminated — take what we have.
-                    result.push_str(&window[start..i.min(bytes.len())]);
-                    return Some(unescape_js(&result));
+                    if b == b'\\' && i + 1 < bytes.len() {
+                        // Keep escape sequences verbatim-ish: copy both
+                        // bytes; unescape_js handles common cases.
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
                 }
+                // Unterminated — take what we have.
+                result.push_str(&window[start..i.min(bytes.len())]);
+                return Some(unescape_js(&result));
             }
         }
-        pos += 1;
+        search_from = pos + 3;
     }
     None
 }
@@ -714,18 +934,37 @@ pub fn response_text(value: &Value) -> String {
     }
 }
 
-/// Normalize a runtime hook/plugin payload into a `skill_load` event.
+/// Upper bound on events emitted from a single payload. A hostile or buggy
+/// tool call could reference thousands of distinct SKILL.md paths; without
+/// a cap the hook would run unbounded recommend() passes and churn the
+/// event log.
+const MAX_EVENTS_PER_PAYLOAD: usize = 64;
+
+/// Normalize a runtime hook/plugin payload into `skill_load` events —
+/// one per distinct skill access (a command may touch several SKILL.md
+/// files). Empty when the payload carries no skill-load signal.
 ///
 /// Accepts the union of shapes emitted by the shell-hook adapters
 /// (`tool_name`/`tool_input`/`tool_response`/`session_id`) and the OpenCode
-/// plugin (`tool`/`input`/`result`/`sessionID`). Returns `None` when the
-/// payload carries no skill-load signal — callers use this for cheap early
-/// exclusion before doing any recommendation work.
-pub fn detect_from_payload(
+/// plugin (`tool`/`input`/`result`/`sessionID`).
+pub fn detect_all_from_payload(
     runtime: Runtime,
     observed_via: ObservedVia,
     payload: &Value,
-) -> Option<SkillUsageEvent> {
+) -> Vec<SkillUsageEvent> {
+    // A failed tool call never loaded the skill: payloads carrying an
+    // explicit error status/success flag produce no load events.
+    if payload.get("status").and_then(Value::as_str) == Some("error")
+        || payload.get("success").and_then(Value::as_bool) == Some(false)
+        || payload.get("error").is_some_and(|e| {
+            // The OpenCode plugin forwards `error` defensively; any
+            // non-empty error value marks a failed call. null/false/""
+            // are not errors.
+            !e.is_null() && *e != Value::Bool(false) && e.as_str() != Some("")
+        })
+    {
+        return Vec::new();
+    }
     let tool = payload
         .get("tool_name")
         .or_else(|| payload.get("tool"))
@@ -750,72 +989,124 @@ pub fn detect_from_payload(
         .or_else(|| payload.get("sessionId"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let to_event = |c: LoadClassification| {
+        SkillUsageEvent::skill_load(
+            runtime,
+            observed_via,
+            session_id,
+            &rfc3339_now(),
+            Some(tool.to_string()),
+            c.skill_name,
+            c.skill_path,
+            c.detection,
+            c.confidence,
+        )
+    };
 
     // Codex `exec` tool: input is JS source, not a shell command. Extract
-    // exec_command cmd strings and classify each; emit the strongest signal.
+    // exec_command cmd strings and classify every SKILL.md access.
     if tool.eq_ignore_ascii_case("exec") {
-        let js = input.as_str().unwrap_or("");
-        let mut best: Option<LoadClassification> = None;
-        for cmd in extract_exec_commands(js) {
-            if let Some((path, access)) = classify_command(&cmd) {
-                let c = match access {
-                    Access::Read => classify_file_read(&path, &output),
-                    Access::Reference => LoadClassification {
-                        skill_name: skill_name_from_path(&path),
-                        skill_path: Some(path),
-                        detection: Detection::Mention,
-                        confidence: Confidence::Low,
-                    },
-                };
-                if best.as_ref().is_none_or(|b| rank(&c) > rank(b)) {
-                    best = Some(c);
+        let js = exec_source(&input);
+        // Dedup by skill identity (path preferred, name otherwise) keeping
+        // the strongest classification: `grep` before `cat` on the same
+        // SKILL.md must not let the weaker mention shadow the verified
+        // file_read, and one path must not emit two events under different
+        // derived names.
+        let mut classes: Vec<LoadClassification> = Vec::new();
+        let mut index: std::collections::HashMap<Option<String>, usize> =
+            std::collections::HashMap::new();
+        // Same single-frontmatter rule as classify_tool_access_all: only
+        // the first Read access may claim the output's frontmatter name.
+        let mut frontmatter_available = true;
+        let mut classify = |path: &str, access: &Access| -> LoadClassification {
+            match access {
+                Access::Read => {
+                    let verify = frontmatter_available;
+                    frontmatter_available = false;
+                    if verify {
+                        classify_file_read(path, &output)
+                    } else {
+                        classify_file_read_unverified(path)
+                    }
                 }
-            }
-        }
-        if js.contains("SKILL.md")
-            && best.is_none()
-            && let Some((path, access)) = classify_command(js)
-        {
-            best = Some(match access {
-                Access::Read => classify_file_read(&path, &output),
                 Access::Reference => LoadClassification {
-                    skill_name: skill_name_from_path(&path),
-                    skill_path: Some(path),
+                    skill_name: skill_name_from_path(path),
+                    skill_path: Some(path.to_string()),
                     detection: Detection::Mention,
                     confidence: Confidence::Low,
                 },
-            });
+            }
+        };
+        let mut push = |c: LoadClassification, classes: &mut Vec<LoadClassification>| {
+            if c.skill_name.is_none() {
+                return;
+            }
+            let key = c.skill_path.clone().or_else(|| c.skill_name.clone());
+            // Only the first MAX_EVENTS_PER_PAYLOAD classes are ever
+            // emitted; refuse new keys past that so a hostile payload
+            // cannot grow the intermediate vec (upgrades to existing
+            // keys still apply).
+            if classes.len() >= MAX_EVENTS_PER_PAYLOAD && !index.contains_key(&key) {
+                return;
+            }
+            match index.get(&key) {
+                Some(&i) if rank(&classes[i]) >= rank(&c) => {}
+                Some(&i) => classes[i] = c,
+                None => {
+                    index.insert(key, classes.len());
+                    classes.push(c);
+                }
+            }
+        };
+        for cmd in extract_exec_commands(&js) {
+            for (path, access) in classify_command(&cmd) {
+                push(classify(&path, &access), &mut classes);
+            }
         }
-        return best.map(|c| {
-            SkillUsageEvent::skill_load(
-                runtime,
-                observed_via,
-                session_id,
-                &rfc3339_now(),
-                Some(tool.to_string()),
-                c.skill_name,
-                c.skill_path,
-                c.detection,
-                c.confidence,
-            )
-        });
+        // Fallback: unparsed JS may still reference SKILL.md in raw text.
+        if classes.is_empty() && js.contains("SKILL.md") {
+            for (path, access) in classify_command(&js) {
+                push(classify(&path, &access), &mut classes);
+            }
+        }
+        let mut events: Vec<SkillUsageEvent> = classes.into_iter().map(to_event).collect();
+        events.truncate(MAX_EVENTS_PER_PAYLOAD);
+        return events;
     }
 
-    classify_tool_access(tool, &input, &output)
+    let mut events: Vec<SkillUsageEvent> = classify_tool_access_all(tool, &input, &output)
+        .into_iter()
         .filter(|c| c.skill_name.is_some())
-        .map(|c| {
-            SkillUsageEvent::skill_load(
-                runtime,
-                observed_via,
-                session_id,
-                &rfc3339_now(),
-                Some(tool.to_string()),
-                c.skill_name,
-                c.skill_path,
-                c.detection,
-                c.confidence,
-            )
-        })
+        .map(to_event)
+        .collect();
+    events.truncate(MAX_EVENTS_PER_PAYLOAD);
+    events
+}
+
+/// Single-event view kept for callers that can only carry one result
+/// (e.g. `skill-graph detect` prints the strongest access first).
+pub fn detect_from_payload(
+    runtime: Runtime,
+    observed_via: ObservedVia,
+    payload: &Value,
+) -> Option<SkillUsageEvent> {
+    detect_all_from_payload(runtime, observed_via, payload)
+        .into_iter()
+        .next()
+}
+
+/// Extract the JS source for a Codex `exec` tool input: a plain string,
+/// a `cmd`/`command` field, or the serialized object as a last resort.
+fn exec_source(input: &Value) -> String {
+    if let Some(s) = input.as_str() {
+        return s.to_string();
+    }
+    for key in ["cmd", "command", "input"] {
+        if let Some(s) = input.get(key).and_then(Value::as_str) {
+            return s.to_string();
+        }
+    }
+    input.to_string()
 }
 
 fn rank(c: &LoadClassification) -> u8 {
@@ -843,6 +1134,59 @@ mod tests {
             None // escaped JSON is not raw frontmatter
         );
         assert_eq!(frontmatter_name("no frontmatter"), None);
+        // A fence with a trailing space is not a fence — the canonical
+        // parser (split_frontmatter) rejects it, so detection must too.
+        assert_eq!(frontmatter_name("--- \nname: alpha\n---\n"), None);
+        assert_eq!(frontmatter_name("---\t\nname: alpha\n---\n"), None);
+        // A `---` block embedded in the body is not frontmatter: the
+        // opening fence must be the first non-blank line, matching
+        // split_frontmatter.
+        assert_eq!(frontmatter_name("intro\n---\nname: late\n---\n"), None);
+        assert_eq!(frontmatter_name("```\n---\nname: code\n---\n```"), None);
+        // Leading blank lines are still allowed.
+        assert_eq!(
+            frontmatter_name("\n\n---\nname: lead\n---\n"),
+            Some("lead".to_string())
+        );
+    }
+
+    #[test]
+    fn sanitize_session_id_distinguishes_invalid_ids() {
+        // Charset-valid ids pass through unchanged.
+        assert_eq!(sanitize_session_id("s-1.ok_2"), "s-1.ok_2");
+        // Distinct all-invalid ids must not collapse into one funnel
+        // session, while the same id stays deterministic for joins.
+        let a = sanitize_session_id("!!!");
+        let b = sanitize_session_id("???");
+        assert!(a.starts_with("unknown-"));
+        assert!(b.starts_with("unknown-"));
+        assert_ne!(a, b);
+        assert_eq!(a, sanitize_session_id("!!!"));
+        // Empty stays empty — it marks unattributable events.
+        assert_eq!(sanitize_session_id(""), "");
+        // Overlong ids are truncated at 128 chars.
+        assert_eq!(sanitize_session_id(&"x".repeat(200)).len(), 128);
+    }
+
+    #[test]
+    fn sanitize_session_id_truncation_keeps_prefix_sharing_ids_distinct() {
+        // Two ids sharing a 128-char valid prefix must not collapse into
+        // one funnel session: the bounded head carries a hash suffix of
+        // the original bytes (parity with the plugin's safeSessionID).
+        let a = format!("{}-aaa", "x".repeat(200));
+        let b = format!("{}-bbb", "x".repeat(200));
+        let sa = sanitize_session_id(&a);
+        let sb = sanitize_session_id(&b);
+        assert_eq!(sa.len(), 128);
+        assert_eq!(sb.len(), 128);
+        assert_ne!(sa, sb);
+        assert!(sa.starts_with(&"x".repeat(119)));
+        assert!(sa.contains('-'));
+        // Deterministic: the same id sanitizes identically for joins.
+        assert_eq!(sa, sanitize_session_id(&a));
+        // Exactly-128-char ids pass through unsuffixed.
+        let exact = "y".repeat(128);
+        assert_eq!(sanitize_session_id(&exact), exact);
     }
 
     #[test]
@@ -853,22 +1197,85 @@ mod tests {
         assert!(is_skill_md_path("a/b/SKILL.md"));
         assert!(!is_skill_md_path("a/b/MYSKILL.md"));
         assert!(!is_skill_md_path("a/b/SKILL.mdx"));
+        // Forward boundary: SKILL.md followed by name/path characters is
+        // a different file, not a SKILL.md access.
+        assert!(skill_md_paths("cat x/SKILL.mdx").is_empty());
+        assert!(skill_md_paths("cat x/SKILL.md.bak").is_empty());
+        assert!(skill_md_paths("cat x/SKILL.md-old").is_empty());
+        assert!(skill_md_paths("cat x/SKILL.md/y").is_empty());
+        // Legitimate trailing delimiters still classify; a trailing `.`
+        // is ambiguous with name continuation (`.bak`) and stays rejected.
+        assert_eq!(
+            skill_md_paths("cat x/SKILL.md, then cat y/SKILL.md"),
+            vec!["x/SKILL.md".to_string(), "y/SKILL.md".to_string()]
+        );
+    }
+
+    /// #144 round-12: the backward path-byte scan is bounded — a run
+    /// longer than MAX_CANDIDATE_BYTES is rejected anyway, so scanning
+    /// to position 0 would be quadratic on hostile input.
+    #[test]
+    fn skill_md_paths_bounds_backward_scan() {
+        // A >4 KiB path-byte run before SKILL.md is rejected; a valid
+        // candidate later in the same input still extracts.
+        let hostile = format!("{}a/SKILL.md", "a".repeat(5000));
+        assert!(skill_md_paths(&hostile).is_empty());
+        let mixed = format!("{} /SKILL.md b/SKILL.md", "a".repeat(5000));
+        assert_eq!(
+            skill_md_paths(&mixed),
+            vec!["/SKILL.md".to_string(), "b/SKILL.md".to_string()]
+        );
+    }
+
+    /// #144 r22: dense `,SKILL.md` hits inside one long path-byte run
+    /// must not re-scan ~4 KiB per hit — candidates resolve in O(1)
+    /// via the forward-tracked run start. Hits near the run start
+    /// still produce candidates (the whole run prefix); once the
+    /// candidate exceeds MAX_CANDIDATE_BYTES every later hit rejects.
+    #[test]
+    fn skill_md_paths_dense_hits_stay_linear() {
+        // 5000 'a's + 500 ",SKILL.md" hits: every candidate is the full
+        // run prefix (>4 KiB) — all rejected, and the call must not
+        // degrade to ~500x5000 byte-ops.
+        let hostile = format!("{}{}", "a".repeat(5000), ",SKILL.md".repeat(500));
+        assert!(skill_md_paths(&hostile).is_empty());
+        // Run-start hits within the bound still extract: "a"*4000 keeps
+        // the first ~10 candidates <= 4096 bytes, the rest reject.
+        let bounded = format!("{}{}", "a".repeat(4000), ",SKILL.md".repeat(500));
+        let paths = skill_md_paths(&bounded);
+        assert_eq!(paths.len(), 10, "{paths:?}");
+        assert!(paths.iter().all(|p| p.starts_with(&"a".repeat(100))));
     }
 
     #[test]
     fn classify_command_distinguishes_read_and_reference() {
-        let (p, a) = classify_command("cat .agents/skills/x/SKILL.md").unwrap();
-        assert_eq!(p, ".agents/skills/x/SKILL.md");
-        assert_eq!(a, Access::Read);
-        let (_, a) = classify_command("grep foo .agents/skills/x/SKILL.md").unwrap();
-        assert_eq!(a, Access::Reference);
-        let (_, a) = classify_command("find . -name SKILL.md").unwrap();
-        assert_eq!(a, Access::Reference);
-        let (_, a) = classify_command("sed -n '1,5p' x/SKILL.md | head").unwrap();
-        assert_eq!(a, Access::Read);
-        assert!(classify_command("ls .agents/skills").is_none());
-        let (_, a) = classify_command("sudo cat /tmp/sg/SKILL.md").unwrap();
-        assert_eq!(a, Access::Read);
+        let accesses = classify_command("cat .agents/skills/x/SKILL.md");
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].0, ".agents/skills/x/SKILL.md");
+        assert_eq!(accesses[0].1, Access::Read);
+        assert_eq!(
+            classify_command("grep foo .agents/skills/x/SKILL.md")[0].1,
+            Access::Reference
+        );
+        assert_eq!(
+            classify_command("find . -name SKILL.md")[0].1,
+            Access::Reference
+        );
+        assert_eq!(
+            classify_command("sed -n '1,5p' x/SKILL.md | head")[0].1,
+            Access::Read
+        );
+        assert!(classify_command("ls .agents/skills").is_empty());
+        assert_eq!(
+            classify_command("sudo cat /tmp/sg/SKILL.md")[0].1,
+            Access::Read
+        );
+        // Multiple SKILL.md paths in one command are all classified,
+        // each with its own segment's access kind.
+        let multi = classify_command("cat a/SKILL.md; grep x b/SKILL.md");
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi[0].1, Access::Read);
+        assert_eq!(multi[1].1, Access::Reference);
     }
 
     #[test]
@@ -934,5 +1341,26 @@ mod tests {
     fn rfc3339_conversion() {
         assert_eq!(unix_secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(epoch_ms_to_rfc3339(1793321018917), "2026-10-30T00:43:38Z");
+    }
+
+    /// #144 round-11: `name:foo` without YAML separation is a scalar,
+    /// not a mapping — the canonical parser sees no name, so the
+    /// transcript-side extractor must not claim one either.
+    #[test]
+    fn frontmatter_name_requires_yaml_separator() {
+        assert_eq!(
+            frontmatter_name("---\nname:foo\n---\nbody"),
+            None,
+            "name:foo is a scalar, not a mapping"
+        );
+        assert_eq!(
+            frontmatter_name("---\nname: foo-bar\n---\nbody"),
+            Some("foo-bar".to_string())
+        );
+        assert_eq!(
+            frontmatter_name("---\nname:\tfoo-bar\n---\nbody"),
+            Some("foo-bar".to_string()),
+            "tab is valid YAML separation"
+        );
     }
 }
