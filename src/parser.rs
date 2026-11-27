@@ -207,16 +207,37 @@ fn no_follow(opts: &mut fs::OpenOptions) {
 #[cfg(not(unix))]
 fn no_follow(_opts: &mut fs::OpenOptions) {}
 
-/// True when the YAML document stream contains at least one alias
-/// (`*name`) event. A libyaml parse error returns false: serde_yaml runs
-/// the same parser and reports its own frontmatter parse_error, so an
-/// unscanned suffix cannot smuggle an alias into a document serde_yaml
-/// would reject anyway.
-fn yaml_contains_alias(input: &str) -> bool {
+/// Deepest YAML container nesting accepted in frontmatter.
+/// `serde_yaml`'s recursive deserializer walks nested
+/// sequences/mappings on the call stack, so ~1 MiB of `[[[[…` reaches
+/// hundreds of thousands of frames and overflows the stack before any
+/// other bound applies (#144 structural). Legitimate frontmatter nests
+/// only a few levels (metadata map → key → list → map).
+const MAX_YAML_DEPTH: usize = 128;
+
+/// The first unsafe YAML construct found in `input`, as a reason
+/// suffix for the frontmatter parse_error, or `None` when the document
+/// is safe to hand to serde_yaml. Two hazards are scanned in ONE
+/// libyaml pass so they cannot disagree with what serde_yaml consumes:
+///
+/// - Aliases (`*name`): serde_yaml expands them by re-walking the
+///   anchored event subtree once per reference; its jump-count guard
+///   bounds the number of jumps, not the re-walked events, so a flat
+///   anchor/alias pair in ≤1 MiB of frontmatter can materialize ~10^10
+///   nodes and OOM the process (#144 r17).
+/// - Nesting deeper than `MAX_YAML_DEPTH`: stack overflow in the
+///   recursive deserializer (see the constant).
+///
+/// A libyaml parse error returns `None`: serde_yaml runs the same
+/// parser and reports its own frontmatter parse_error, so an unscanned
+/// suffix cannot smuggle a hazard into a document serde_yaml would
+/// reject anyway.
+fn yaml_frontmatter_hazard(input: &str) -> Option<&'static str> {
     use unsafe_libyaml::{
-        YAML_ALIAS_EVENT, YAML_STREAM_END_EVENT, yaml_event_delete, yaml_event_t,
-        yaml_parser_delete, yaml_parser_initialize, yaml_parser_parse,
-        yaml_parser_set_input_string, yaml_parser_t,
+        YAML_ALIAS_EVENT, YAML_MAPPING_END_EVENT, YAML_MAPPING_START_EVENT,
+        YAML_SEQUENCE_END_EVENT, YAML_SEQUENCE_START_EVENT, YAML_STREAM_END_EVENT,
+        yaml_event_delete, yaml_event_t, yaml_parser_delete, yaml_parser_initialize,
+        yaml_parser_parse, yaml_parser_set_input_string, yaml_parser_t,
     };
     // SAFETY: `parser`/`event` are initialized by the libyaml calls before
     // use; every produced event is deleted before the next parse, and both
@@ -224,7 +245,7 @@ fn yaml_contains_alias(input: &str) -> bool {
     unsafe {
         let mut parser = std::mem::MaybeUninit::<yaml_parser_t>::uninit();
         if yaml_parser_initialize(parser.as_mut_ptr()).fail {
-            return false;
+            return None;
         }
         let parser = parser.as_mut_ptr();
         yaml_parser_set_input_string(
@@ -234,22 +255,35 @@ fn yaml_contains_alias(input: &str) -> bool {
         );
         let mut event = std::mem::MaybeUninit::<yaml_event_t>::uninit();
         let event = event.as_mut_ptr();
-        let found = loop {
+        let mut depth = 0usize;
+        let hazard = loop {
             if yaml_parser_parse(parser, event).fail {
-                break false;
+                break None;
             }
-            let is_alias = (*event).type_ == YAML_ALIAS_EVENT;
-            let is_end = (*event).type_ == YAML_STREAM_END_EVENT;
+            let ty = (*event).type_;
+            let hazard_found = match ty {
+                YAML_ALIAS_EVENT => Some("YAML aliases are not supported"),
+                YAML_SEQUENCE_START_EVENT | YAML_MAPPING_START_EVENT => {
+                    depth += 1;
+                    (depth > MAX_YAML_DEPTH).then_some("YAML nesting exceeds the supported depth")
+                }
+                YAML_SEQUENCE_END_EVENT | YAML_MAPPING_END_EVENT => {
+                    depth -= 1;
+                    None
+                }
+                _ => None,
+            };
+            let is_end = ty == YAML_STREAM_END_EVENT;
             yaml_event_delete(event);
-            if is_alias {
-                break true;
+            if let Some(hazard) = hazard_found {
+                break Some(hazard);
             }
             if is_end {
-                break false;
+                break None;
             }
         };
         yaml_parser_delete(parser);
-        found
+        hazard
     }
 }
 
@@ -321,13 +355,16 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
     // subtree once per reference; its jump-count guard bounds the number
     // of jumps, not the re-walked events, so a flat anchor/alias pair in
     // ≤1 MiB of frontmatter can materialize ~10^10 nodes and OOM the
-    // process (#144 r17). Anchors alone are harmless — only aliases
-    // expand — and Agent Skills frontmatter never legitimately uses
-    // them, so reject any document containing an alias event. The scan
+    // process (#144 r17). Deep nesting overflows the recursive
+    // deserializer's stack instead. Anchors alone are harmless — only
+    // aliases expand — and Agent Skills frontmatter never legitimately
+    // uses either hazard, so reject documents containing them. The scan
     // uses the same libyaml event stream serde_yaml consumes, so it
     // cannot disagree with what the parser would have expanded.
-    if !frontmatter.trim().is_empty() && yaml_contains_alias(frontmatter) {
-        let msg = "frontmatter: YAML aliases are not supported".to_string();
+    if !frontmatter.trim().is_empty()
+        && let Some(hazard) = yaml_frontmatter_hazard(frontmatter)
+    {
+        let msg = format!("frontmatter: {hazard}");
         parse_error = Some(match parse_error {
             Some(prev) => format!("{prev}; {msg}"),
             None => msg,
@@ -742,6 +779,36 @@ mod tests {
         assert!(skill.parse_error.is_none(), "{:?}", skill.parse_error);
         assert_eq!(skill.name, "anchor-skill");
         assert_eq!(skill.metadata.get("a").map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn deep_yaml_nesting_is_rejected_before_deserialize() {
+        // ~1 MiB of `[[[[…` would recurse hundreds of thousands of
+        // frames inside serde_yaml's deserializer and overflow the
+        // stack; the libyaml pre-scan rejects at MAX_YAML_DEPTH
+        // (#144 structural). Moderately nested legitimate frontmatter
+        // still parses.
+        let dir = tempfile::tempdir().unwrap();
+        let deep = format!(
+            "name: deep-skill\ndescription: d\nmetadata:\n  nest: {}1{}\n",
+            "[".repeat(MAX_YAML_DEPTH + 10),
+            "]".repeat(MAX_YAML_DEPTH + 10),
+        );
+        let path = write_skill(&dir.path().join("deep-skill"), &deep);
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(
+            skill
+                .parse_error
+                .as_deref()
+                .is_some_and(|e| e.contains("nesting exceeds")),
+            "{:?}",
+            skill.parse_error
+        );
+        let shallow = "name: shallow-skill\ndescription: d\nmetadata:\n  a:\n    - x\n    - y\n";
+        let path = write_skill(&dir.path().join("shallow-skill"), shallow);
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(skill.parse_error.is_none(), "{:?}", skill.parse_error);
+        assert_eq!(skill.name, "shallow-skill");
     }
 
     #[test]

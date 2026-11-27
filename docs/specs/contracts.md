@@ -10,6 +10,28 @@ JSON Schema の正本は `contracts/v1/` に置く。CLI の `--format json` 出
 | `resolve-result.schema.json` | `resolve --format json` |
 | `skill-usage-event.schema.json` | hook/plugin が発行し `observe` が正規化する Skill Usage Event（JSONL, v1） |
 
+## 横断的な不変条件（#144 監査の構造的要件）
+
+22 ラウンドの監査で反復発見された欠陥クラスを構造的に排除するため、
+全実装が従う 3 つの不変条件をここに明文化する。監査は個別 bound の
+有無ではなく、これらの不変条件が全入力経路で成立するかを検査する。
+
+1. **保持量の有限性** — 外部入力 (ファイル、stdin、JSON payload、
+   transcript、plugin event、dataset) から保持する全 collection
+   (Vec/HashMap/String/PathBuf) は byte 数・要素数のいずれかの上限を
+   持つ。上限超過時は detail を捨てて counter/診断のみ残すか、入力を
+   reject する。retained 推定は実際の割当を過小評価してはならない
+   (clone・展開・前処理を含む保守的見積)。
+2. **charge-before-work** — 入力サイズに比例する仕事 (走査・比較・
+   分類・正規化・直列化) は、実行前に保守的な上限を work/byte
+   budget へ課金する。cap が保持量にしか効かず、保持ゼロのまま
+   CPU だけ消費する経路を残してはならない。
+3. **順序保存 truncation** — 件数・byte 上限による打ち切りは、定義
+   された順序 (observe では feed-line seq、その他では決定的 sort)
+   の真の prefix を emit する。category 順・発見順など入力順と
+   異なる順での打ち切りは、優先順位の偏りを生むため禁止。
+   打ち切り後の counter は全入力を集計し続ける (detail のみ欠落)。
+
 ## MCP tool surface（`skill-graph mcp`、ADR-0005）
 
 MCP server は read-only 3 tools を公開し、戻り値は対応する CLI
@@ -32,7 +54,14 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 （`observed_via` に `mcp` は存在しない）。tool 計算は 1 件ずつ
 直列化される: client が call を pipeline しても同時に走る graph
 構築は 1 つまでで、待機は async 側で行うため blocking pool を
-消費しない（#144 r19）。
+消費しない（#144 r19）。待機 queue は持たない: permit は
+`try_acquire` で取り、計算中の call がある間に届いた pipelined
+call は `internal_error` ("skill-graph is busy") で即 reject する。
+各 handler task は parse 済みの引数 `JsonObject` を保持するため、
+queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
+で迂回する OOM 経路になる（#144 R23）。逐次 request/response
+の client は影響を受けない。引数 tree は clone せず blocking task
+へ move する。
 
 ## observe 出力の扱い
 
@@ -197,7 +226,12 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   順の真の prefix になる（passthrough pending buffer と同じ
   意味論）。tool_use 1 件あたりの classification 数も
   `MAX_EVENTS_PER_PAYLOAD`（64）で打ち切る（hook の per-payload
-  cap と同じ上限）。
+  cap と同じ上限）。`--summary` の `session_events`/`funnel_for`
+  は集計用の transient map（`runtime:session_id` キー等）を
+  event 数比例で構築するため、最悪入力では retained
+  `MAX_OBSERVE_RETAINED_BYTES` budget の数倍の peak memory に
+  なる — CPU は共有 pair-check 予算で有限であり、memory 増幅は
+  受容 residual として記録する（#144 R23 LOW）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
   `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
@@ -455,7 +489,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   bound するため、flat な anchor/alias 対で ~10^10 node の materialize
   （OOM）に至りうる（#144 r17）。anchor 定義のみ・alias 非含有の
   document は影響を受けない。判定は serde_yaml と同一の libyaml
-  event stream で行うため parser と乖離しない。
+  event stream で行うため parser と乖離しない。同一 scan で
+  container nesting depth 128 を超える document も reject する:
+  serde_yaml の再帰 deserializer は深い nesting で call stack を
+  使い切り（≤1 MiB の `[[[[…` で ~50 万 frame）、他の bound が
+  効く前に stack overflow しうる（#144 structural）。
 - `parse_skill` の `O_NOFOLLOW` は最終 component のみを守る。
   WalkDir 収集後に skill ディレクトリや祖先 component が symlink
   へ差し替えられる窓は残るが、影響は ≤1 MiB の untrusted parse
