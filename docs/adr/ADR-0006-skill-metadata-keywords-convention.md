@@ -3,6 +3,11 @@
 Date: 2026-11-27
 Status: accepted (issue #184)
 
+> 旧称注記: 本文中の `project-init` / `rebuildup/project-init` は旧称であり、
+> 現行の canonical repository は `rebuildup/aude-skills`（改名追跡:
+> rebuildup/aude-skills#212）。
+
+
 ## Context
 
 #172 の holdout eval で、skill 名・description 語彙を含まない自然言語

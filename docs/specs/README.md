@@ -3,6 +3,8 @@
 `docs/specs/` には2種類の文書がある。要求・受入条件の最終正本は常に
 GitHub Issue / PR であり、Spec はその設計記録である。
 
+> 旧称注記: 本文書群中の `project-init` は `rebuildup/project-init` の旧称であり、現行の canonical repository は `rebuildup/aude-skills`（改名追跡: rebuildup/aude-skills#212）。
+
 ## 継続正本（evergreen）
 
 製品全体に効き続ける契約。変更時は実装と同時に更新する。
