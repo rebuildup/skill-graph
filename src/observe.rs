@@ -504,14 +504,12 @@ fn observe_jsonl(
     // finish(), so inline recording would always place passthrough
     // events before every transcript event regardless of line position
     // (#144 r17). All three sources share one (timestamp, line) sort.
-    let mut pending: Vec<(u64, SkillUsageEvent)> = Vec::new();
     // The pending buffer must be bounded BEFORE the feed-order merge:
     // `record_event`'s count/byte caps only run after every line is
     // scanned, so an input of many small passthrough events could
     // otherwise materialize unboundedly first (#144 r17 CR). Overflowed
     // events still feed the counter maps; only detail is dropped.
-    let mut pending_bytes = 0usize;
-    let mut pending_truncated = false;
+    let mut pending = PendingBuffer::default();
     for (line_idx, line) in content.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
@@ -528,15 +526,7 @@ fn observe_jsonl(
         if let Some(sid) = line_session_id(&value) {
             sessions.insert(sid);
         }
-        if try_passthrough_event(
-            &value,
-            line,
-            &mut pending,
-            &mut pending_bytes,
-            &mut pending_truncated,
-            line_idx as u64,
-            obs,
-        ) {
+        if try_passthrough_event(&value, line, &mut pending, line_idx as u64, obs) {
             continue;
         }
         if looks_like_codex_rollout(&value) {
@@ -557,7 +547,7 @@ fn observe_jsonl(
     let mut runs = codex.emit_runs(obs);
     runs.extend(claude.emit_runs(obs));
     merge_emit_runs(runs, &mut emit, &mut events, obs);
-    events.extend(pending);
+    events.extend(pending.events);
     // Emit in feed-line order: scanner runs are already seq-merged and
     // passthrough events are buffered, so without this final stable
     // sort a passthrough event would land far from its true position
@@ -575,6 +565,19 @@ fn observe_jsonl(
     Ok(())
 }
 
+/// Bounded staging area for contract-form passthrough events between
+/// the feed scan and the seq-ordered merge. `closed` latches on the
+/// FIRST budget rejection — same semantics as `EmitBudget`: every later
+/// event drops detail, so survivors stay a feed-order prefix rather
+/// than a biased subset (#144 R23).
+#[derive(Default)]
+struct PendingBuffer {
+    events: Vec<(u64, SkillUsageEvent)>,
+    bytes: usize,
+    truncated: bool,
+    closed: bool,
+}
+
 /// Contract-form event logs are passed through after validation.
 /// `line` is the raw JSON text: deserializing the struct straight from
 /// it avoids deep-cloning the already-parsed `Value` tree (~30x the
@@ -582,9 +585,7 @@ fn observe_jsonl(
 fn try_passthrough_event(
     value: &Value,
     line: &str,
-    pending: &mut Vec<(u64, SkillUsageEvent)>,
-    pending_bytes: &mut usize,
-    pending_truncated: &mut bool,
+    pending: &mut PendingBuffer,
     seq: u64,
     obs: &mut Observation,
 ) -> bool {
@@ -719,11 +720,13 @@ fn try_passthrough_event(
     // CR); only their retained detail is dropped, with one latched
     // notice — same truncation semantics as record_event.
     let charge = event_total_charge(&event, obs.current_file_len);
-    if pending.len() >= MAX_OBSERVE_EVENTS
-        || pending_bytes.saturating_add(charge) > MAX_OBSERVE_RETAINED_BYTES
+    if pending.closed
+        || pending.events.len() >= MAX_OBSERVE_EVENTS
+        || pending.bytes.saturating_add(charge) > MAX_OBSERVE_RETAINED_BYTES
     {
-        if !*pending_truncated {
-            *pending_truncated = true;
+        pending.closed = true;
+        if !pending.truncated {
+            pending.truncated = true;
             obs_error(
                 obs,
                 "passthrough events truncated at pending budget".to_string(),
@@ -742,8 +745,8 @@ fn try_passthrough_event(
         }
         return true;
     }
-    *pending_bytes = pending_bytes.saturating_add(charge);
-    pending.push((seq, event));
+    pending.bytes = pending.bytes.saturating_add(charge);
+    pending.events.push((seq, event));
     true
 }
 
@@ -2828,7 +2831,11 @@ impl Funnel {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_injected_recommendation, under_cap};
+    use super::{
+        MAX_OBSERVE_RETAINED_BYTES, Observation, PendingBuffer, SkillUsageEvent,
+        event_total_charge, parse_injected_recommendation, try_passthrough_event, under_cap,
+    };
+    use serde_json::Value;
 
     /// #144 round-12: a hostile transcript line with a huge comma list
     /// must not materialize an unbounded Vec — the cap is applied during
@@ -2853,6 +2860,50 @@ mod tests {
         assert!(!under_cap(2, 2, "events", &mut noted, &mut errors));
         assert!(!under_cap(999, 2, "events", &mut noted, &mut errors));
         assert_eq!(errors, vec!["events truncated at 2".to_string()]);
+    }
+
+    /// #144 R23: the passthrough pending buffer must latch `closed` on
+    /// the first budget rejection — a dropped large event followed by a
+    /// smaller one that still fits must NOT be retained, or the merged
+    /// feed-order prefix would have a hole.
+    #[test]
+    fn passthrough_pending_latches_closed_on_first_rejection() {
+        let small_line = r#"{"schema_version":1,"kind":"prompt_submit","runtime":"claude-code","observed_via":"hook","prompt_hash":"abc"}"#;
+        let big_line = r#"{"schema_version":1,"kind":"prompt_submit","runtime":"claude-code","observed_via":"hook","prompt_hash":"abc","recommended":[{"name":"aaa"},{"name":"bbb"},{"name":"ccc"}]}"#;
+        let small: SkillUsageEvent = serde_json::from_str(small_line).unwrap();
+        let big: SkillUsageEvent = serde_json::from_str(big_line).unwrap();
+        let charge_small = event_total_charge(&small, 0);
+        let charge_big = event_total_charge(&big, 0);
+        assert!(charge_big > charge_small);
+
+        // Headroom fits `small` exactly but not `big`.
+        let mut pending = PendingBuffer {
+            bytes: MAX_OBSERVE_RETAINED_BYTES - charge_small,
+            ..PendingBuffer::default()
+        };
+        let mut obs = Observation::default();
+
+        let value: Value = serde_json::from_str(big_line).unwrap();
+        assert!(try_passthrough_event(
+            &value,
+            big_line,
+            &mut pending,
+            0,
+            &mut obs,
+        ));
+        assert!(pending.closed);
+        assert!(pending.events.is_empty());
+
+        // Would fit the byte budget, but the latch drops it too.
+        let value: Value = serde_json::from_str(small_line).unwrap();
+        assert!(try_passthrough_event(
+            &value,
+            small_line,
+            &mut pending,
+            1,
+            &mut obs,
+        ));
+        assert!(pending.events.is_empty());
     }
 }
 
