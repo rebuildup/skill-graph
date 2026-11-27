@@ -187,11 +187,15 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   （timestamp sort は `funnel_for` の下流 (timestamp, index) sort が
   担う）。timestamp が欠落・同値の場合も真の出現順が保たれ、
   untimestamped rec の `li > ri` fallback は encounter order を
-  比較する。transcript scanner の `finish()` emit は merge 前に
-  共有 budget（`MAX_OBSERVE_EVENTS` 件・`MAX_OBSERVE_RETAINED_BYTES`
-  推定 byte、両 scanner 合算）で制限され、超過 event は detail を
-  捨てて counter map のみ更新する（passthrough pending buffer と
-  同じ意味論）。tool_use 1 件あたりの classification 数も
+  比較する。transcript scanner の emit は `emit_runs()` が生成する
+  seq-ordered lazy run を `merge_emit_runs` が feed line index で
+  k-way merge し、共有 budget（`MAX_OBSERVE_EVENTS` 件・
+  `MAX_OBSERVE_RETAINED_BYTES` 推定 byte、両 scanner 合算）で
+  feed 順に制限する。budget が最初に event を拒否した時点で
+  `closed` latch が立ち、以降の event は全て detail を捨てて
+  counter map のみ更新するため、emit される event 列は常に feed
+  順の真の prefix になる（passthrough pending buffer と同じ
+  意味論）。tool_use 1 件あたりの classification 数も
   `MAX_EVENTS_PER_PAYLOAD`（64）で打ち切る（hook の per-payload
   cap と同じ上限）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に

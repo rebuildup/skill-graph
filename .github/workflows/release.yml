@@ -18,10 +18,33 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    outputs:
+      tag_sha: ${{ steps.tag.outputs.tag_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.tag || github.ref }}
+      - name: Bind checkout to the release tag commit
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          # Tag names reach shell via env only; validate before any use.
+          [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || {
+            echo "invalid tag: $RELEASE_TAG"; exit 1; }
+          # checkout's ref resolution can prefer a same-named branch over
+          # the tag, and a branch-resolved checkout does not fetch the
+          # tag ref — fetch it explicitly so the comparison below always
+          # sees the real tag object (#144 r20).
+          git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          # Peel annotated tags to the commit: refs/tags/<tag> alone
+          # resolves to the tag object for annotated tags, which would
+          # never equal HEAD's commit SHA.
+          tag_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          [ "$head_sha" = "$tag_sha" ] || {
+            echo "checked-out HEAD $head_sha is not tag $RELEASE_TAG ($tag_sha)"; exit 1; }
+          echo "tag_sha=$tag_sha" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.100.0
@@ -46,7 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # The peeled tag commit resolved and verified in `verify` —
+          # never the ambiguous tag/branch name (#144 r20).
+          ref: ${{ needs.verify.outputs.tag_sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.100.0
@@ -66,12 +91,12 @@ jobs:
           path: skill-graph-${{ matrix.target }}.tar.gz
 
   release:
-    needs: build
+    needs: [verify, build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.verify.outputs.tag_sha }}
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -87,17 +112,13 @@ jobs:
           got=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
           [ "$want" = "$got" ] || {
             echo "tag $RELEASE_TAG does not match Cargo.toml version $got"; exit 1; }
-          # The checked-out ref must actually be this tag: checkout's
-          # ref resolution can prefer a same-named branch over the tag,
-          # which would build and publish the branch under the tag's
-          # provenance (#144 r19).
-          # Peel annotated tags to the commit: refs/tags/<tag> alone
-          # resolves to the tag object for annotated tags, which would
-          # never equal HEAD's commit SHA.
-          tag_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
+          # The checked-out ref must be the tag commit verified in the
+          # `verify` job. checkout is pinned to that SHA, so compare
+          # HEAD directly — resolving refs/tags/ here would fail because
+          # a SHA checkout does not fetch tag refs (#144 r20).
           head_sha="$(git rev-parse HEAD)"
-          [ "$head_sha" = "$tag_sha" ] || {
-            echo "checked-out HEAD $head_sha is not tag $RELEASE_TAG ($tag_sha)"; exit 1; }
+          [ "$head_sha" = "${{ needs.verify.outputs.tag_sha }}" ] || {
+            echo "checked-out HEAD $head_sha is not the verified tag commit"; exit 1; }
       - name: Checksums
         run: |
           cd dist

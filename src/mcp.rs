@@ -286,17 +286,29 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
             // truncation (a hostile corpus can produce ~1k entries).
             const MAX_DISCOVER_ERRORS: usize = 256;
             let mut errors: Vec<String> = diagnostics;
-            let room = MAX_DISCOVER_ERRORS.saturating_sub(errors.len());
+            // Reserve two slots for the truncation markers pushed below
+            // so the final vector never exceeds the cap (#144 r20).
+            let room = MAX_DISCOVER_ERRORS
+                .saturating_sub(errors.len())
+                .saturating_sub(2);
             errors.extend(discovery.errors.iter().take(room).cloned());
             if discovery.errors.len() > room {
                 errors.push(format!("errors truncated at {MAX_DISCOVER_ERRORS}"));
             }
+            // Take before mapping: Skill::summary clones name/description/
+            // paths per skill, so mapping all ~10k discovered skills only
+            // to truncate to 512 wastes the clones (#144 r20).
+            let skills_truncated = discovery.skills.len() > MAX_DISCOVER_SKILLS;
             let mut output = DiscoveryOutput {
-                skills: discovery.skills.iter().map(Skill::summary).collect(),
+                skills: discovery
+                    .skills
+                    .iter()
+                    .take(MAX_DISCOVER_SKILLS)
+                    .map(Skill::summary)
+                    .collect(),
                 errors,
             };
-            if output.skills.len() > MAX_DISCOVER_SKILLS {
-                output.skills.truncate(MAX_DISCOVER_SKILLS);
+            if skills_truncated {
                 output.errors.push(format!(
                     "discover output truncated to {MAX_DISCOVER_SKILLS} skills"
                 ));
