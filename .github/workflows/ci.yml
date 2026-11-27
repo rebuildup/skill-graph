@@ -5,6 +5,13 @@ on:
     tags: ["v*"]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   base-guard:
     # Release-driven delivery: ticket PRs must target the active
@@ -13,6 +20,7 @@ jobs:
     # 拒否する)。Push events have no base_ref and skip this check.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: PR refs must follow the release-driven delivery model
         # Refs pass through env, never `${{ }}` interpolation: ref names
@@ -22,23 +30,33 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
         run: |
           # Ticket PRs integrate into a release-* branch. The only
-          # main-bound PR allowed is a release-* integration head.
-          # `release-*` is a naming convention, not proof of release
-          # status — the human merge-approval boundary for main covers
-          # the residual (#144). Push events skip this job entirely.
+          # main-bound PR allowed is a release-* integration head —
+          # and that head must live in THIS repository: a fork branch
+          # named `release-*` is attacker-controlled and proves
+          # nothing (#221). `release-*` is a naming convention, not
+          # proof of release status — the human merge-approval
+          # boundary for main covers the residual (#144). Push events
+          # skip this job entirely.
+          head_is_release=0
+          if [[ "$HEAD_REF" == release-* && "$HEAD_REPO" == "$REPO" ]]; then
+            head_is_release=1
+          fi
           if [[ "$BASE_REF" != release-* ]] &&
-             { [ "$BASE_REF" != "main" ] || [[ "$HEAD_REF" != release-* ]]; }; then
+             { [ "$BASE_REF" != "main" ] || [ "$head_is_release" -ne 1 ]; }; then
             echo "ticket PRs must target a release-* branch;" >&2
-            echo "main-bound PRs must come from a release-* branch." >&2
+            echo "main-bound PRs must come from a same-repo release-* branch." >&2
             exit 1
           fi
   rust:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: 1.100.0
           components: rustfmt, clippy
@@ -106,7 +124,11 @@ jobs:
     # compiling and testing on exactly that toolchain (#130 — declared
     # MSRV was previously unverified). The toolchain is read from the
     # manifest so a rust-version bump can never drift from CI.
+    # RUSTUP_TOOLCHAIN is required: rust-toolchain.toml in the repo
+    # (newer channel) takes precedence over the action's default
+    # toolchain, which would silently test the wrong rustc (#221).
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Read declared rust-version
@@ -115,8 +137,12 @@ jobs:
           v="$(grep -m1 '^rust-version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           [ -n "$v" ] || { echo "rust-version missing in Cargo.toml" >&2; exit 1; }
           echo "version=$v" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - run: cargo check --locked --all-targets
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
       - run: cargo test --locked
+        env:
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
