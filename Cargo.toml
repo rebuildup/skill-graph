@@ -25,6 +25,7 @@ walkdir = "2"
 rmcp = { version = "3.11.0", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["rt"] }
 tempfile = "3"
+unsafe-libyaml = "0.2.11"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1278,3 +1278,39 @@ fn opencode_status_empty_skill_graph_bin_uses_path() {
     assert!(out.contains("enabled"), "{out}");
     assert!(!out.contains("broken"), "{out}");
 }
+
+/// Round-17: status/disable resolve the payload dir from the config's
+/// own file:// spec, not the current XDG_DATA_HOME — an env change
+/// between enable and status must not report a healthy install as
+/// broken, and disable must remove the spec-referenced payload.
+#[test]
+fn opencode_status_and_disable_follow_spec_dir_across_env_change() {
+    let f = Fixture::new();
+    let (out, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    let payload = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin");
+    assert!(payload.join("index.ts").is_file());
+
+    // Status under a different XDG_DATA_HOME: the spec still points at
+    // the original payload, which exists -> enabled, not broken.
+    let alt = f.home.path().join("alt-data");
+    let (out, rc) = f.run_env(
+        &["adapter", "status", "opencode", "--user"],
+        &[("XDG_DATA_HOME", alt.to_str().unwrap())],
+    );
+    assert_eq!(rc, 0, "{out}");
+    assert!(out.contains("enabled"), "{out}");
+    assert!(!out.contains("broken"), "{out}");
+
+    // Disable under the changed env must remove the spec-referenced
+    // payload, not the (nonexistent) env-resolved dir.
+    let (_, rc) = f.run_env(
+        &["adapter", "disable", "opencode", "--user"],
+        &[("XDG_DATA_HOME", alt.to_str().unwrap())],
+    );
+    assert_eq!(rc, 0);
+    assert!(!payload.exists(), "spec-referenced payload must be removed");
+}

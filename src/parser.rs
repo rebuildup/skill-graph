@@ -102,6 +102,52 @@ fn no_follow(opts: &mut fs::OpenOptions) {
 #[cfg(not(unix))]
 fn no_follow(_opts: &mut fs::OpenOptions) {}
 
+/// True when the YAML document stream contains at least one alias
+/// (`*name`) event. A libyaml parse error returns false: serde_yaml runs
+/// the same parser and reports its own frontmatter parse_error, so an
+/// unscanned suffix cannot smuggle an alias into a document serde_yaml
+/// would reject anyway.
+fn yaml_contains_alias(input: &str) -> bool {
+    use unsafe_libyaml::{
+        YAML_ALIAS_EVENT, YAML_STREAM_END_EVENT, yaml_event_delete, yaml_event_t,
+        yaml_parser_delete, yaml_parser_initialize, yaml_parser_parse,
+        yaml_parser_set_input_string, yaml_parser_t,
+    };
+    // SAFETY: `parser`/`event` are initialized by the libyaml calls before
+    // use; every produced event is deleted before the next parse, and both
+    // objects are deleted on every exit path.
+    unsafe {
+        let mut parser = std::mem::MaybeUninit::<yaml_parser_t>::uninit();
+        if yaml_parser_initialize(parser.as_mut_ptr()).fail {
+            return false;
+        }
+        let parser = parser.as_mut_ptr();
+        yaml_parser_set_input_string(
+            parser,
+            input.as_ptr().cast(),
+            input.len().try_into().unwrap(),
+        );
+        let mut event = std::mem::MaybeUninit::<yaml_event_t>::uninit();
+        let event = event.as_mut_ptr();
+        let found = loop {
+            if yaml_parser_parse(parser, event).fail {
+                break false;
+            }
+            let is_alias = (*event).type_ == YAML_ALIAS_EVENT;
+            let is_end = (*event).type_ == YAML_STREAM_END_EVENT;
+            yaml_event_delete(event);
+            if is_alias {
+                break true;
+            }
+            if is_end {
+                break false;
+            }
+        };
+        yaml_parser_delete(parser);
+        found
+    }
+}
+
 /// Read at most `MAX_SKILL_BYTES + 1` bytes. The size cap is enforced
 /// on bytes actually read — pre-read metadata can be falsified by a
 /// file that grows between `metadata()` and `read()`, is swapped, or
@@ -166,7 +212,22 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
 
     let mut parse_error = unterminated.then(|| "unterminated frontmatter fence".to_string());
     let mut meta = Frontmatter::default();
-    if !frontmatter.trim().is_empty() {
+    // serde_yaml expands YAML aliases by re-walking the anchored event
+    // subtree once per reference; its jump-count guard bounds the number
+    // of jumps, not the re-walked events, so a flat anchor/alias pair in
+    // ≤1 MiB of frontmatter can materialize ~10^10 nodes and OOM the
+    // process (#144 r17). Anchors alone are harmless — only aliases
+    // expand — and Agent Skills frontmatter never legitimately uses
+    // them, so reject any document containing an alias event. The scan
+    // uses the same libyaml event stream serde_yaml consumes, so it
+    // cannot disagree with what the parser would have expanded.
+    if !frontmatter.trim().is_empty() && yaml_contains_alias(frontmatter) {
+        let msg = "frontmatter: YAML aliases are not supported".to_string();
+        parse_error = Some(match parse_error {
+            Some(prev) => format!("{prev}; {msg}"),
+            None => msg,
+        });
+    } else if !frontmatter.trim().is_empty() {
         match serde_yaml::from_str::<Frontmatter>(frontmatter) {
             Ok(parsed) => meta = parsed,
             Err(err) => {
@@ -527,5 +588,54 @@ mod tests {
         assert!(!cleaned.contains('\n'));
         assert!(!cleaned.contains('\t'));
         assert_eq!(cleaned.chars().count(), 1024);
+    }
+
+    #[test]
+    fn yaml_alias_in_frontmatter_is_rejected() {
+        // serde_yaml expands aliases by re-walking the anchored subtree
+        // per reference with only a jump-count bound — a flat
+        // anchor/alias pair can materialize ~10^10 nodes (#144 r17).
+        // The libyaml event scan must reject before serde_yaml runs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_skill(
+            &dir.path().join("alias-skill"),
+            "name: alias-skill\ndescription: d\nmetadata:\n  a: &x [s, s, s]\n  b: [*x, *x]",
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(
+            skill.parse_error.as_deref().unwrap_or("").contains("alias"),
+            "{:?}",
+            skill.parse_error
+        );
+    }
+
+    #[test]
+    fn yaml_alias_as_scalar_value_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_skill(
+            &dir.path().join("alias-skill2"),
+            "name: base\ndescription: &d anchored\nkeywords: &k [a, b]\nmetadata:\n  m: *k",
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(
+            skill.parse_error.as_deref().unwrap_or("").contains("alias"),
+            "{:?}",
+            skill.parse_error
+        );
+    }
+
+    #[test]
+    fn yaml_anchor_without_alias_still_parses() {
+        // Anchors alone cost nothing — only aliases expand — so they
+        // must not be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_skill(
+            &dir.path().join("anchor-skill"),
+            "name: anchor-skill\ndescription: d\nmetadata:\n  a: &x hello",
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(skill.parse_error.is_none(), "{:?}", skill.parse_error);
+        assert_eq!(skill.name, "anchor-skill");
+        assert_eq!(skill.metadata.get("a").map(String::as_str), Some("hello"));
     }
 }

@@ -242,15 +242,14 @@ async function recommendNames(
   max = 5,
   context = "",
 ): Promise<{ name: string; digest?: string }[]> {
-  const roots = (process.env.SKILL_GRAPH_ROOTS ?? "")
-    .split(":")
-    .filter(Boolean)
-    .flatMap((r) => ["--root", r])
+  // No --root args: the spawned CLI inherits SKILL_GRAPH_ROOTS, and
+  // resolve_roots gives that env var precedence over explicit args, so
+  // argv roots would be dead whenever the env is set (#144 r17).
   // The query travels on stdin (--query-stdin), not argv: prompts may
   // begin with `-` and prompt bodies should not sit in process listings.
   const args = [
     SKILL_GRAPH_BIN, "recommend", "--query-stdin",
-    ...roots, "--max", String(max), "--format", "json",
+    "--max", String(max), "--format", "json",
   ]
   if (context) args.push("--context", context)
   const proc = Bun.spawn(args, {

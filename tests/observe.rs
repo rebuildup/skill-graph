@@ -910,3 +910,65 @@ fn claude_duplicate_tool_use_id_claims_frontmatter_once() {
             .any(|e| e.skill_name.as_deref() == Some("beta"))
     );
 }
+
+/// Round-17 M2: an untimestamped recommendation admits loads by
+/// encounter order (`li > ri`), so the conversion winner must be
+/// ranked by encounter order too. Timestamp-sorted position would let
+/// an old-but-valid timestamp encountered LAST win over an
+/// earlier-encountered untimestamped load, inflating `converted`.
+#[test]
+fn funnel_untimestamped_rec_ranks_loads_by_encounter_order() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // Untimestamped rec recommending {alpha, beta}.
+            rec_event("s1", "", &["alpha", "beta"], true),
+            // Second untimestamped rec recommending beta only.
+            rec_event("s1", "", &["beta"], true),
+            // Untimestamped beta load, encountered before alpha's.
+            load_event("s1", "", "beta"),
+            // Old-timestamped alpha load encountered LAST: sorts FIRST
+            // by timestamp but must lose the encounter-order ranking.
+            load_event("s1", "2020-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // Encounter-order greedy: rec1 consumes beta (earliest eligible),
+    // rec2 finds nothing -> converted = 1. Timestamp-position ranking
+    // would consume alpha for rec1 and leave beta for rec2 -> 2.
+    assert_eq!(v["converted_recommendations"], 1);
+}
+
+/// Round-17 M1: transcript-derived and contract-log passthrough events
+/// share one (timestamp, feed-line) ordering, so a transcript event on
+/// an earlier line is not displaced by a passthrough event recorded
+/// later in the same file.
+#[test]
+fn mixed_passthrough_and_transcript_events_keep_feed_order() {
+    let dir = TempDir::new().unwrap();
+    write_transcript(
+        &dir,
+        "mixed.jsonl",
+        &[
+            // Transcript-derived load on line 0 (untimestamped).
+            r#"{"type":"assistant","sessionId":"s1","message":{"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/x/skills/beta-skill/SKILL.md"}}]}}"#,
+            // Passthrough contract load on line 1 (untimestamped).
+            r#"{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"s1","timestamp":"","observed_via":"hook","skill_name":"alpha-skill","detection":"file_read","confidence":"high"}"#,
+        ],
+    );
+    let obs = observe_path(dir.path()).unwrap();
+    let names: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .filter_map(|e| e.skill_name.clone())
+        .collect();
+    // Feed order: transcript load (line 0) must precede the
+    // passthrough load (line 1); inline recording used to invert this.
+    assert_eq!(
+        names,
+        vec!["beta-skill".to_string(), "alpha-skill".to_string()]
+    );
+}

@@ -40,11 +40,11 @@
 - skill の読み込みを成果物品質の保証として扱わない。
 - 推薦 admission は direct relevance または explicit `requires` dependency に限定する。direct relevance は以下のいずれかとする（`src/search.rs` の `directly_admitted` + exact-name admission）:
   - query が skill name に完全一致（exact name。parse-error skill は対象外）
-  - query term が skill name に 2 語以上一致、または 1 語一致かつ corpus 内で低頻度（df ≤ max(2, corpus の 10%)）かつ 4 文字以上
+  - query term が skill name に 2 語以上一致、または 1 語一致かつ corpus 内で低頻度（df ≤ max(2, distinct skill name 数の 10%)）かつ 4 文字以上
   - name hit 1 語以上 + description hit 2 語以上（name が identity を anchor し description が主題適合を確認する `name_plus_description`）
   - description hit 2 語以上、うち少なくとも 1 語が低頻度、かつ hit が **2 つ以上の独立した provenance source** から来ること（単一の CJK evidence unit が出す bigram cluster + glossary 展開を独立証拠と数えない）
   - context term が description に 2 語以上一致し、同様に 2 つ以上の独立 source から来ること
-  - 加えて、admitted skill の explicit `requires` link 先は necessity として伝播 admit される（parse-error skill は seed にも target にもならない）。
+  - 加えて、admitted skill の explicit `requires` link 先は necessity として伝播 admit される（parse-error skill は seed にも target にもならない）。伝播の (seed × link × 同名 copy) 組合せは 4,000,000 検査で打ち切り、伝播 reason も 1 skill 64 件の cap を共有する（#144 r17）。
   document frequency は name + description を対象に計算するが、description 側には frontmatter の `keywords` と組み込み glossary による CJK→英語展開（`expand_gloss`）を含む（`src/search.rs` の `document_frequency`）。Markdown link・名前言及・backlink・body text・link target の一致は relatedness / weak evidence であり、単独では推薦しない。
   term 抽出の対象 script は ASCII 英数字と CJK（ひらがな・カタカナ・漢字・ハングル）のみ。それ以外の文字体系（キリル・アラビア・ギリシャ・アクセント付きラテン等）は現行実装では term を生成しない既知の境界であり、対応が必要になった場合は Unicode 対応の tokenization を別途設計する。
 
