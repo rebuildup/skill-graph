@@ -428,7 +428,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   `~/.local/share` の canonical path）の配下にある dir に限定
   される。spec decode だけでは任意の `*/skill-graph/opencode-plugin`
   を削除対象にできない（#144 r19）。最終 component が symlink の
-  場合は link 自体を unlink し、target は削除しない。残余: enable
+  場合は canonicalize した **parent** が managed parent
+  （`<canonical base>/skill-graph`）に一致する時のみ link 自体を
+  unlink し、target は削除しない — foreign dir の symlink も
+  attacker-directed deletion になりうるため同じ base-membership
+  gate を通す（#144 r22）。残余: enable
   当時の custom `XDG_DATA_HOME` が unset 等で base 集合から外れた
   payload は orphan として残る（削除を拒否する方向の fail-safe）。
 - materialize される OpenCode plugin payload は XDG data dir 配下に

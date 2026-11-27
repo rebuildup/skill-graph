@@ -268,7 +268,10 @@ fn yaml_frontmatter_hazard(input: &str) -> Option<&'static str> {
                     (depth > MAX_YAML_DEPTH).then_some("YAML nesting exceeds the supported depth")
                 }
                 YAML_SEQUENCE_END_EVENT | YAML_MAPPING_END_EVENT => {
-                    depth -= 1;
+                    // saturating_sub: an unbalanced END is unreachable
+                    // in a conformant libyaml stream, but this is an
+                    // unsafe FFI block — never panic on depth underflow.
+                    depth = depth.saturating_sub(1);
                     None
                 }
                 _ => None,
