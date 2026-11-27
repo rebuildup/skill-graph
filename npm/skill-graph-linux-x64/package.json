@@ -1,6 +1,6 @@
 {
   "name": "@rebuildup/skill-graph-linux-x64",
-  "version": "0.4.0",
+  "version": "1.0.0",
   "description": "skill-graph native binary for linux/x64",
   "license": "MIT",
   "os": [
