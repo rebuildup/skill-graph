@@ -1,5 +1,9 @@
 # Product Spec — skill-graph
 
+> 旧称注記: 本文中の `project-init` は `rebuildup/project-init` の旧称であり、
+> 現行の canonical repository は `rebuildup/aude-skills`（改名追跡:
+> rebuildup/aude-skills#212）。
+
 ## 目的
 
 Agent Skills の存在をエージェントが自発的に認識できない問題を、標準 Markdown / frontmatter / 参照関係 / 作業コンテキストを使って改善する。単なる検索 CLI ではなく、必要なスキルが必要なタイミングで読み込まれることを目指す。
