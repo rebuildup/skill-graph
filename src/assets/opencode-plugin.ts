@@ -282,6 +282,11 @@ async function recommendNames(
 const MAX_RESULT_TEXT_BYTES = 64 * 1024
 const MAX_INPUT_JSON_BYTES = 1024 * 1024
 const MAX_PAYLOAD_BYTES = 1024 * 1024
+// Tool names are small identifiers; error/status text is forwarded
+// only for the Rust-side failure guard, which checks shape (== "error",
+// === false, non-empty) and never reads content (#144 r22).
+const MAX_TOOL_NAME_BYTES = 4 * 1024
+const MAX_ERROR_TEXT_BYTES = 64 * 1024
 
 // Caps are UTF-8 BYTES, not UTF-16 code units: `"あ".repeat(400000)`
 // is ~1.2 MB but only 400k `String.length` (#144 r18 CR).
@@ -334,10 +339,23 @@ function resultText(result: unknown): string {
   }
 }
 
+// Rust's failure guard treats any non-null, non-false, non-""
+// `error` as a failed call and never reads its content — so strings are
+// sliced and objects/arrays collapse to a presence marker. Bounding
+// BEFORE JSON.stringify keeps a host-supplied multi-hundred-MB error
+// from materializing in this long-lived process (#144 r22).
+function boundedError(e: unknown): unknown {
+  if (typeof e === "string") return utf8Slice(e, MAX_ERROR_TEXT_BYTES)
+  if (e !== null && typeof e === "object") return true
+  return e
+}
+
 async function detectLoad(event: any): Promise<Record<string, any>[]> {
   try {
     // Cheap pre-filter: only SKILL.md-touching tools reach the binary.
-    const tool = String(event.tool ?? "")
+    // tool is host-supplied: bound it before toLowerCase/stringify so a
+    // giant string cannot allocate twice in this long-lived process.
+    const tool = utf8Slice(String(event.tool ?? ""), MAX_TOOL_NAME_BYTES)
     const input = event.input ?? {}
     const inputJson = JSON.stringify(input ?? {})
     // An oversized input cannot fit the payload budget below anyway —
@@ -350,6 +368,8 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     if (!isSkillTool && !touches) return []
 
     const sid = safeSessionID(event.sessionID)
+    const status = (event as any).status
+    const success = (event as any).success
 
     const payload = {
       tool_name: tool,
@@ -358,10 +378,13 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       session_id: sid,
       // Forwarded defensively so the Rust-side error-status guard also
       // applies to plugin-originated payloads (the field name is
-      // UNVERIFIED against the OpenCode event API).
-      status: (event as any).status,
-      success: (event as any).success,
-      error: (event as any).error,
+      // UNVERIFIED against the OpenCode event API). Rust only reads
+      // status as a string, success as a bool, and error's non-emptiness
+      // — non-matching types carry no signal, so they are dropped rather
+      // than serialized at unbounded size.
+      status: typeof status === "string" ? utf8Slice(status, MAX_ERROR_TEXT_BYTES) : undefined,
+      success: typeof success === "boolean" ? success : undefined,
+      error: boundedError((event as any).error),
     }
     const body = JSON.stringify(payload)
     // The child's stdin parse cap is 4 MiB; anything near it would be

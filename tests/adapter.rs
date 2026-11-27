@@ -1198,6 +1198,37 @@ fn disable_keeps_payload_when_project_config_unreadable() {
     );
 }
 
+/// #144 r22: the final-component symlink unlink must satisfy the same
+/// base-membership gate as the recursive delete. A crafted project
+/// `file://` spec can name ANY absolute `*/skill-graph/opencode-plugin`
+/// — unlinking a foreign symlink there is still attacker-directed
+/// deletion, so the parent must canonicalize to a managed payload
+/// parent under a data-home base.
+#[cfg(unix)]
+#[test]
+fn disable_keeps_foreign_payload_symlink() {
+    let f = Fixture::new();
+    // Foreign payload-shaped symlink OUTSIDE the data-home bases:
+    // <proj>/evil/skill-graph/opencode-plugin -> <proj>/target.
+    let evil = f.proj.path().join("evil/skill-graph/opencode-plugin");
+    std::fs::create_dir_all(evil.parent().unwrap()).unwrap();
+    let target = f.proj.path().join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &evil).unwrap();
+    // The project config references it via a file:// spec — our own
+    // marker makes it "ours" to strip, and its decoded dir enters the
+    // deletion candidates.
+    let spec = format!("file://{}", evil.display());
+    let cfg = f.proj.path().join("opencode.json");
+    std::fs::write(&cfg, format!(r#"{{"plugins":["{spec}","other-plugin"]}}"#)).unwrap();
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--project"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        evil.symlink_metadata().unwrap().file_type().is_symlink(),
+        "foreign payload symlink must survive disable: {out}"
+    );
+}
+
 /// #144 r12 CodeRabbit: config reads are strict UTF-8 — invalid bytes
 /// must error out instead of being lossy-rewritten and persisted.
 #[test]

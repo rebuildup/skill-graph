@@ -1457,17 +1457,22 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 }
                 payload_dirs.sort();
                 payload_dirs.dedup();
-                // Canonicalized data-home bases: the resolved payload
-                // dir must BE `<base>/skill-graph/opencode-plugin` for
-                // one of them — `starts_with` would also admit a
-                // foreign `other-vendor/skill-graph/opencode-plugin`
-                // nested under the same base, and the managed payload
-                // is never nested deeper than the marker (#144 r19/r20).
-                let bases: Vec<PathBuf> = payload_base_dirs()
+                // Canonicalized data-home bases: managed payload
+                // locations are exactly `<base>/skill-graph` (parent,
+                // gates symlink unlinks) and `<base>/skill-graph/
+                // opencode-plugin` (full dir, gates recursive deletes).
+                // `starts_with` would also admit a foreign
+                // `other-vendor/skill-graph/opencode-plugin` nested
+                // under the same base, and the managed payload is never
+                // nested deeper than the marker (#144 r19/r20).
+                let base_dirs: Vec<PathBuf> = payload_base_dirs()
                     .iter()
                     .filter_map(|b| b.canonicalize().ok())
-                    .map(|b| b.join(PLUGIN_MARKER))
                     .collect();
+                let managed_parents: Vec<PathBuf> =
+                    base_dirs.iter().map(|b| b.join("skill-graph")).collect();
+                let managed_dirs: Vec<PathBuf> =
+                    base_dirs.iter().map(|b| b.join(PLUGIN_MARKER)).collect();
                 for dir in payload_dirs {
                     // The lexical guard above cannot see symlinks in
                     // intermediate components: a spec naming
@@ -1480,16 +1485,28 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                     // canonicalize() would resolve it and delete the
                     // link target's contents. Unlink the link itself
                     // instead — the payload entry is gone either way.
+                    // The unlink needs the same base-membership gate as
+                    // the recursive delete: spec-decoded dirs are
+                    // arbitrary absolute paths, and removing a foreign
+                    // `*/skill-graph/opencode-plugin` symlink is still
+                    // attacker-directed deletion (#144 r22). Canonicalize
+                    // the PARENT — never the final component.
                     if dir
                         .symlink_metadata()
                         .map(|m| m.file_type().is_symlink())
                         .unwrap_or(false)
                     {
-                        let _ = std::fs::remove_file(&dir);
+                        let parent_ok = dir
+                            .parent()
+                            .and_then(|p| p.canonicalize().ok())
+                            .is_some_and(|p| managed_parents.contains(&p));
+                        if parent_ok {
+                            let _ = std::fs::remove_file(&dir);
+                        }
                         continue;
                     }
                     let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                    if is_managed_payload_dir(&resolved) && bases.contains(&resolved) {
+                    if is_managed_payload_dir(&resolved) && managed_dirs.contains(&resolved) {
                         let _ = std::fs::remove_dir_all(&resolved);
                     }
                 }
