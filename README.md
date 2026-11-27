@@ -12,16 +12,15 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 パッケージマネージャから導入する。hook の有効化は install では行われず、
 後述の `skill-graph adapter enable` で明示的に opt-in する。
 
-**現時点で利用可能なチャネルは mise（`github:` backend）と Homebrew。**
-npm と crates.io は配布 workflow とパッケージ定義は v0.4.0 に含まれるが、
-外部レジストリへの公開は未完了（`NPM_TOKEN` / crates.io token 未設定）
-のため **準備中** であり、現状は install できない。
+**利用可能なチャネルは mise（`github:` backend）・Homebrew・npm・
+crates.io の4系統。** v0.5.0 で全チャネルへの正式公開を完了した
+（v0.4.0 時点では npm / crates.io が未公開だった）。
 
 ### mise（推奨・動作保証チャネル）
 
 ```bash
 mise use -g github:rebuildup/skill-graph          # 最新版
-mise use -g github:rebuildup/skill-graph@0.4.0   # バージョン固定
+mise use -g github:rebuildup/skill-graph@0.5.0   # バージョン固定
 ```
 
 GitHub Release のバイナリ tarball を直接取得するため、外部レジストリの
@@ -33,10 +32,10 @@ GitHub Release のバイナリ tarball を直接取得するため、外部レ�
 brew install rebuildup/tap/skill-graph
 ```
 
-`rebuildup/homebrew-tap` の formula が v0.4.0 release asset を参照する
+`rebuildup/homebrew-tap` の formula が v0.5.0 release asset を参照する
 （`on_macos`/`on_linux` × Intel/ARM）。
 
-### npm / Bun / pnpm（準備中・未公開）
+### npm / Bun / pnpm
 
 ```bash
 npm install -g @rebuildup/skill-graph
@@ -46,18 +45,12 @@ pnpm add -g @rebuildup/skill-graph
 
 パッケージ定義は `npm/` にあり、platform 別バイナリを optional
 dependency として同梱する設計（postinstall のダウンロード・ビルドなし）。
-ただし **npm registry への publish は未実施**（`NPM_TOKEN` 未設定）のため、
-現時点ではこのコマンドは失敗する。公開完了までは mise または Homebrew
-を使うこと。
 
-### crates.io（準備中・未公開）
+### crates.io
 
 ```bash
 cargo install skill-graph
 ```
-
-crate 定義は `Cargo.toml` にあるが **crates.io への publish は未実施**
-（registry token 未設定）のため、現時点ではこのコマンドは失敗する。
 
 ソースからビルドする場合（Rust toolchain は `rust-toolchain.toml` 参照）:
 
