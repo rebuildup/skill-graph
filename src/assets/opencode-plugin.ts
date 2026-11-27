@@ -274,15 +274,55 @@ async function recommendNames(
   }
 }
 
+// The plugin host is long-lived: an uncapped tool result or input
+// would be buffered here (parts → join → JSON.stringify → stdin),
+// several× amplified, before the child's own 16 MiB/4 MiB stdin caps
+// ever see it (#144 r18). Legitimate hook/plugin payloads are
+// KB-scale, so these bounds are generous.
+const MAX_RESULT_TEXT_BYTES = 64 * 1024
+const MAX_INPUT_JSON_BYTES = 1024 * 1024
+const MAX_PAYLOAD_BYTES = 1024 * 1024
+
+// Caps are UTF-8 BYTES, not UTF-16 code units: `"あ".repeat(400000)`
+// is ~1.2 MB but only 400k `String.length` (#144 r18 CR).
+const utf8Bytes = (s: string) => Buffer.byteLength(s, "utf8")
+
+// Largest prefix of `s` within `maxBytes` UTF-8 bytes, never splitting
+// a code point (for..of iterates code points, not UTF-16 units).
+function utf8Slice(s: string, maxBytes: number): string {
+  if (utf8Bytes(s) <= maxBytes) return s
+  let out = ""
+  let used = 0
+  for (const ch of s) {
+    const b = utf8Bytes(ch)
+    if (used + b > maxBytes) break
+    out += ch
+    used += b
+  }
+  return out
+}
+
 function resultText(result: unknown): string {
-  if (typeof result === "string") return result
+  if (typeof result === "string") return utf8Slice(result, MAX_RESULT_TEXT_BYTES)
   try {
     const r = result as any
     const parts: string[] = []
+    // `total` charges each part's bytes PLUS one for the "\n" the
+    // join will insert — otherwise 64Ki parts of {text:""} would
+    // still double the budget via separators (#144 r18 CR).
+    let total = 0
+    const push = (s: string) => {
+      const room = MAX_RESULT_TEXT_BYTES - total
+      if (room <= 1) return
+      const t = utf8Slice(s, room - 1)
+      if (!t) return
+      parts.push(t)
+      total += utf8Bytes(t) + 1
+    }
     const walk = (v: any) => {
-      if (!v || typeof v !== "object") return
-      if (typeof v.text === "string") parts.push(v.text)
-      if (typeof v.content === "string") parts.push(v.content)
+      if (total >= MAX_RESULT_TEXT_BYTES || !v || typeof v !== "object") return
+      if (typeof v.text === "string") push(v.text)
+      if (typeof v.content === "string") push(v.content)
       if (Array.isArray(v.content)) v.content.forEach(walk)
       if (Array.isArray(v.output)) v.output.forEach(walk)
       if (v.output && typeof v.output === "object") walk(v.output)
@@ -300,23 +340,16 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     const tool = String(event.tool ?? "")
     const input = event.input ?? {}
     const inputJson = JSON.stringify(input ?? {})
+    // An oversized input cannot fit the payload budget below anyway —
+    // skip before the SKILL.md scan so a giant object is not walked
+    // twice (#144 r18).
+    if (utf8Bytes(inputJson) > MAX_INPUT_JSON_BYTES) return []
     const isSkillTool = tool.toLowerCase() === "skill"
     const touches = inputJson.includes("SKILL.md") ||
       (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
     if (!isSkillTool && !touches) return []
 
-    // Bound actual `detect` subprocess spawns per session. Counting
-    // happens HERE, after the prefilter — charging every tool call
-    // would let 512 unrelated executions silently disable detection
-    // for the rest of a long session.
     const sid = safeSessionID(event.sessionID)
-    const detects = detectCounts.get(sid) ?? 0
-    if (detects >= MAX_DETECT_PER_SESSION) return []
-    if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
-      const oldest = detectCounts.keys().next().value
-      if (oldest !== undefined) detectCounts.delete(oldest)
-    }
-    detectCounts.set(sid, detects + 1)
 
     const payload = {
       tool_name: tool,
@@ -330,11 +363,29 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       success: (event as any).success,
       error: (event as any).error,
     }
+    const body = JSON.stringify(payload)
+    // The child's stdin parse cap is 4 MiB; anything near it would be
+    // rejected after a wasted spawn, and the forwarded status/error
+    // fields are unbounded event data. Skip detection instead — the
+    // plugin fails open by design (#144 r18).
+    if (utf8Bytes(body) > MAX_PAYLOAD_BYTES) return []
+    // Bound actual `detect` subprocess spawns per session. Counting
+    // happens HERE — after the prefilter AND the payload gate — so
+    // oversized events that skip spawn cannot burn the session's
+    // detect budget, while 512 unrelated executions still cannot
+    // silently disable detection (#144 r18 CR).
+    const detects = detectCounts.get(sid) ?? 0
+    if (detects >= MAX_DETECT_PER_SESSION) return []
+    if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
+      const oldest = detectCounts.keys().next().value
+      if (oldest !== undefined) detectCounts.delete(oldest)
+    }
+    detectCounts.set(sid, detects + 1)
     const proc = Bun.spawn(
       [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
       { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
     )
-    proc.stdin.write(JSON.stringify(payload))
+    proc.stdin.write(body)
     proc.stdin.end()
     const out = await collectProc(proc).catch(() => "")
     const trimmed = out.trim()
@@ -372,6 +423,10 @@ export default Plugin.define({
     // load-grade event per prompt.
     const promptSkillSeen = new Map<string, Set<string>>()
 
+    // Per-session entry cap: MAX_PENDING_SESSIONS bounds distinct
+    // sessions, but a session whose context hook never drains would
+    // otherwise grow `list` for its whole lifetime (#144 r18).
+    const MAX_PENDING_ENTRIES_PER_SESSION = 64
     const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
       if (!names.length) return
       if (!pending.has(sessionID) && pending.size >= MAX_PENDING_SESSIONS) {
@@ -381,6 +436,9 @@ export default Plugin.define({
       }
       const list = pending.get(sessionID) ?? []
       list.push({ kind, names })
+      if (list.length > MAX_PENDING_ENTRIES_PER_SESSION) {
+        list.splice(0, list.length - MAX_PENDING_ENTRIES_PER_SESSION)
+      }
       pending.set(sessionID, list)
     }
 

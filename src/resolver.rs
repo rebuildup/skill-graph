@@ -7,7 +7,12 @@ pub struct Graph {
     pub skills: Vec<Skill>,
     pub by_name: HashMap<String, Vec<usize>>,
     pub by_path: HashMap<PathBuf, usize>,
-    pub backlinks: HashMap<usize, Vec<usize>>,
+    /// target index -> number of distinct source skills linking it.
+    /// Only the count is consumed (search.rs backlink reason), so the
+    /// per-target source list is never materialized: name-resolved
+    /// links would otherwise fan out O(sources × same-name copies)
+    /// pairs — ~100M inserts / >1 GB on a max corpus (#144 r18).
+    pub backlinks: HashMap<usize, usize>,
     pub ambiguous_names: Vec<String>,
 }
 
@@ -49,34 +54,45 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
     // carries the backlink. Sources are deduplicated per target: a skill
     // referencing the same copy through several link kinds (e.g. a
     // Markdown link plus Requires) counts once.
-    // Worst case is bounded by the discovery caps (10K skills ×
-    // 512 links + 64 requires + 64 mentions ≈ 6.4M pairs, ~100-200 MB
-    // transient per Graph). Rebuilt per call; revisit only if the
-    // discovery caps grow (#144 r13).
-    let mut backlinks: HashMap<usize, HashSet<usize>> = HashMap::new();
+    //
+    // Name-resolved links are aggregated per NAME, not per copy: every
+    // copy of a name shares the same name-source set, so materializing
+    // (target, source) pairs would cost O(links × same-name copies) —
+    // ~100M pairs on a 10K-skill corpus of duplicate installs (#144
+    // r18). Path-resolved links stay per-target. The final count per
+    // target is |name_sources[name] ∪ path_sources[target]|, computed
+    // as name-set size plus path-set members absent from the name set —
+    // O(links + targets × path-set size), independent of copy count.
+    let mut name_sources: HashMap<&str, HashSet<usize>> = HashMap::new();
+    let mut path_sources: HashMap<usize, HashSet<usize>> = HashMap::new();
     for (source, skill) in skills.iter().enumerate() {
         for link in &skill.links {
             if let Some(path) = &link.resolved_path
                 && let Some(&target) = by_path.get(path)
             {
-                backlinks.entry(target).or_default().insert(source);
+                path_sources.entry(target).or_default().insert(source);
                 continue;
             }
-            if let Some(name) = &link.resolved_name
-                && let Some(targets) = by_name.get(name)
-            {
-                for &target in targets {
-                    backlinks.entry(target).or_default().insert(source);
-                }
+            if let Some(name) = &link.resolved_name {
+                name_sources
+                    .entry(name.as_str())
+                    .or_default()
+                    .insert(source);
             }
         }
     }
-    let backlinks = backlinks
-        .into_iter()
-        .map(|(target, sources)| {
-            let mut sources: Vec<usize> = sources.into_iter().collect();
-            sources.sort_unstable();
-            (target, sources)
+    let backlinks: HashMap<usize, usize> = skills
+        .iter()
+        .enumerate()
+        .filter_map(|(index, skill)| {
+            let name_set = name_sources.get(skill.name.as_str());
+            let base = name_set.map_or(0, HashSet::len);
+            let extra = path_sources.get(&index).map_or(0, |set| {
+                set.iter()
+                    .filter(|s| name_set.is_none_or(|ns| !ns.contains(s)))
+                    .count()
+            });
+            (base + extra > 0).then_some((index, base + extra))
         })
         .collect();
 

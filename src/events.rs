@@ -681,7 +681,11 @@ pub fn classify_tool_access_all(
         // only the first Read access may claim it — attributing it to every
         // path would stamp the wrong skill name on the rest.
         let mut frontmatter_available = true;
-        for key in ["command", "cmd", "input"] {
+        // Parity with detect_all_from_payload's per-payload cap: observe
+        // scanners emit one event per classification, so an uncapped
+        // per-use list would fan out ~(uses × ~1.5K classes) before any
+        // downstream budget runs (#144 r18).
+        'keys: for key in ["command", "cmd", "input"] {
             if let Some(command) = input.get(key).and_then(Value::as_str) {
                 for (path, access) in classify_command(command) {
                     let c = match access {
@@ -701,6 +705,18 @@ pub fn classify_tool_access_all(
                             confidence: Confidence::Low,
                         },
                     };
+                    // Unnamed classifications are dropped downstream
+                    // (detect_all_from_payload emits no event for
+                    // them); counting them against the cap would let
+                    // 64 junk paths starve a later valid one (#144 r18
+                    // CR). Frontmatter consumption above already ran,
+                    // so ordering semantics are unchanged.
+                    if c.skill_name.is_none() {
+                        continue;
+                    }
+                    if out.len() >= MAX_EVENTS_PER_PAYLOAD {
+                        break 'keys;
+                    }
                     if seen.insert((c.skill_path.clone(), c.detection)) {
                         out.push(c);
                     }

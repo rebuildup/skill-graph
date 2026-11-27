@@ -828,6 +828,19 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         // state-dir path would redirect marker/session writes (and the
         // chmod below) into an arbitrary directory. Refuse state ops in
         // that case; the event log still records observations.
+        // Residual: the symlink_metadata check and the later open in
+        // restrict_dir_perms are not atomic. In a shared sticky TMPDIR
+        // an attacker of ANY uid can win the swap race: create the
+        // state dir as a real directory (passing the check), then
+        // replace it with a symlink before the opens. The euid guard
+        // only keeps chmod 0700 off foreign-owned dirs — marker and
+        // <session>.recommended writes still follow the link, so a
+        // victim-owned recommended file in the target dir can be
+        // truncated and rewritten with the session's skill names
+        // (valid existing names and the new name are preserved; only
+        // malformed lines and entries past the 32-name cap drop).
+        // Impact needs a tight race in a shared TMPDIR; documented
+        // rather than fixed with dirfd anchoring (#144 r18).
         let is_link = std::fs::symlink_metadata(&env.state_dir)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);

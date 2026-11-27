@@ -154,7 +154,12 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   `skill-graph detect` の stdin も hook と同じ 4 MiB parse 前
   閾値と bounded drain を持つ。OpenCode plugin の
   `prompt.skills` 由来 skill_load は 1 prompt あたり 1,024 entry・
-  session あたり 4,096 name で打ち切る。
+  session あたり 4,096 name で打ち切る。plugin が扱う外部 payload
+  には上限がある: `resultText` は 64 KiB までに切り詰めて保持、
+  `tool_input` の JSON parse は 1 MiB 以下のみ（超過は event 化を
+  skip）、`skill-graph` への spawn は stdin payload が 1 MiB
+  以下の時のみ（fail-open: 上限超過時は注入なしで継続）。
+  pending 注入キューは session あたり 64 entry で打ち切る。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を
@@ -169,8 +174,17 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   sort 位置ではなく encounter order で選ぶ（eligibility と同じ
   順序で「最初」を定義するため）。transcript 由来 event と
   contract-log passthrough event は file 内の feed line index を
-  共有し、(timestamp, line) で emit されるため、timestamp が
-  欠落・同値の場合も真の出現順が保たれる。
+  共有して merge され、`obs.events` は feed line 順を保持する
+  （timestamp sort は `funnel_for` の下流 (timestamp, index) sort が
+  担う）。timestamp が欠落・同値の場合も真の出現順が保たれ、
+  untimestamped rec の `li > ri` fallback は encounter order を
+  比較する。transcript scanner の `finish()` emit は merge 前に
+  共有 budget（`MAX_OBSERVE_EVENTS` 件・`MAX_OBSERVE_RETAINED_BYTES`
+  推定 byte、両 scanner 合算）で制限され、超過 event は detail を
+  捨てて counter map のみ更新する（passthrough pending buffer と
+  同じ意味論）。tool_use 1 件あたりの classification 数も
+  `MAX_EVENTS_PER_PAYLOAD`（64）で打ち切る（hook の per-payload
+  cap と同じ上限）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
   `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
@@ -377,12 +391,14 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   file 成長による過小計上を防ぐ。
 - この 512 MiB 境界は **discovery phase の `Skill` データのみ**を
   対象とする。Graph phase（`resolver::build`）では link 毎に
-  `resolved_name`/`resolved_path` が追加され、mention link は skill
-  毎 64 件・backlinks map は discovery cap 上で worst case
-  ~100-200 MB の transient を持つ（`resolver.rs` のコメント参照）。
-  MCP `recommend`/`resolve` は call 毎にこの Graph を再構築するため、
-  実メモリは名目値を超えうる既知の residual として記録する
-  （`discover` tool は resolver を通らずこの上乗せを持たない）。
+  `resolved_name`/`resolved_path` が追加される transient を持つ。
+  backlinks は name-resolved link を name 毎・path-resolved link を
+  target 毎の source 集合として集約し、最終的には target 毎の
+  dedup 済み source **件数**のみを保持する（消費側は件数のみ使用）。
+  同名 copy への fan-out は発生せず O(links + skills) に留まる
+  （#144 r18）。MCP `recommend`/`resolve` は call 毎にこの Graph を
+  再構築するため、実メモリは名目値を超えうる既知の residual として
+  記録する（`discover` tool は resolver を通らずこの上乗せを持たない）。
 - discovery の `errors` は収集時点で 1024 件（`MAX_DISCOVER_ERRORS`）に
   制限され、打ち切りは latched notice で通知される。parse 失敗は
   skill/byte cap を消費しないが、error エントリ自体は bounded。
