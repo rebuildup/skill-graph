@@ -972,3 +972,33 @@ fn mixed_passthrough_and_transcript_events_keep_feed_order() {
         vec!["beta-skill".to_string(), "alpha-skill".to_string()]
     );
 }
+
+/// Round-17 CR: an untimestamped recommendation must compare ALL
+/// same-name candidates, not stop at the first eligible one — the
+/// timestamp-ordered candidate list can place a later-encountered
+/// load first, and consuming it would steal the conversion from a
+/// later rec that could only use the earlier-encountered load.
+#[test]
+fn funnel_untimestamped_rec_compares_all_same_name_candidates() {
+    use skill_graph::observe::{Observation, summary};
+
+    let obs = Observation {
+        events: vec![
+            // R1 (untimestamped) -> alpha
+            rec_event("s1", "", &["alpha"], true),
+            // L1 (untimestamped) alpha, encountered before R2
+            load_event("s1", "", "alpha"),
+            // R2 (untimestamped) -> alpha
+            rec_event("s1", "", &["alpha"], true),
+            // L2 timestamped alpha, encountered LAST: sorts first in
+            // the timestamp-ordered candidate list.
+            load_event("s1", "2026-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    // Encounter-order greedy: R1 takes L1 (earliest eligible), R2
+    // takes L2 -> 2 conversions. First-eligible-in-list-order would
+    // give R1 the timestamped L2 and leave R2 nothing -> 1.
+    assert_eq!(v["converted_recommendations"], 2);
+}

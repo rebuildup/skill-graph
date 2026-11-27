@@ -444,12 +444,17 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
                 continue;
             };
             for &target in targets {
-                if graph.skills[target].parse_error.is_some() {
-                    continue;
-                }
+                // Charge before the parse-error skip: `by_name` also
+                // holds parse-error copies, and iterating them must
+                // consume the same budget or a corpus of same-name
+                // parse-error copies could exceed the cap's intent
+                // (#144 r17 CR).
                 propagation_checks += 1;
                 if propagation_checks > MAX_PROPAGATION_CHECKS {
                     break 'propagation;
+                }
+                if graph.skills[target].parse_error.is_some() {
+                    continue;
                 }
                 let is_seed = match direct_flags[target] {
                     Some(d) => d,

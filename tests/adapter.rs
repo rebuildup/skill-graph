@@ -1314,3 +1314,42 @@ fn opencode_status_and_disable_follow_spec_dir_across_env_change() {
     assert_eq!(rc, 0);
     assert!(!payload.exists(), "spec-referenced payload must be removed");
 }
+
+#[test]
+fn opencode_disable_never_removes_dirs_outside_payload_layout() {
+    // A crafted file:// spec can percent-decode to a path containing
+    // `..`; marker matching alone must not turn it into a
+    // remove_dir_all target (#144 r17 CR). The spec still matches our
+    // plugin marker so disable strips the config entry, but the
+    // resolved victim directory must survive.
+    let f = Fixture::new();
+    let victim = f.home.path().join(".local/Documents");
+    std::fs::create_dir_all(&victim).unwrap();
+    std::fs::write(victim.join("keep.txt"), "do not delete").unwrap();
+    let managed = f
+        .home
+        .path()
+        .join(".local/share/skill-graph/opencode-plugin");
+    // managed/../../../Documents resolves to .local/Documents.
+    let spec = format!("file://{}/../../../Documents", managed.display());
+    let cfg = f.home.path().join(".config/opencode/opencode.json");
+    std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+    std::fs::write(&cfg, serde_json::json!({ "plugins": [spec] }).to_string()).unwrap();
+
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        victim.join("keep.txt").is_file(),
+        "spec-decoded path outside the payload layout must not be removed"
+    );
+    // An emptied config is removed entirely (uninstall behavior), so
+    // absence of the file is the success signal here.
+    assert!(
+        !cfg.exists()
+            || serde_json::from_str::<Value>(&std::fs::read_to_string(&cfg).unwrap())
+                .unwrap()["plugins"]
+                .as_array()
+                .map(Vec::len)
+                == Some(0)
+    );
+}

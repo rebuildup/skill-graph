@@ -1142,10 +1142,26 @@ fn plugin_spec_dir(spec: &str) -> Option<PathBuf> {
     }
 }
 
+/// True only for directories `adapter enable opencode` could have
+/// materialized: absolute, free of `.`/`..` components, and ending in
+/// `skill-graph/opencode-plugin`. A project config is untrusted input —
+/// a crafted `file://` spec can percent-decode to any path, and
+/// `remove_dir_all` follows `..` at the filesystem layer, so marker
+/// matching alone must never grant deletion rights (#144 r17 CR).
+fn is_managed_payload_dir(dir: &Path) -> bool {
+    use std::path::Component;
+    dir.is_absolute()
+        && dir.ends_with("skill-graph/opencode-plugin")
+        && !dir
+            .components()
+            .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+}
+
 /// Payload dirs referenced by v0.4.x `file://` plugin specs in `config`.
 /// Legacy-marker entries point into removed adapter bundles, not the
-/// shared payload dir, and specs that fail to decode are skipped
-/// (unverifiable rather than missing).
+/// shared payload dir, and specs that fail to decode — or decode to a
+/// path outside the managed payload layout — are skipped (unverifiable
+/// rather than missing, and never eligible for recursive deletion).
 fn opencode_spec_dirs(config: &Value) -> Vec<PathBuf> {
     config
         .get("plugins")
@@ -1155,6 +1171,7 @@ fn opencode_spec_dirs(config: &Value) -> Vec<PathBuf> {
                 .filter_map(Value::as_str)
                 .filter(|s| marker_at_boundary(s, PLUGIN_MARKER))
                 .filter_map(plugin_spec_dir)
+                .filter(|d| is_managed_payload_dir(d))
                 .collect()
         })
         .unwrap_or_default()
@@ -1415,7 +1432,9 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 // which covers payloads orphaned by env changes or
                 // failed enables. An unresolvable env dir is skipped
                 // rather than fabricated cwd-relative.
-                if let Some(dir) = opencode_plugin_dir() {
+                if let Some(dir) = opencode_plugin_dir()
+                    && is_managed_payload_dir(&dir)
+                {
                     payload_dirs.push(dir);
                 }
                 payload_dirs.sort();
