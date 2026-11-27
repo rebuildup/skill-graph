@@ -16,12 +16,19 @@ import { createHash } from "node:crypto"
 // UNVERIFIED fields are read defensively (optional chaining); the plugin
 // fails open on any error.
 
-const SKILL_GRAPH_BIN = process.env.SKILL_GRAPH_BIN ?? "skill-graph"
+// Empty string is treated as unset, matching the Rust adapter's
+// SKILL_GRAPH_BIN handling (#144 r15).
+const SKILL_GRAPH_BIN = process.env.SKILL_GRAPH_BIN || "skill-graph"
 // Parity with the Rust hook's env_absolute_path: env-supplied paths
 // must be absolute — a relative value resolves against the OpenCode
 // server process cwd (an arbitrary project tree) (#144 r13/r14).
+// Node/Bun decode non-UTF-8 env bytes to U+FFFD rather than failing,
+// so a replacement char marks a value that cannot name a real path;
+// reject it and fall back like an unset value (#144 r15).
 const absPath = (v: string | undefined): string | undefined =>
-  v !== undefined && v !== "" && isAbsolute(v) ? v : undefined
+  v !== undefined && v !== "" && !v.includes("\uFFFD") && isAbsolute(v)
+    ? v
+    : undefined
 const EVENT_LOG =
   absPath(process.env.SKILL_GRAPH_EVENT_LOG) ??
   join(absPath(tmpdir()) ?? "/tmp", "skill-graph-events.jsonl")
@@ -102,7 +109,9 @@ function emit(event: Record<string, unknown>): boolean {
       // lstat: a symlinked log must not be rotated through (the open
       // below refuses it anyway via O_NOFOLLOW).
       const st = lstatSync(EVENT_LOG)
-      if (!st.isSymbolicLink() && st.size > EVENT_LOG_MAX) {
+      // isFile parity with the Rust hook: a directory must not be
+      // renamed away as if it were an oversized log.
+      if (!st.isSymbolicLink() && st.isFile() && st.size > EVENT_LOG_MAX) {
         renameSync(EVENT_LOG, EVENT_LOG + ".1")
       }
     } catch {}
@@ -252,7 +261,13 @@ async function recommendNames(
   const out = await collectProc(proc).catch(() => "")
   try {
     const recs = JSON.parse(out) as { skill: { name: string; digest?: string } }[]
-    return recs.map((r) => ({ name: r.skill.name, digest: r.skill.digest }))
+    // `recommend` output is operator-trusted but still normalized like
+    // every other plugin path: names must satisfy the skill-name
+    // contract and the list is bounded before it can reach context.
+    return recs
+      .filter((r) => validSkillName(r.skill.name))
+      .slice(0, 64)
+      .map((r) => ({ name: r.skill.name, digest: r.skill.digest }))
   } catch {
     return []
   }

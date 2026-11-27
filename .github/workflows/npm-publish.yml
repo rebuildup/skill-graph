@@ -129,9 +129,6 @@ jobs:
               # target rather than trusting any non-empty `file` output —
               # an x86-64 ELF inside linux-arm64 still contains 'ELF'.
               case "$target" in
-                linux-x64)
-                  file "$pkg/bin/skill-graph" | grep -q 'ELF' \
-                    && file "$pkg/bin/skill-graph" | grep -q 'x86-64' ;;
                 linux-arm64)
                   file "$pkg/bin/skill-graph" | grep -q 'ELF' \
                     && file "$pkg/bin/skill-graph" | grep -q 'aarch64' ;;

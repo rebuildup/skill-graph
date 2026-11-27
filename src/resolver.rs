@@ -80,11 +80,14 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
         })
         .collect();
 
-    let ambiguous_names = by_name
+    let mut ambiguous_names: Vec<String> = by_name
         .iter()
         .filter(|(_, indexes)| indexes.len() > 1)
         .map(|(name, _)| name.clone())
         .collect();
+    // HashMap iteration order is random; keep the public field
+    // deterministic for any consumer that iterates it (#144 r15).
+    ambiguous_names.sort_unstable();
 
     Graph {
         skills,
@@ -140,11 +143,11 @@ fn add_mentions(skills: &mut [Skill], index: usize, by_name: &HashMap<String, Ve
     if skills[index].parse_error.is_some() {
         return;
     }
-    let body = skills[index].body_text.clone();
-    let self_name = skills[index].name.clone();
+    // Tokenize in an immutable borrow scope so the ~1 MiB body_text is
+    // not cloned per skill — the mutable links borrow comes after.
     let mut tokens = HashSet::new();
     let mut current = String::new();
-    for ch in body.chars().chain(std::iter::once(' ')) {
+    for ch in skills[index].body_text.chars().chain(std::iter::once(' ')) {
         if ch.is_ascii_alphanumeric() || ch == '-' {
             current.push(ch.to_ascii_lowercase());
         } else {
@@ -155,6 +158,7 @@ fn add_mentions(skills: &mut [Skill], index: usize, by_name: &HashMap<String, Ve
         }
     }
 
+    let self_name = skills[index].name.clone();
     let mut tokens: Vec<String> = tokens.into_iter().collect();
     tokens.sort_unstable();
     let mut mentions = Vec::new();
