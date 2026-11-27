@@ -101,10 +101,11 @@ enum Command {
     Mcp,
     /// Manage runtime adapter hooks/plugins in native configs.
     /// enable|disable|status <claude-code|codex|opencode> [--user|--project]
+    /// clean-legacy removes v0.3.x install artifacts (no runtime needed)
     Adapter {
         action: String,
-        /// claude-code | codex | opencode
-        runtime: String,
+        /// claude-code | codex | opencode — required except clean-legacy
+        runtime: Option<String>,
         #[arg(long)]
         user: bool,
         #[arg(long)]
@@ -257,8 +258,18 @@ pub fn run() -> Result<(), String> {
         } => {
             use crate::adapter::{AdapterArgs, Scope};
             use crate::events::Runtime;
-            let runtime =
-                Runtime::parse(&runtime).ok_or_else(|| format!("unknown runtime: {runtime}"))?;
+            // clean-legacy is runtime-agnostic file cleanup — dispatch
+            // before runtime parsing (#225).
+            if action == "clean-legacy" {
+                if user && project {
+                    return Err("--user and --project are mutually exclusive".to_string());
+                }
+                return crate::adapter::clean_legacy();
+            }
+            let runtime = match runtime {
+                Some(r) => Runtime::parse(&r).ok_or_else(|| format!("unknown runtime: {r}"))?,
+                None => return Err("runtime is required for enable|disable|status".to_string()),
+            };
             let action = match action.as_str() {
                 "enable" => crate::adapter::Action::Enable,
                 "disable" => crate::adapter::Action::Disable,
@@ -448,11 +459,17 @@ fn file_uri_to_path(target: &str) -> Option<PathBuf> {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && bytes[i + 1].is_ascii_hexdigit()
-            && bytes[i + 2].is_ascii_hexdigit()
-        {
+        if bytes[i] == b'%' {
+            // A bare or truncated `%` is malformed percent-encoding:
+            // RFC 3986 requires `%` to introduce two hex digits, so a
+            // literal `%` in a file URI can only mean corruption —
+            // reject rather than silently passing it through (#225).
+            if i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit()
+            {
+                return None;
+            }
             let hi = (bytes[i + 1] as char).to_digit(16)?;
             let lo = (bytes[i + 2] as char).to_digit(16)?;
             decoded.push((hi * 16 + lo) as u8);
@@ -524,5 +541,32 @@ fn human(value: impl serde::Serialize) -> String {
             })
             .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap_or_default()),
         _ => serde_json::to_string_pretty(&value).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_uri_to_path;
+
+    #[test]
+    fn file_uri_to_path_decodes_valid_percent_encoding() {
+        assert_eq!(
+            file_uri_to_path("file:///tmp/my%20skill/SKILL.md"),
+            Some(std::path::PathBuf::from("/tmp/my skill/SKILL.md"))
+        );
+        assert_eq!(
+            file_uri_to_path("file://localhost/etc/100%25"),
+            Some(std::path::PathBuf::from("/etc/100%"))
+        );
+    }
+
+    /// #225: the contract rejects malformed percent-encoding — a bare or
+    /// truncated `%` must yield None, not pass through literally.
+    #[test]
+    fn file_uri_to_path_rejects_malformed_percent_encoding() {
+        assert_eq!(file_uri_to_path("file:///tmp/100%.md"), None);
+        assert_eq!(file_uri_to_path("file:///tmp/100%2.md"), None);
+        assert_eq!(file_uri_to_path("file:///tmp/%zz.md"), None);
+        assert_eq!(file_uri_to_path("file:///tmp/%"), None);
     }
 }

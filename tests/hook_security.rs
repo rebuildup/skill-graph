@@ -177,9 +177,9 @@ fn hardlinked_recommended_state_is_not_rewritten() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
-    let rec = state.join("sec1.recommended");
+    let rec = state.join("claude-code-sec1.recommended");
     std::fs::write(&rec, "alpha-skill\n").unwrap();
-    std::fs::hard_link(&rec, state.join("alias.recommended")).unwrap();
+    std::fs::hard_link(&rec, state.join("claude-code-alias.recommended")).unwrap();
 
     let envs = base_envs(&dir, &[]);
     let (_, rc) = run_hook(&["hook", "claude-code", "prompt"], &prompt_payload(), &envs);
@@ -199,7 +199,7 @@ fn fifo_recommended_state_does_not_hang() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
-    let rec = state.join("sec1.recommended");
+    let rec = state.join("claude-code-sec1.recommended");
     let c = std::ffi::CString::new(rec.to_string_lossy().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
 

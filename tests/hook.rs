@@ -254,7 +254,7 @@ fn prompt_mode_records_recommended_names_per_session() {
     );
     assert_eq!(rc, 0);
     assert!(!out.trim().is_empty());
-    let rec_file = state.join("s1.recommended");
+    let rec_file = state.join("claude-code-s1.recommended");
     let names = std::fs::read_to_string(&rec_file).expect("recommended file");
     let lines: Vec<&str> = names.lines().collect();
     assert!(!lines.is_empty());
@@ -267,7 +267,7 @@ fn prompt_mode_records_recommended_names_per_session() {
     }
     assert!(!names.contains("please"));
     // other sessions are untouched
-    assert!(!state.join("s2.recommended").exists());
+    assert!(!state.join("claude-code-s2.recommended").exists());
 }
 
 #[test]
@@ -278,7 +278,7 @@ fn skill_load_uses_session_recommended_as_context() {
     std::fs::create_dir_all(&state).unwrap();
     // Seed session context whose terms hit beta-skill's description
     // ("tests", "verification harnesses") — admits it via context alone.
-    std::fs::write(state.join("s1.recommended"), "tests\nharness\n").unwrap();
+    std::fs::write(state.join("claude-code-s1.recommended"), "tests\nharness\n").unwrap();
     let payload = json!({
         "session_id":"s1",
         "tool_name":"Skill",
@@ -335,7 +335,12 @@ fn nostate_records_no_session_recommendations() {
         &env_pairs(&envs),
     );
     assert_eq!(rc, 0);
-    assert!(!dir.path().join("state").join("s1.recommended").exists());
+    assert!(
+        !dir.path()
+            .join("state")
+            .join("claude-code-s1.recommended")
+            .exists()
+    );
 }
 
 #[test]

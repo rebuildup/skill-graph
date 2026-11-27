@@ -1294,6 +1294,117 @@ pub fn run_adapter(args: &AdapterArgs) -> Result<(), String> {
     }
 }
 
+/// v0.3.x install home: `${SKILL_GRAPH_HOME:-~/.local/share/skill-graph}`
+/// — a fixed path, NOT XDG-based (the current plugin payload resolves
+/// through XDG_DATA_HOME/~/.local/share separately).
+fn legacy_home() -> Option<PathBuf> {
+    env_absolute_dir("SKILL_GRAPH_HOME")
+        .or_else(|| home().map(|h| h.join(".local/share/skill-graph")))
+}
+
+/// A top-level home entry is legacy iff it is the `current` symlink or a
+/// `<semver>/` release dir. Everything else — including the current
+/// `opencode-plugin/` payload and any user-added content — is preserved
+/// and reported (#225).
+fn is_legacy_home_entry(name: &std::ffi::OsStr, is_dir: bool) -> bool {
+    if name == "current" {
+        return true;
+    }
+    if !is_dir {
+        return false;
+    }
+    let Some(s) = name.to_str() else {
+        return false;
+    };
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() >= 3
+        && parts[..3]
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove v0.3.x install artifacts: the `current` symlink and `<semver>/`
+/// release dirs under the legacy home, plus `~/.local/bin/skill-graph`
+/// when it is a symlink pointing into that home. The current
+/// `opencode-plugin/` payload shares the same base directory and MUST
+/// survive — the previous documented `rm -rf` of the whole home deleted
+/// a freshly enabled plugin (#225). Idempotent; non-matching entries are
+/// reported and left in place. Runtime-agnostic: dispatched directly by
+/// the CLI before runtime parsing.
+pub fn clean_legacy() -> Result<(), String> {
+    let Some(home_dir) = legacy_home() else {
+        return Err("cannot resolve legacy install home (HOME unset)".to_string());
+    };
+    let mut removed: Vec<String> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    if home_dir.is_dir() {
+        let entries =
+            std::fs::read_dir(&home_dir).map_err(|e| format!("{}: {e}", home_dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let path = entry.path();
+            // file_type does not follow symlinks: `current` (a symlink)
+            // and symlinked entries are removed as links, never through.
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_legacy_home_entry(&entry.file_name(), is_dir) {
+                kept.push(path.display().to_string());
+                continue;
+            }
+            let r = if is_dir {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match r {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) => kept.push(format!("{} (remove failed: {e})", path.display())),
+            }
+        }
+    }
+
+    // The v0.3.x bin symlink: only removed when it points into the
+    // legacy home — a regular file or foreign symlink at that path is
+    // not ours to delete.
+    let bin_dir =
+        env_absolute_dir("SKILL_GRAPH_BIN_DIR").or_else(|| home().map(|h| h.join(".local/bin")));
+    if let Some(bin_dir) = bin_dir {
+        let link = bin_dir.join("skill-graph");
+        let is_link = link
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link {
+            let target = std::fs::read_link(&link).map_err(|e| e.to_string())?;
+            let abs = if target.is_absolute() {
+                target
+            } else {
+                bin_dir.join(target)
+            };
+            let home_norm = crate::resolver::normalize_path(&home_dir);
+            let target_norm = crate::resolver::normalize_path(&abs);
+            if target_norm.starts_with(&home_norm) {
+                match std::fs::remove_file(&link) {
+                    Ok(()) => removed.push(link.display().to_string()),
+                    Err(e) => kept.push(format!("{} (remove failed: {e})", link.display())),
+                }
+            } else {
+                kept.push(format!("{} (points outside legacy home)", link.display()));
+            }
+        }
+    }
+
+    for p in &removed {
+        outln!("removed: {p}");
+    }
+    for p in &kept {
+        outln!("kept:    {p}");
+    }
+    if removed.is_empty() && kept.is_empty() {
+        outln!("no legacy artifacts found under {}", home_dir.display());
+    }
+    Ok(())
+}
+
 /// Strip skill-graph hooks from the opt-in compose overlay named by
 /// SKILL_GRAPH_EXTRA_OVERLAY. The overlay may be a symlink into a
 /// dotfiles repo: keep the file even when it reduces to {}, and

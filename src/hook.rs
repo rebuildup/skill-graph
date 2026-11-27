@@ -23,7 +23,7 @@ use crate::resolver::build;
 use crate::search::recommend;
 use serde_json::{Value, json};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const LOAD_GRADE: [Detection; 5] = [
@@ -45,7 +45,17 @@ struct HookEnv {
     state_dir: PathBuf,
     event_log_max: u64,
     /// Filesystem-safe session key for state files — always non-empty.
+    /// Includes the runtime so identical session ids emitted by different
+    /// runtimes (e.g. claude-code and codex) cannot share dedup or
+    /// recommended-skill state (#225).
     session_id: String,
+    /// Unix-only dirfd anchoring the state dir: opened once with
+    /// O_NOFOLLOW|O_DIRECTORY and verified dir+euid-owned, so every
+    /// state file op resolves names relative to this fd via openat/
+    /// fstatat and a post-check swap of the state-dir entry in shared
+    /// TMPDIR cannot redirect reads or writes (#225).
+    #[cfg(unix)]
+    state_fd: Option<std::fs::File>,
     /// Contract session id for emitted events: `events::sanitize_session_id`
     /// semantics, so absent ids stay unattributed (`""`) and distinct
     /// all-invalid ids hash apart instead of collapsing into `"unknown"`.
@@ -78,7 +88,12 @@ impl HookEnv {
         Self {
             runtime,
             nostate: std::env::var("SKILL_GRAPH_HOOK_NOSTATE").as_deref() == Ok("1"),
-            state_disabled: false,
+            // A session id that sanitizes to empty is unattributable:
+            // every such session must NOT share one "unknown" dedup or
+            // recommended-skill namespace — skip state reads/writes
+            // entirely while the event log still records observations
+            // (#225).
+            state_disabled: event_session_id.is_empty(),
             event_log: env_absolute_path("SKILL_GRAPH_EVENT_LOG")
                 .unwrap_or_else(|| tmp.join("skill-graph-events.jsonl")),
             state_dir: env_absolute_path("SKILL_GRAPH_HOOK_STATE")
@@ -87,15 +102,14 @@ impl HookEnv {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(64 * 1024 * 1024),
-            // State files key off the contract session id so distinct
-            // all-invalid payload ids (hashed apart by
-            // sanitize_session_id) do not share one dedup namespace;
-            // only a truly absent id falls back to "unknown".
-            session_id: if event_session_id.is_empty() {
-                "unknown".to_string()
-            } else {
-                event_session_id.clone()
-            },
+            // State files key off the contract session id scoped by
+            // runtime: distinct all-invalid payload ids (hashed apart by
+            // sanitize_session_id) and cross-runtime id collisions do
+            // not share one dedup namespace. An absent id disables state
+            // entirely via state_disabled above (#225).
+            session_id: format!("{}-{}", runtime.as_str(), event_session_id),
+            #[cfg(unix)]
+            state_fd: None,
             event_session_id,
             timestamp: events::rfc3339_now(),
         }
@@ -148,59 +162,97 @@ impl HookEnv {
     }
 
     fn marker_exists(&self, dedup_key: &str) -> bool {
-        // symlink_metadata: a planted symlink must not satisfy dedup, and a
-        // foreign-owned marker must not suppress recommendations either —
-        // shared-TMPDIR writers verify ownership before trusting state.
+        // A planted symlink must not satisfy dedup, and a foreign-owned
+        // marker must not suppress recommendations either — shared
+        // TMPDIR writers verify ownership before trusting state.
         if self.nostate || self.state_disabled {
             return false;
         }
-        self.marker_path(dedup_key)
-            .symlink_metadata()
-            .map(|m| m.is_file() && meta_owned_by_euid(&m))
-            .unwrap_or(false)
+        #[cfg(unix)]
+        {
+            let Some(fd) = self.state_fd.as_ref() else {
+                return false;
+            };
+            // fstatat relative to the anchored dirfd: the directory
+            // entry cannot be swapped out from under the lookup (#225).
+            fd_stat(fd, &self.marker_name(dedup_key)).is_some_and(|st| stat_regular_owned(&st))
+        }
+        #[cfg(not(unix))]
+        {
+            self.marker_path(dedup_key)
+                .symlink_metadata()
+                .map(|m| m.is_file() && meta_owned_by_euid(&m))
+                .unwrap_or(false)
+        }
     }
 
     fn touch_marker(&self, dedup_key: &str) {
         if self.nostate || self.state_disabled {
             return;
         }
-        let path = self.marker_path(dedup_key);
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            let Some(fd) = self.state_fd.as_ref() else {
+                return;
+            };
+            let Some(f) = openat_state(fd, &self.marker_name(dedup_key), true) else {
+                return;
+            };
+            // Same shared-TMPDIR contract as log_event: refuse
+            // foreign-owned, non-regular, or multiply-linked targets;
+            // chmod via the fd only.
+            if !fd_writeable(&f) {
+                return;
+            }
+            restrict_perms_fd(&f);
         }
-        no_follow(&mut opts);
-        let Ok(f) = opts.open(path) else {
-            return;
-        };
-        // Same shared-TMPDIR contract as log_event: refuse foreign-owned,
-        // non-regular, or multiply-linked targets; chmod via the fd only.
-        if !fd_writeable(&f) {
-            return;
+        #[cfg(not(unix))]
+        {
+            let path = self.marker_path(dedup_key);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).write(true);
+            no_follow(&mut opts);
+            let Ok(f) = opts.open(path) else {
+                return;
+            };
+            // Same shared-TMPDIR contract as log_event: refuse foreign-owned,
+            // non-regular, or multiply-linked targets; chmod via the fd only.
+            if !fd_writeable(&f) {
+                return;
+            }
+            restrict_perms_fd(&f);
         }
-        restrict_perms_fd(&f);
     }
 
-    fn marker_path(&self, dedup_key: &str) -> PathBuf {
-        // Marker names: <session>.<cksum(dedup_key)>, identical to the
-        // v0.3.x shell hook so dedup state survives migration.
+    /// State file names are relative to the anchored state dir on unix
+    /// (resolved via the dirfd, never re-resolved by path) and joined
+    /// under `state_dir` elsewhere (#225).
+    fn marker_name(&self, dedup_key: &str) -> String {
+        // Marker names: <runtime>-<session>.<cksum(dedup_key)> — the
+        // runtime prefix keeps identical session ids in different
+        // runtimes from sharing dedup state (#225).
         let key_hash = cksum_decimal(dedup_key.as_bytes());
-        self.state_dir
-            .join(format!("{}.{key_hash}", self.session_id))
+        format!("{}.{key_hash}", self.session_id)
     }
 
     /// Per-session record of skill names surfaced by prompt-mode
     /// recommendations (issue #128). Names only — prompt text, commands,
     /// and tool responses are never persisted here.
+    fn recommended_name(&self) -> String {
+        format!("{}.recommended", self.session_id)
+    }
+
+    #[cfg(not(unix))]
+    fn marker_path(&self, dedup_key: &str) -> PathBuf {
+        self.state_dir.join(self.marker_name(dedup_key))
+    }
+
+    #[cfg(not(unix))]
     fn recommended_path(&self) -> PathBuf {
-        self.state_dir
-            .join(format!("{}.recommended", self.session_id))
+        self.state_dir.join(self.recommended_name())
     }
 
     fn session_recommended(&self) -> Vec<String> {
@@ -210,24 +262,54 @@ impl HookEnv {
         // State lives under a shared TMPDIR: bound the read so a planted
         // oversized file cannot OOM the hook, and refuse symlinks.
         const MAX_STATE_BYTES: u64 = 64 * 1024;
-        let Ok(meta) = std::fs::symlink_metadata(self.recommended_path()) else {
-            return Vec::new();
+        #[cfg(unix)]
+        let f = {
+            let Some(fd) = self.state_fd.as_ref() else {
+                return Vec::new();
+            };
+            // Size/type/owner gate BEFORE open via fstatat on the
+            // anchored dirfd — a planted FIFO or oversized file never
+            // reaches open(2), and the directory entry cannot be swapped
+            // out from under the lookup (#225).
+            let Some(st) = fd_stat(fd, &self.recommended_name()) else {
+                return Vec::new();
+            };
+            if !stat_regular_owned(&st) || st.st_size > MAX_STATE_BYTES as i64 {
+                return Vec::new();
+            }
+            let Some(f) = openat_state(fd, &self.recommended_name(), false) else {
+                return Vec::new();
+            };
+            // Read side of the same contract: only trust a regular file
+            // owned by our euid; anything else under the shared TMPDIR
+            // reads as empty (fail-open).
+            if !fd_is_ours(&f) {
+                return Vec::new();
+            }
+            f
         };
-        if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_STATE_BYTES {
-            return Vec::new();
-        }
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true);
-        no_follow(&mut opts);
-        let Ok(f) = opts.open(self.recommended_path()) else {
-            return Vec::new();
+        #[cfg(not(unix))]
+        let f = {
+            let Ok(meta) = std::fs::symlink_metadata(self.recommended_path()) else {
+                return Vec::new();
+            };
+            if meta.file_type().is_symlink() || !meta.is_file() || meta.len() > MAX_STATE_BYTES {
+                return Vec::new();
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            opts.read(true);
+            no_follow(&mut opts);
+            let Ok(f) = opts.open(self.recommended_path()) else {
+                return Vec::new();
+            };
+            // Read side of the same contract: only trust a regular file owned
+            // by our euid; anything else under the shared TMPDIR reads as
+            // empty (fail-open).
+            if !fd_is_ours(&f) {
+                return Vec::new();
+            }
+            f
         };
-        // Read side of the same contract: only trust a regular file owned
-        // by our euid; anything else under the shared TMPDIR reads as
-        // empty (fail-open).
-        if !fd_is_ours(&f) {
-            return Vec::new();
-        }
         let mut buf = String::new();
         use std::io::Read;
         if f.take(MAX_STATE_BYTES + 1)
@@ -256,24 +338,36 @@ impl HookEnv {
         if all.len() > CAP {
             all.drain(..all.len() - CAP);
         }
-        if let Some(parent) = self.recommended_path().parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut opts = std::fs::OpenOptions::new();
-        // No O_TRUNC here: truncation at open time would destroy a
-        // foreign-owned or multiply-linked file before fd_writeable can
-        // refuse it. set_len(0) below does the truncate only after the
-        // opened fd passed the shared-TMPDIR contract.
-        opts.create(true).write(true);
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        no_follow(&mut opts);
-        let Ok(f) = opts.open(self.recommended_path()) else {
-            return;
+        let f = {
+            let Some(dirfd) = self.state_fd.as_ref() else {
+                return;
+            };
+            let Some(f) = openat_state(dirfd, &self.recommended_name(), true) else {
+                return;
+            };
+            f
         };
+        #[cfg(not(unix))]
+        let f = {
+            let path = self.recommended_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let mut opts = std::fs::OpenOptions::new();
+            // No O_TRUNC here: truncation at open time would destroy a
+            // foreign-owned or multiply-linked file before fd_writeable can
+            // refuse it. set_len(0) below does the truncate only after the
+            // opened fd passed the shared-TMPDIR contract.
+            opts.create(true).write(true);
+            no_follow(&mut opts);
+            let Ok(f) = opts.open(path) else {
+                return;
+            };
+            f
+        };
+        // Same shared-TMPDIR contract as log_event: refuse foreign-owned,
+        // non-regular, or multiply-linked targets; chmod via the fd only.
         if !fd_writeable(&f) {
             return;
         }
@@ -285,6 +379,108 @@ impl HookEnv {
         }
         let _ = f.write_all((all.join("\n") + "\n").as_bytes());
     }
+}
+
+/// Open the state dir anchored: O_NOFOLLOW|O_DIRECTORY refuse a symlinked
+/// or non-directory final component at open time, and the fd is verified
+/// to be an euid-owned directory before use. All state file ops then go
+/// through openat/fstatat relative to this fd — after the open, swapping
+/// the directory entry in shared TMPDIR cannot redirect them (#225).
+#[cfg(unix)]
+fn open_state_dir(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::io::FromRawFd;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "state dir path contains NUL",
+        )
+    })?;
+    // SAFETY: `c` is a valid NUL-terminated path; flags refuse a
+    // symlinked or non-directory final component. The returned fd is
+    // verified before use.
+    let raw = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a fresh open file descriptor.
+    let f = unsafe { std::fs::File::from_raw_fd(raw) };
+    let md = f.metadata()?;
+    // An attacker-precreated state dir in shared TMPDIR is
+    // attacker-owned and its entry can be swapped at will — only an
+    // euid-owned directory is a trustworthy anchor.
+    if !md.is_dir() || md.uid() != unsafe { libc::geteuid() } {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "state dir is not an euid-owned directory",
+        ));
+    }
+    Ok(f)
+}
+
+/// fstatat relative to the anchored state dir — never re-resolves the
+/// directory path, so the lookup cannot be redirected by swapping the
+/// state-dir entry (#225). AT_SYMLINK_NOFOLLOW reports a planted link
+/// itself rather than its target.
+#[cfg(unix)]
+fn fd_stat(dirfd: &std::fs::File, name: &str) -> Option<libc::stat> {
+    use std::os::unix::io::AsRawFd;
+    let c = std::ffi::CString::new(name).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dirfd` is open; `st` is a valid out-pointer; `c` is a
+    // valid NUL-terminated relative name (state file names contain no
+    // `/` or NUL by construction).
+    let rc = unsafe {
+        libc::fstatat(
+            dirfd.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    (rc == 0).then_some(st)
+}
+
+/// Regular file owned by our euid, from fstatat metadata (which never
+/// follows the final symlink).
+#[cfg(unix)]
+fn stat_regular_owned(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFREG && st.st_uid == unsafe { libc::geteuid() }
+}
+
+/// openat relative to the anchored state dir with O_NOFOLLOW (and
+/// O_NONBLOCK so a planted FIFO cannot hang the open) — `create`
+/// selects O_CREAT with mode 0600 for the write paths.
+#[cfg(unix)]
+fn openat_state(dirfd: &std::fs::File, name: &str, create: bool) -> Option<std::fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let c = std::ffi::CString::new(name).ok()?;
+    let flags = if create {
+        libc::O_WRONLY | libc::O_CREAT
+    } else {
+        libc::O_RDONLY
+    };
+    // SAFETY: `dirfd` is open; `c` is a valid relative name; the mode
+    // argument is only consulted with O_CREAT.
+    let raw = unsafe {
+        libc::openat(
+            dirfd.as_raw_fd(),
+            c.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh open file descriptor.
+    Some(unsafe { std::fs::File::from_raw_fd(raw) })
 }
 
 /// fd-based permission tightening for files we write (event log, markers,
@@ -359,14 +555,9 @@ fn fd_writeable(_f: &std::fs::File) -> bool {
     true
 }
 
-/// Ownership check on already-fetched metadata (marker dedup reads via
-/// symlink_metadata, which never follows links).
-#[cfg(unix)]
-fn meta_owned_by_euid(m: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    m.uid() == unsafe { libc::geteuid() }
-}
-
+/// Ownership check on already-fetched metadata — only used by the
+/// non-unix path fallback; unix state reads go through the dirfd-anchored
+/// fstatat checks instead (#225).
 #[cfg(not(unix))]
 fn meta_owned_by_euid(_m: &std::fs::Metadata) -> bool {
     true
@@ -828,19 +1019,6 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         // state-dir path would redirect marker/session writes (and the
         // chmod below) into an arbitrary directory. Refuse state ops in
         // that case; the event log still records observations.
-        // Residual: the symlink_metadata check and the later open in
-        // restrict_dir_perms are not atomic. In a shared sticky TMPDIR
-        // an attacker of ANY uid can win the swap race: create the
-        // state dir as a real directory (passing the check), then
-        // replace it with a symlink before the opens. The euid guard
-        // only keeps chmod 0700 off foreign-owned dirs — marker and
-        // <session>.recommended writes still follow the link, so a
-        // victim-owned recommended file in the target dir can be
-        // truncated and rewritten with the session's skill names
-        // (valid existing names and the new name are preserved; only
-        // malformed lines and entries past the 32-name cap drop).
-        // Impact needs a tight race in a shared TMPDIR; documented
-        // rather than fixed with dirfd anchoring (#144 r18).
         let is_link = std::fs::symlink_metadata(&env.state_dir)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);
@@ -849,6 +1027,17 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         } else {
             let _ = std::fs::create_dir_all(&env.state_dir);
             restrict_dir_perms(&env.state_dir);
+            #[cfg(unix)]
+            {
+                // Anchor every state file op to a verified dirfd: the
+                // check-then-open race documented at R18 is closed —
+                // after this open no path re-resolution can be
+                // redirected by swapping the state-dir entry (#225).
+                match open_state_dir(&env.state_dir) {
+                    Ok(fd) => env.state_fd = Some(fd),
+                    Err(_) => env.state_disabled = true,
+                }
+            }
         }
     }
 

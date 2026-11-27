@@ -81,6 +81,10 @@ jobs:
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package binary
         run: |
+          # The default run shell is `bash -e` — NO pipefail (#225):
+          # without this, a tar failure would be masked by a successful
+          # gzip and ship a corrupt asset.
+          set -euo pipefail
           bin="target/${{ matrix.target }}/release/skill-graph"
           strip "$bin" 2>/dev/null || true
           mkdir -p pkg
@@ -118,6 +122,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
           # Tag names reach shell via env only; validate before any use.
           [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || {
             echo "invalid tag: $RELEASE_TAG"; exit 1; }
@@ -134,6 +139,7 @@ jobs:
             echo "checked-out HEAD $head_sha is not the verified tag commit"; exit 1; }
       - name: Checksums
         run: |
+          set -euo pipefail
           cd dist
           sha256sum *.tar.gz > ../sha256sums.txt
           cat ../sha256sums.txt
