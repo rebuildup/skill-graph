@@ -54,7 +54,14 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 （`observed_via` に `mcp` は存在しない）。tool 計算は 1 件ずつ
 直列化される: client が call を pipeline しても同時に走る graph
 構築は 1 つまでで、待機は async 側で行うため blocking pool を
-消費しない（#144 r19）。
+消費しない（#144 r19）。待機 queue は持たない: permit は
+`try_acquire` で取り、計算中の call がある間に届いた pipelined
+call は `internal_error` ("skill-graph is busy") で即 reject する。
+各 handler task は parse 済みの引数 `JsonObject` を保持するため、
+queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
+で迂回する OOM 経路になる（#144 R23）。逐次 request/response
+の client は影響を受けない。引数 tree は clone せず blocking task
+へ move する。
 
 ## observe 出力の扱い
 

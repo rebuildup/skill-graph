@@ -210,19 +210,28 @@ impl ServerHandler for SkillGraphMcp {
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let args = request.arguments.clone().unwrap_or_default();
-        let name = request.name.clone();
+        // Move (never clone) name/arguments into the blocking task:
+        // each queued call would otherwise retain two argument trees.
+        let CallToolRequestParams {
+            name, arguments, ..
+        } = request;
+        let args = arguments.unwrap_or_default();
         // Discovery/recommend/resolve do synchronous filesystem scans and
         // CPU-bound scoring; run them on the blocking pool so a slow or
         // huge corpus cannot stall the stdio server's async runtime.
-        // The permit serializes computations across pipelined calls —
-        // see compute_permit (#144 r19).
+        // try_acquire — NOT acquire — bounds admission: rmcp spawns one
+        // handler task per pipelined request and each retains its parsed
+        // arguments tree (a request LINE is capped at 16 MiB but a
+        // serde_json::Value amplifies that ~16-30x), so an unbounded
+        // acquire queue is an OOM path (#144 R23). Sequential clients
+        // never see the busy error: at most one compute is in flight.
         let permit = self
             .compute_permit
             .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| McpError::internal_error(format!("compute permit: {e}"), None))?;
+            .try_acquire_owned()
+            .map_err(|_| {
+                McpError::internal_error("skill-graph is busy; retry the call", None)
+            })?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             compute_tool(name.as_ref(), &args)
