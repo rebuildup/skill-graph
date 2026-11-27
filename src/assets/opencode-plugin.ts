@@ -319,17 +319,19 @@ const utf8Bytes = (s: string) => Buffer.byteLength(s, "utf8")
 
 // Largest prefix of `s` within `maxBytes` UTF-8 bytes, never splitting
 // a code point (for..of iterates code points, not UTF-16 units).
+// Work is O(budget), not O(input): iteration stops as soon as the byte
+// budget is exceeded, so a multi-hundred-MB host string cannot force a
+// full scan before being sliced (#225 re-review).
 function utf8Slice(s: string, maxBytes: number): string {
-  if (utf8Bytes(s) <= maxBytes) return s
   let out = ""
   let used = 0
   for (const ch of s) {
     const b = utf8Bytes(ch)
-    if (used + b > maxBytes) break
+    if (used + b > maxBytes) return out
     out += ch
     used += b
   }
-  return out
+  return s
 }
 
 function resultText(result: unknown): string {
@@ -503,6 +505,13 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     // oversized events that skip spawn cannot burn the session's
     // detect budget, while 512 unrelated executions still cannot
     // silently disable detection (#144 r18 CR).
+    // detectCounts is keyed by the sanitized session id. The "" key is
+    // the anonymous aggregate: unattributable sessions have no identity
+    // to key on, so they share ONE fail-closed spawn budget — a flood
+    // of anonymous tool calls can exhaust detection for anonymous
+    // sessions only, never for attributed ones, and never grows state
+    // (#225 re-review). This is a resource bound, not recommendation
+    // state: no dedup/queue/context data is shared under "".
     const detects = detectCounts.get(sid) ?? 0
     if (detects >= MAX_DETECT_PER_SESSION) return []
     if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
@@ -620,9 +629,15 @@ export default Plugin.define({
       // session state, and re-emitting per prompt would inflate
       // load-grade counts.
       const skills = (event.prompt as any)?.skills
+      // Unattributable sessions (sanitized id "") share NO per-session
+      // state — parity with the Rust hook's state_disabled: dedup,
+      // recommendation queues, and session continuity are all bypassed
+      // so distinct anonymous sessions cannot merge or leak into each
+      // other (#225 re-review).
+      const attributed = sessionID !== ""
       if (Array.isArray(skills) && skills.length > 0) {
-        let seen = promptSkillSeen.get(sessionID)
-        if (!seen) {
+        let seen = attributed ? promptSkillSeen.get(sessionID) : undefined
+        if (attributed && !seen) {
           if (promptSkillSeen.size >= MAX_PENDING_SESSIONS) {
             const oldest = promptSkillSeen.keys().next().value
             if (oldest !== undefined) promptSkillSeen.delete(oldest)
@@ -635,8 +650,8 @@ export default Plugin.define({
         for (const s of skills.slice(0, MAX_PROMPT_SKILLS)) {
           const name = typeof s === "string" ? s : s?.name ?? s?.id
           if (typeof name !== "string" || !name || !validSkillName(name)) continue
-          if (seen.has(name)) continue
-          if (seen.size >= MAX_SEEN_SKILLS) continue
+          if (seen?.has(name)) continue
+          if (seen && seen.size >= MAX_SEEN_SKILLS) continue
           // Register the dedup key only when the event was actually
           // written — a transient log failure must not suppress retries.
           if (emit({
@@ -646,23 +661,28 @@ export default Plugin.define({
             detection: "inferred",
             confidence: "medium",
             tool: "prompt.skills",
-          })) seen.add(name)
+          })) seen?.add(name)
         }
       }
       // Empty prompts carry no signal — the Rust hook exits before
       // emitting any recommendation event for them.
       if (!text) return
-      const key = sha256(`${sessionID}\n${text}`)
-      if (emitted.has(key)) return
-      if (emitted.size >= MAX_EMITTED) {
-        const oldest = emitted.values().next().value
-        if (oldest !== undefined) emitted.delete(oldest)
+      // Dedup is per-session state: unattributable sessions bypass it
+      // entirely (the Rust hook's markers are disabled for them), so
+      // identical anonymous prompts are not suppressed across sessions.
+      if (attributed) {
+        const key = sha256(`${sessionID}\n${text}`)
+        if (emitted.has(key)) return
+        if (emitted.size >= MAX_EMITTED) {
+          const oldest = emitted.values().next().value
+          if (oldest !== undefined) emitted.delete(oldest)
+        }
+        emitted.add(key)
       }
-      emitted.add(key)
       const recs = await recommendNames(text, 3).catch(() => [])
       // recommended[] must equal the injected set for funnel integrity.
       const names = recs.map((r) => r.name)
-      rememberSession(sessionID, names)
+      if (attributed) rememberSession(sessionID, names)
       emit({
         ...base("recommendation"),
         session_id: sessionID,
@@ -672,7 +692,10 @@ export default Plugin.define({
         emitted: names.length > 0,
         reason: names.length > 0 ? "recommended" : "no_recommendations",
       })
-      if (names.length > 0) {
+      if (names.length > 0 && attributed) {
+        // Anonymous sessions cannot be correlated with a later context
+        // hook — queueing under "" would leak one session's
+        // recommendations into another's (#225 re-review).
         queue(sessionID, "prompt", names)
         console.log(`[skill-graph] recommended: ${names.join(", ")}`)
       }
@@ -684,6 +707,7 @@ export default Plugin.define({
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
       const sessionID = safeSessionID(event.sessionID)
+      const attributed = sessionID !== ""
       const detected = await detectLoad(event)
       if (!detected.length) return
       // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call
@@ -700,9 +724,10 @@ export default Plugin.define({
         // the shell adapters' skill-load mode, including session-context
         // continuity). recommended[] records exactly the injected set
         // for funnel integrity.
-        // Skip skills this session already got a dependency pass for.
-        let done = loadDedup.get(sessionID)
-        if (!done) {
+        // Skip skills this session already got a dependency pass for —
+        // unattributable sessions share no dedup state (#225 re-review).
+        let done = attributed ? loadDedup.get(sessionID) : undefined
+        if (attributed && !done) {
           if (loadDedup.size >= MAX_PENDING_SESSIONS) {
             const oldest = loadDedup.keys().next().value
             if (oldest !== undefined) loadDedup.delete(oldest)
@@ -710,14 +735,14 @@ export default Plugin.define({
           done = new Set()
           loadDedup.set(sessionID, done)
         }
-        if (done.has(skillName)) continue
+        if (done?.has(skillName)) continue
         // Budget check before marking done: a skill skipped for budget
         // was never recommended, so a later payload may still surface it
         // (same ordering as the Rust hook).
         if (recommendBudget <= 0) continue
-        done.add(skillName)
+        done?.add(skillName)
         recommendBudget -= 1
-        const sessionNames = sessionCtx.get(sessionID) ?? []
+        const sessionNames = attributed ? (sessionCtx.get(sessionID) ?? []) : []
         const deps = await recommendNames(
           skillName,
           5,
@@ -733,12 +758,15 @@ export default Plugin.define({
           emitted: names.length > 0,
           reason: names.length > 0 ? "recommended" : "no_recommendations",
         })
-        if (names.length > 0) queue(sessionID, "deps", names)
+        if (names.length > 0 && attributed) queue(sessionID, "deps", names)
       }
     })
 
     await ctx.session.hook("context", (event) => {
       const sessionID = safeSessionID(event.sessionID)
+      // Anonymous sessions never queue (see the prompt hook) — an
+      // empty-key lookup must not drain another session's entries.
+      if (!sessionID) return
       const list = pending.get(sessionID)
       if (!list?.length) return
       pending.delete(sessionID)

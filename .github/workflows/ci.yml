@@ -75,6 +75,13 @@ jobs:
         # safeSessionID parity with events::sanitize_session_id is part
         # of the event contract — verify it, don't assume it (#225).
         run: bun test src/assets/opencode-plugin.test.ts
+      - name: Release verification scripts
+        # The npm publish path relies on verify-npm-{arch,tarballs,
+        # registry}.sh; their accept/reject behavior — including
+        # mismatch, missing/extra files, corrupt tarballs, wrong arch —
+        # is a contract, so it is regression-tested here (#225
+        # re-review).
+        run: bash scripts/test-release-verify.sh
       - name: Package versions agree
         run: |
           python3 - <<'PY'

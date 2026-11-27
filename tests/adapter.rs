@@ -1475,6 +1475,10 @@ fn clean_legacy_keeps_lookalike_user_content() {
     // Exact semver shape but no `skill-graph` payload marker.
     std::fs::create_dir_all(home.join("9.9.9")).unwrap();
     std::fs::write(home.join("9.9.9/readme"), "mine").unwrap();
+    // Semver shape + a stray `skill-graph` file but no `adapters/`
+    // tree — one marker alone is not proof of a v0.3.x release dir.
+    std::fs::create_dir_all(home.join("8.8.8")).unwrap();
+    std::fs::write(home.join("8.8.8/skill-graph"), "not ours").unwrap();
 
     let (out, rc) = f.run(&["adapter", "clean-legacy"]);
     assert_eq!(rc, 0, "{out}");
@@ -1483,6 +1487,7 @@ fn clean_legacy_keeps_lookalike_user_content() {
         "2024.01.01/notes/a.md",
         "1.2.3.4/data",
         "9.9.9/readme",
+        "8.8.8/skill-graph",
     ] {
         assert!(
             home.join(p).is_file(),
@@ -1516,4 +1521,32 @@ fn clean_legacy_keeps_bin_link_into_plugin_payload() {
         "bin link into opencode-plugin must be kept: {out}"
     );
     assert!(home.join("opencode-plugin/skill-graph").is_file());
+}
+
+/// #225 re-review: `current` is legacy only as the v0.3.x symlink into
+/// a payload-carrying release dir. A `current` symlink to user content
+/// — or to a semver dir lacking the markers — must survive, and the
+/// release dir it points at must survive with it.
+#[cfg(unix)]
+#[test]
+fn clean_legacy_keeps_current_link_to_nonlegacy_target() {
+    let f = Fixture::new();
+    let home = f.home.path().join(".local/share/skill-graph");
+    // `current` -> opencode-plugin/: user-managed payload, not v0.3.x.
+    std::fs::create_dir_all(home.join("opencode-plugin")).unwrap();
+    std::fs::write(home.join("opencode-plugin/plugin.ts"), "payload").unwrap();
+    std::os::unix::fs::symlink("opencode-plugin", home.join("current")).unwrap();
+    // `current2`-style: a semver dir WITHOUT the full marker set, with
+    // `current` pointing at it — both must be kept.
+    std::fs::create_dir_all(home.join("7.7.7")).unwrap();
+    std::fs::write(home.join("7.7.7/skill-graph"), "no adapters").unwrap();
+
+    let (out, rc) = f.run(&["adapter", "clean-legacy"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        home.join("current").symlink_metadata().is_ok(),
+        "current -> opencode-plugin must be kept: {out}"
+    );
+    assert!(home.join("opencode-plugin/plugin.ts").is_file());
+    assert!(home.join("7.7.7/skill-graph").is_file());
 }
