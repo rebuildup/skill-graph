@@ -148,52 +148,72 @@ pub(crate) const MAX_RECOMMENDED: usize = 32;
 /// bound them like `tool`/`skill_path` so a hostile payload cannot write
 /// unbounded strings into every event line. Charset matches the hook's
 /// sanitizer so hook- and detect-emitted events agree.
+/// Session-id contract (#225 r5): the sanitized form must be injective
+/// over arbitrary host input, not merely collision-resistant. The old
+/// scheme let a charset-valid literal id ("sess1-deadbeef") equal the
+/// transformed output of a different id ("sess!1" -> "sess1-deadbeef")
+/// — a structural namespace collision merging two sessions' funnel
+/// state. The fix reserves the transform output shape: any id ending
+/// in `-` + 32 lowercase hex chars is non-canonical and is itself
+/// transformed, so passthrough and generated namespaces can never
+/// overlap. Idempotency is intentionally NOT a contract: for a
+/// charset-lossy mapping, injectivity and idempotency are mutually
+/// exclusive (a fixed-point output would have to be canonical, hence
+/// pass through, hence collide with the literal that produced it).
+/// sanitize runs exactly once per event at ingest.
 pub(crate) fn sanitize_session_id(session_id: &str) -> String {
-    // Materialize at most 129 filtered chars: the overflow branch only
-    // needs a 119-char head plus a hash of the ORIGINAL input, so a
-    // hostile multi-MB session id cannot force a full-size allocation.
-    let mut filtered = String::new();
-    let mut chars = session_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-');
-    for c in chars.by_ref().take(129) {
-        filtered.push(c);
+    const MAX_ID_CHARS: usize = 128;
+    const HEAD_CHARS: usize = 95; // 95 + 1 + 32 = 128
+    const SCAN_CHARS: usize = 8192;
+    const HASH_HEX: usize = 32;
+
+    // Canonical fast path: at most MAX_ID_CHARS+1 chars are inspected,
+    // so a hostile multi-MB id cannot force a full scan here. When the
+    // prefix is shorter than the cap it IS the whole string.
+    let prefix: Vec<char> = session_id.chars().take(MAX_ID_CHARS + 1).collect();
+    if prefix.len() <= MAX_ID_CHARS
+        && prefix
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+        && !has_reserved_suffix(session_id)
+    {
+        return session_id.to_string();
     }
-    if filtered.chars().count() > 128 {
-        // Truncation must not merge distinct ids that share a 128-char
-        // prefix: keep a bounded head plus a hash suffix of the original,
-        // mirroring the plugin's safeSessionID exactly.
-        let head: String = filtered.chars().take(119).collect();
-        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
-    }
-    let safe = filtered;
-    if safe.is_empty() {
-        if session_id.is_empty() {
-            return safe;
+
+    // Non-canonical: bounded head of valid chars + hash of the
+    // ORIGINAL bytes. The scan cap keeps pathological all-invalid
+    // megabyte ids at O(SCAN_CHARS); the hash covers the full input so
+    // distinct ids cannot collide through a shared head.
+    let mut head = String::new();
+    let mut head_len = 0usize;
+    for (scanned, c) in session_id.chars().enumerate() {
+        if scanned >= SCAN_CHARS || head_len >= HEAD_CHARS {
+            break;
         }
-        // Distinct invalid ids must not collapse into one "unknown"
-        // funnel session: derive a deterministic suffix from the
-        // original bytes so different ids stay distinct while the same
-        // id remains joinable. SHA-256 (truncated) is used rather than
-        // DefaultHasher because the OpenCode plugin must produce the
-        // identical id for the same payload — the hash is part of the
-        // cross-entrypoint event contract.
-        return format!("unknown-{}", &sha256_hex(session_id.as_bytes())[..16]);
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+            head.push(c);
+            head_len += 1;
+        }
     }
-    if safe != session_id {
-        // Charset filtering is lossy: "sess!1" and "sess?1" would both
-        // sanitize to "sess1" and share funnel state. When any character
-        // was stripped, suffix a hash of the ORIGINAL id so distinct
-        // inputs stay distinct — the same suffix scheme the >128-char
-        // branch uses, mirrored exactly by the OpenCode plugin's
-        // safeSessionID (#225). The head is capped at 119 chars so the
-        // result can never exceed the 128-char session_id contract —
-        // a 128-char filtered id plus the suffix would otherwise emit
-        // 137 chars (#225 re-review).
-        let head: String = safe.chars().take(119).collect();
-        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
+    if head.is_empty() {
+        head.push('u');
     }
-    safe
+    format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..HASH_HEX])
+}
+
+/// True when `s` ends with `-` followed by 32 lowercase hex chars —
+/// the transform output shape. A longer hex tail still matches
+/// (over-reserving only costs an extra transform of a literal id,
+/// never a collision). Caller guarantees `s` is ASCII safe-charset,
+/// so byte slicing is exact.
+fn has_reserved_suffix(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 33 || b[b.len() - 33] != b'-' {
+        return false;
+    }
+    b[b.len() - 32..]
+        .iter()
+        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
 impl SkillUsageEvent {
@@ -1198,8 +1218,8 @@ mod tests {
         // session, while the same id stays deterministic for joins.
         let a = sanitize_session_id("!!!");
         let b = sanitize_session_id("???");
-        assert!(a.starts_with("unknown-"));
-        assert!(b.starts_with("unknown-"));
+        assert!(a.starts_with("u-"));
+        assert!(b.starts_with("u-"));
         assert_ne!(a, b);
         assert_eq!(a, sanitize_session_id("!!!"));
         // Empty stays empty — it marks unattributable events.
@@ -1220,7 +1240,7 @@ mod tests {
         assert_eq!(sa.len(), 128);
         assert_eq!(sb.len(), 128);
         assert_ne!(sa, sb);
-        assert!(sa.starts_with(&"x".repeat(119)));
+        assert!(sa.starts_with(&"x".repeat(95)));
         assert!(sa.contains('-'));
         // Deterministic: the same id sanitizes identically for joins.
         assert_eq!(sa, sanitize_session_id(&a));
@@ -1241,6 +1261,30 @@ mod tests {
         // Deterministic for joins, and a clean id keeps its bare form.
         assert_eq!(a, sanitize_session_id("sess!1"));
         assert_eq!(sanitize_session_id("sess1"), "sess1");
+        // Fixed cross-implementation vector: opencode-plugin.test.ts
+        // asserts the same literal — the sanitize rules are a shared
+        // event contract across entrypoints.
+        assert_eq!(a, "sess1-f1437b8fb22261cc21b7a104ca00e1b1");
+    }
+
+    #[test]
+    fn sanitize_session_id_reserved_shape_cannot_collide() {
+        // #225 r5 structural collision: a charset-valid LITERAL id equal
+        // to another id's transform output must not merge their funnel
+        // state. Transform outputs end in "-" + 32 lowercase hex; that
+        // shape is reserved, so the literal is itself transformed.
+        let transformed = sanitize_session_id("sess!1");
+        let literal = transformed.clone(); // valid charset, <=128
+        assert_ne!(sanitize_session_id(&literal), transformed);
+        // A hand-crafted id in the reserved shape is transformed too.
+        let crafted = format!("sess1-{}", "0123456789abcdef".repeat(2));
+        assert_ne!(sanitize_session_id(&crafted), crafted);
+        // Canonical ids still pass through — the reservation only
+        // catches the exact generated shape.
+        assert_eq!(
+            sanitize_session_id("sess-0123456789abcdef"),
+            "sess-0123456789abcdef"
+        );
     }
 
     #[test]
@@ -1256,8 +1300,10 @@ mod tests {
         ] {
             let out = sanitize_session_id(&raw);
             assert!(out.len() <= 128, "{out:?} exceeds 128 chars");
-            // Idempotent: sanitizing an already-sanitized id is a no-op.
-            assert_eq!(sanitize_session_id(&out), out);
+            // Idempotency is intentionally NOT a contract (#225 r5):
+            // injectivity and idempotency are mutually exclusive for a
+            // charset-lossy map — a fixed-point output would be
+            // canonical and collide with the literal that made it.
         }
         // Distinct long ids that share a 119-char filtered head still
         // separate via the original-bytes hash.
@@ -1269,10 +1315,12 @@ mod tests {
     #[test]
     fn sanitize_session_id_property_contract() {
         // Property sweep over adversarial inputs (#225 re-review): the
-        // contract — ≤128 chars, charset-safe, deterministic,
-        // idempotent — must hold for ARBITRARY session ids, not just
-        // the hand-picked cases above. Deterministic LCG, no external
-        // deps; mirrors the plugin-side property test in
+        // contract — ≤128 chars, charset-safe, deterministic — must
+        // hold for ARBITRARY session ids, not just the hand-picked
+        // cases above. Idempotency is deliberately NOT part of the
+        // contract (#225 r5): it is mutually exclusive with
+        // injectivity for a charset-lossy map. Deterministic LCG, no
+        // external deps; mirrors the plugin-side property test in
         // opencode-plugin.test.ts.
         let mut state: u64 = 0x9e3779b97f4a7c15;
         let mut rand = move || {
@@ -1306,16 +1354,17 @@ mod tests {
             }
             let out = sanitize_session_id(&raw);
             assert!(out.len() <= 128, "{out:?} exceeds 128 chars for {raw:?}");
-            // Charset: output is "" or [A-Za-z0-9._-] only — "unknown-"
-            // and hash-suffix forms use the same safe alphabet.
+            // Charset: output is "" or [A-Za-z0-9._-] only — head,
+            // "u-", and hash-suffix forms all use the safe alphabet.
             assert!(
                 out.chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
                 "unsafe charset in {out:?} from {raw:?}"
             );
-            // Deterministic + idempotent.
+            // Deterministic. Idempotency is NOT asserted: it is
+            // mutually exclusive with injectivity for this mapping
+            // (#225 r5) — see sanitize_session_id's contract comment.
             assert_eq!(sanitize_session_id(&raw), out);
-            assert_eq!(sanitize_session_id(&out), out);
             if i < 1000 {
                 seen.insert(raw, out);
             }

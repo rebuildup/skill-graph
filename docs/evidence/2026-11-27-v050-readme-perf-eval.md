@@ -1,8 +1,8 @@
 # v0.5.0 README/SVG 用パフォーマンス・評価エビデンス
 
 Issue: #213。README の性能・精度・効率セクションと `assets/readme/*.svg` の
-データソース。全て release-0-5-0 最終候補 @ `e4f2f5f` (#225 第4回レビュー対応後、
-PR #228 merge 前の ticket head) の release build で実測した。
+データソース。全て release-0-5-0 最終候補 @ `2de2080` (#225 第5回レビュー対応後、
+PR merge 前の ticket head) の release build で実測した。
 
 ## 測定環境
 
@@ -28,31 +28,32 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test"}' \
 ## 1. 合成コーパス・スケーラビリティ (`skill-graph perf`)
 
 `perf` は N 個の合成 SKILL.md を生成し、cold discovery+build、warm recommend
-(p50/p95/max)、process 全体 (p50/p95、5 samples) を計測する。iterations=30
-(既定)。単位 ms。
+(p50/p95/max)、process 全体 (p50/p95/max、**30 samples**) を計測する。
+warm iterations=30 (既定)。process samples は #225 r5 で 5→30 に増量:
+n=5 では p95 の順位統計量が max に退化していたため。単位 ms。
 
-| skills | cold_discover | cold_build | cold_total | warm p50 | warm p95 | warm max | process p50 | process p95 |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 50  | 1.00 | 0.19 | 1.19  | 0.100 | 0.159 | 0.164 | 2.64 | 2.82  |
-| 100 | 1.68 | 0.37 | 2.05  | 0.195 | 0.276 | 0.294 | 4.05 | 5.11  |
-| 200 | 3.37 | 0.76 | 4.13  | 0.368 | 0.452 | 0.524 | 5.87 | 6.28  |
-| 500 | 8.75 | 1.89 | 10.64 | 0.986 | 1.279 | 1.506 | 12.72| 14.77 |
+| skills | cold_discover | cold_build | cold_total | warm p50 | warm p95 | warm max | process p50 | process p95 | process max |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50  | 0.81 | 0.17 | 0.98  | 0.090 | 0.122 | 0.128 | 1.79 | 2.37  | 2.41  |
+| 100 | 1.60 | 0.35 | 1.94  | 0.185 | 0.237 | 0.371 | 3.29 | 3.70  | 4.04  |
+| 200 | 3.64 | 0.82 | 4.46  | 0.358 | 0.404 | 0.422 | 5.55 | 6.31  | 6.39  |
+| 500 | 7.08 | 1.77 | 8.86  | 0.833 | 0.970 | 1.003 | 10.88| 11.88 | 14.03 |
 
 filesystem cache 状態で cold_total は ±20% 程度変動する
-(500 skills で ~9–11ms)。表は最終候補での実測値 (1 run)。
+(500 skills で ~8–11ms)。表は最終候補での実測値 (1 run)。
 
 読み方:
 
-- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~11ms。
-- **warm recommend はサブミリ秒〜1ms 台** — グラフ構築は cold のみ、推薦は常駐不要の
-  都度プロセスで p95 ~1.3ms (500 skills)。
-- **process p95 (CLI spawn 込み) は 500 skills で ~15ms** — hook として
-  実用上無視できるレイテンシ。
+- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~9ms。
+- **warm recommend はサブミリ秒〜1ms 未満** — グラフ構築は cold のみ、
+  推薦は常駐不要の都度プロセスで p95 ~1.0ms (500 skills)。
+- **process p95 (CLI spawn 込み) は 500 skills で ~12ms** (30 samples、
+  max 14.0ms) — hook として実用上無視できるレイテンシ。
 
 ## 2. 推薦精度 (`skill-graph bench evals/dataset/cases.jsonl`)
 
 合成評価データセット 58 cases (required 52 / optional 31 / forbidden は
-expected set に含まれない)。`elapsed_ms: 44` で全件評価。
+expected set に含まれない)。`elapsed_ms: 28` で全件評価。
 最終候補での再測定: recall/forbidden は不変、recommended_total は
 resolver mention-cap 修正 (#225) による推薦集合の変化を反映 (87→88)。
 
@@ -73,24 +74,29 @@ skill_load→conversion とは別物。実利用効果は `observe --summary` �
 
 ## 3. 実コーパスでの計測
 
+RSS は `/usr/bin/time -v` の "Maximum resident set size" を**各点 20 回
+計測し最大値**を採用（`assets/readme/data/memory.json` が単一データ
+ソース — 図・README・本表は全てそこから導出される）。単位 MB
+(1024^2 bytes)。
+
 ### 3a. このリポジトリの開発スキル群 (`.agents/skills`, 24 skills)
 
-- `discover`: wall <10ms、**Maximum RSS 6.4 MB**
+- `discover`: **Maximum RSS 6.5 MB** (20 runs、観測範囲 6.1–6.5)
 - 実際の第三者製 Agent Skills (aude-skills / writing-skills /
   mattpocock/skills / design-skills 由来、keywords 非依存が大半) を含む。
 
 ### 3b. design-skills リポジトリ (`skills/`, 88 skills)
 
-- `discover`: wall ~10ms、**Maximum RSS 7.3 MB**
+- `discover`: **Maximum RSS 7.3 MB** (20 runs、観測範囲 7.0–7.3)
 - 公開されている実在の大規模スキルコーパスでの動作確認。
 
-### 3c. 合成 500 skills コーパス (手動生成、perf と同規模)
+### 3c. 合成 500 skills コーパス (`/tmp/corpus500`、perf と同規模)
 
-- `discover`: wall <10ms、**Maximum RSS 7.2 MB**
-- `recommend --root /tmp/corpus500 "performance testing"`: wall ~10–16ms
-  (5 回計測 0.01s 表示 = /usr/bin/time 分解能)、RSS ~7.1 MB
+- `discover`: **Maximum RSS 7.0 MB** (20 runs、観測範囲 6.6–7.0)
+- `recommend --root /tmp/corpus500 "performance testing"`: **Maximum
+  RSS 7.0 MB** (20 runs)
 
-メモリはコーパス 24→88→500 skills で 6.4→7.3→7.2 MB と**ほぼ一定**
+メモリはコーパス 24→88→500 skills で 6.5→7.3→7.0 MB と**ほぼ一定**
 (パース済み構造が小さいため)。常駐プロセスがないので、コストは呼び出し
 ごとのプロセス起動 + 都度 discovery に限定される。
 
@@ -101,7 +107,7 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
   | ./target/release/skill-graph hook claude-code prompt
 ```
 
-- wall <10ms、**Maximum RSS 6.4 MB**
+- wall <10ms、**Maximum RSS 6.6 MB** (20 runs、観測範囲 6.3–6.6)
 - fail-open 設計: 常に exit 0、hook 失敗がエージェントを阻害しない
 - イベントは `~/.local/state/skill-graph/events.jsonl` に append
   (prompt 本文は SHA-256 hash のみ — contracts.md の privacy 契約)
@@ -117,15 +123,19 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
 ## 6. アーキテクチャ上の帰結 (README 記載の根拠)
 
 - **永続キャッシュ・常駐サービス不要**: グラフは呼び出しごとにオンメモリ構築。
-  cold でも 500 skills で ~11ms、warm recommend は ~1ms。
+  cold でも 500 skills で ~9ms、warm recommend は ~1ms。
   デーモン・DB・index ファイルの運用コストがゼロ。
 - **プロセスモデル**: 各呼び出しは独立プロセス。state は event log
   (append-only JSONL) のみで、クラッシュしても推薦経路に影響しない。
 - **スケーラビリティ**: discovery が支配的コストだが線形かつ小さい。
-  500 skills ≈ 実用上の上限想定を大きく超える規模でも ~10ms。
+  500 skills ≈ 実用上の上限想定を大きく超える規模でも ~9ms。
 
 ## 7. SVG データソース
 
 `assets/readme/` の SVG は上記 §1–§4 の実測値から生成する。
-生成スクリプト: `scripts/gen-readme-assets.sh` (本 PR で追加)。
-手編集ではなくスクリプト再実行で再生成可能。
+データファイルは `assets/readme/data/` に一元化:
+`perf-500.json`（`skill-graph perf` 出力）、`bench-eval.json`
+（`skill-graph bench` 出力）、`memory.json`（RSS 計測条件・
+サンプル数・各点の値）。生成スクリプト:
+`scripts/gen-readme-assets.py`。手編集ではなくスクリプト再実行で
+再生成可能。図・README・本書の数値は全てこれら JSON が正本。

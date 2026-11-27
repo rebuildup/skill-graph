@@ -4,8 +4,10 @@
 Data sources (see docs/evidence/2026-11-27-v050-readme-perf-eval.md):
   - assets/readme/data/perf-500.json  : `skill-graph perf` output (synthetic corpus)
   - assets/readme/data/bench-eval.json: `skill-graph bench evals/dataset/cases.jsonl`
-  - memory/RSS figures are constants measured via `/usr/bin/time -v`
-    (recorded in the evidence doc; not emitted by the CLI).
+  - assets/readme/data/memory.json    : RSS figures measured via
+    `/usr/bin/time -v` (recorded in the evidence doc; not emitted by
+    the CLI). Single source for BOTH this figure and the evidence
+    doc's memory table — no hardcoded copies (#225 r5).
 
 Outputs light + dark variants for GitHub `<picture>` theming:
   assets/readme/{perf-latency,perf-memory,eval-quality,architecture}-{light,dark}.svg
@@ -115,7 +117,7 @@ def fig_latency(theme: str) -> str:
     out.append(f'<g fill="{t["ink"]}">')
 
     # figure-level caption + legend row (keeps panel bottoms clean)
-    out.append(text(70, 20, "synthetic corpus · 30 iterations · 2026-11-27", 9.5, t["faint"]))
+    out.append(text(70, 20, "synthetic corpus · 30 iterations · 30 process samples · 2026-11-28", 9.5, t["faint"]))
     leg = [("cold discovery + graph build", t["blue_tint"], False),
            ("full process p95", t["blue"], False),
            ("warm recommend p95", t["green"], False)]
@@ -179,13 +181,18 @@ def fig_latency(theme: str) -> str:
 
 
 # ---------------------------------------------------------------- figure 2
+def load_memory():
+    return json.loads((DATA / "memory.json").read_text())
+
+
 def fig_memory(theme: str) -> str:
     t = THEMES[theme]
+    mem = load_memory()
     W, H = 880, 300
     out = [svg_open(W, H, t)]
     out.append(f'<g fill="{t["ink"]}">')
-    out.append(text(70, 34, "Peak memory stays near 7 MB across corpus sizes", 14, t["ink"], weight="600"))
-    out.append(text(70, 52, "peak RSS of `skill-graph discover` per invocation · no index or cache files", 10.5, t["muted"]))
+    out.append(text(70, 34, mem["headline"], 14, t["ink"], weight="600"))
+    out.append(text(70, 52, mem["subheadline"], 10.5, t["muted"]))
 
     px, pw = 70, 740
     ph, py = 148, 70
@@ -199,29 +206,33 @@ def fig_memory(theme: str) -> str:
     out.append(line(px, py + ph, px + pw, py + ph, t["axis"], 1.2))
     out.append(line(px, py, px, py + ph, t["axis"], 1.2))
 
-    # points: (label, skills, rss_mb, kind)
+    # points come from memory.json — the same file the evidence doc
+    # cites, so figure and prose can never drift apart (#225 r5).
     pts = [
-        ("this repo's skills", "24", 6.4, "real"),
-        ("design-skills repo", "88", 7.3, "real"),
-        ("synthetic corpus", "500", 7.2, "syn"),
+        (p["label"], str(p["skills"]), p["rss_mb"], p["kind"])
+        for p in mem["points"]
     ]
-    # log-scaled x: corpus sizes span 24→500, equal spacing would imply
-    # a continuous trend that does not exist
+    # x positions span the observed corpus-size range on a log scale:
+    # sizes like 24→500 would imply a continuous trend under equal
+    # spacing that does not exist
     import math
+    lo = min(int(n) for _, n, _, _ in pts)
+    hi = max(int(n) for _, n, _, _ in pts)
     xs = []
     for _, n, _, _ in pts:
-        f = (math.log10(int(n)) - math.log10(24)) / (math.log10(500) - math.log10(24))
+        f = (math.log10(int(n)) - math.log10(lo)) / (math.log10(hi) - math.log10(lo))
         xs.append(130 + f * 620)
     ys = [py + ph - (mb / ymax) * ph for _, _, mb, _ in pts]
+    kind_label = {"real": "real", "synthetic": "synthetic", "syn": "synthetic"}
     for (label, n, mb, kind), x, y in zip(pts, xs, ys):
         out.append(circle(x, y, 5.5, t["panel"], stroke=t["blue"], sw=2.2))
         out.append(circle(x, y, 2.2, t["blue"]))
         out.append(text(x - 12, y + 4, f"{mb:.1f} MB", 11, t["ink"], anchor="end", mono=True, weight="600"))
         out.append(text(x, py + ph + 20, label, 10.5, t["muted"], anchor="middle"))
-        out.append(text(x, py + ph + 36, f"{n} skills · {'real' if kind == 'real' else 'synthetic'}", 10, t["muted"], anchor="middle"))
+        out.append(text(x, py + ph + 36, f"{n} skills · {kind_label.get(kind, kind)}", 10, t["muted"], anchor="middle"))
 
-    out.append(text(70, 276, "hook end-to-end: 6.4 MB peak RSS · recommend @500 skills: ~7.2 MB", 10, t["muted"]))
-    out.append(text(70, 294, "measured with /usr/bin/time -v on release build · RSS includes binary + parsed corpus · x-axis: log scale", 10.5, t["muted"]))
+    for i, note in enumerate(mem.get("footnotes", [])):
+        out.append(text(70, 276 + i * 18, note, 10, t["muted"]))
     out.append("</g>\n</svg>\n")
     return "".join(out)
 

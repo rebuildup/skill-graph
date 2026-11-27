@@ -56,8 +56,8 @@ describe("safeSessionID — parity with events::sanitize_session_id", () => {
   test("distinct all-invalid ids hash apart deterministically", () => {
     const a = safeSessionID("!!!")
     const b = safeSessionID("???")
-    expect(a).toBe(`unknown-${sha256("!!!").slice(0, 16)}`)
-    expect(b).toBe(`unknown-${sha256("???").slice(0, 16)}`)
+    expect(a).toBe(`u-${sha256("!!!").slice(0, 32)}`)
+    expect(b).toBe(`u-${sha256("???").slice(0, 32)}`)
     expect(a).not.toBe(b)
     expect(safeSessionID("!!!")).toBe(a)
   })
@@ -65,16 +65,19 @@ describe("safeSessionID — parity with events::sanitize_session_id", () => {
   test("stripped chars get an original-bytes hash suffix", () => {
     const a = safeSessionID("sess!1")
     const b = safeSessionID("sess?1")
-    expect(a).toBe(`sess1-${sha256("sess!1").slice(0, 8)}`)
-    expect(b).toBe(`sess1-${sha256("sess?1").slice(0, 8)}`)
+    expect(a).toBe(`sess1-${sha256("sess!1").slice(0, 32)}`)
+    expect(b).toBe(`sess1-${sha256("sess?1").slice(0, 32)}`)
     expect(a).not.toBe(b)
     expect(safeSessionID("sess!1")).toBe(a)
+    // Fixed cross-implementation vector: events.rs asserts the same
+    // literal — the sanitize rules are a shared event contract.
+    expect(a).toBe("sess1-f1437b8fb22261cc21b7a104ca00e1b1")
   })
 
   test("over-128-char ids truncate to head + hash, never exceeding 128", () => {
     const raw = "x".repeat(200)
     const out = safeSessionID(raw)
-    expect(out).toBe(`${"x".repeat(119)}-${sha256(raw).slice(0, 8)}`)
+    expect(out).toBe(`${"x".repeat(95)}-${sha256(raw).slice(0, 32)}`)
     expect(out.length).toBe(128)
     // Exactly 128 valid chars pass through bare.
     const exact = "y".repeat(128)
@@ -96,13 +99,27 @@ describe("safeSessionID — parity with events::sanitize_session_id", () => {
     ]) {
       const out = safeSessionID(raw)
       expect(out.length).toBeLessThanOrEqual(128)
-      // Idempotent: an already-sanitized id is a fixed point.
-      expect(safeSessionID(out)).toBe(out)
+      // Idempotency is intentionally NOT a contract (#225 r5):
+      // injectivity and idempotency are mutually exclusive.
     }
-    // Long ids sharing a 119-char filtered head still separate.
+    // Long ids sharing a 95-char filtered head still separate.
     const a = `${"x".repeat(128)}!a`
     const b = `${"x".repeat(128)}!b`
     expect(safeSessionID(a)).not.toBe(safeSessionID(b))
+  })
+
+  test("reserved transform shape cannot collide with literal ids (#225 r5)", () => {
+    // A charset-valid literal equal to another id's transform output
+    // must itself be transformed — the "-" + 32-hex shape is reserved,
+    // so the two namespaces can never overlap.
+    const transformed = safeSessionID("sess!1")
+    const literal = transformed // valid charset, <=128 chars
+    expect(safeSessionID(literal)).not.toBe(transformed)
+    // Hand-crafted reserved-shape ids are transformed too.
+    const crafted = `sess1-${"0123456789abcdef".repeat(2)}`
+    expect(safeSessionID(crafted)).not.toBe(crafted)
+    // Non-reserved canonical ids still pass through.
+    expect(safeSessionID("sess-0123456789abcdef")).toBe("sess-0123456789abcdef")
   })
 
   test("hostile multi-MB ids stay bounded", () => {
@@ -314,6 +331,51 @@ describe("input-bounding properties (#225)", () => {
     expect(gopd).toBeLessThan(40_000)
   })
 
+  test("boundJsonValue reads array length exactly once", () => {
+    // A Proxy get trap answering differently per read must not let the
+    // allocation bound and the iteration bound diverge (#225 r5): the
+    // first read passes the length check, a second read would see a
+    // huge value. The implementation must read `length` ONCE and use
+    // that value for both the cap check and the loop.
+    let lengthReads = 0
+    let indexReads = 0
+    const backing = [11, 22, 33]
+    const proxy = new Proxy(backing, {
+      get(t, p, recv) {
+        if (p === "length") {
+          lengthReads++
+          // First read: small (passes the bound). Any later read:
+          // absurdly large — a second read would size `new Array()`
+          // or the loop far beyond the checked bound.
+          return lengthReads === 1 ? 3 : 100_000_000
+        }
+        if (typeof p === "string" && /^\d+$/.test(p)) indexReads++
+        return Reflect.get(t, p, recv)
+      },
+    })
+    const r = boundJsonValue(proxy, 0, { nodes: 0, strBytes: 0 })
+    expect(lengthReads).toBe(1)
+    expect(r).toEqual([11, 22, 33])
+    expect(indexReads).toBe(3)
+  })
+
+  test("boundJsonValue rejects over-budget array length before indexing", () => {
+    // length > MAX_INPUT_NODES must fail at the length check — the
+    // element get trap must never fire (no O(len) work, no allocation
+    // sized by the hostile value).
+    let indexReads = 0
+    const proxy = new Proxy([1, 2, 3], {
+      get(t, p, recv) {
+        if (typeof p === "string" && /^\d+$/.test(p)) indexReads++
+        if (p === "length") return MAX_INPUT_NODES + 1
+        return Reflect.get(t, p, recv)
+      },
+    })
+    const r = boundJsonValue(proxy, 0, { nodes: 0, strBytes: 0 })
+    expect(r).toBe(BOUND_FAIL)
+    expect(indexReads).toBe(0)
+  })
+
   test("boundJsonValue rejects over-budget key counts", () => {
     const big: Record<string, number> = {}
     for (let i = 0; i < MAX_INPUT_NODES + 1; i++) big[`k${i}`] = i
@@ -387,12 +449,14 @@ describe("input-bounding properties (#225)", () => {
       let raw = ""
       for (let j = 0; j < len; j++) raw += pieces[Math.floor(rand() * pieces.length)]
       const out = safeSessionID(raw)
-      // Contract: ≤128 chars, deterministic, idempotent.
+      // Contract: ≤128 chars, deterministic. Idempotency is NOT a
+      // contract (#225 r5): injectivity and idempotency are mutually
+      // exclusive for a charset-lossy map.
       expect(out.length).toBeLessThanOrEqual(128)
-      expect(safeSessionID(out)).toBe(out)
       expect(safeSessionID(raw)).toBe(out)
-      // Charset: output is either "" or [A-Za-z0-9._-] plus the
-      // "unknown-"/"<head>-<hash>" shapes — all within the safe set.
+      // Charset: output is "" or [A-Za-z0-9._-] only — canonical
+      // passthrough and "<head>-<32hex>" transform shapes share the
+      // same safe alphabet.
       if (out !== "") expect(/^[A-Za-z0-9._-]+$/.test(out)).toBe(true)
       // Distinct raws that survive sanitization distinctly must not
       // collapse — hash suffixes make collisions cryptographically

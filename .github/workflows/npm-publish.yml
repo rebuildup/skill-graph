@@ -171,28 +171,27 @@ jobs:
           rm -rf npm/skill-graph/plugin npm/skill-graph/contracts
           cp -r plugins/skill-graph npm/skill-graph/plugin
           cp -r contracts npm/skill-graph/contracts
-      - name: Publish platform packages
+      - name: Publish packages
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          # The publish decision path — skip-vs-publish, registry
-          # content identity on BOTH paths, bin executability — lives
-          # in scripts/publish-npm.sh so it is exercised end-to-end by
+          # The publish decision path — two-phase preflight (all
+          # packages validated BEFORE any publish), skip-vs-publish,
+          # registry content identity on BOTH paths, bin executability
+          # and format, dependency order — lives in
+          # scripts/publish-npm.sh so it is exercised end-to-end by
           # scripts/test-npm-publish.sh against a stub npm. This
           # workflow cannot run without NPM_TOKEN, so the logic must
           # be verifiable outside it (#225 re-review).
+          # ONE invocation covers platform packages AND the
+          # metapackage: its optionalDependencies are checked against
+          # argument order, so the metapackage cannot precede its
+          # platform packages (#225 r5).
           pkgs=()
           while IFS=: read -r target triple; do
             [ -n "$target" ] || continue
             pkgs+=("npm/skill-graph-${target}")
           done <<< "$TARGETS"
+          pkgs+=("npm/skill-graph")
           scripts/publish-npm.sh "${pkgs[@]}"
-      - name: Publish metapackage
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Same invariant as the platform packages (#225 re-review):
-          # registry content must equal this build on skip AND publish.
-          scripts/publish-npm.sh npm/skill-graph
