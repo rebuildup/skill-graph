@@ -104,6 +104,32 @@ tar -czf "$work/flat.tgz" -C "$work/flat/root" .
 expect_reject "tarball without package/ root rejected" \
   bash "$TAR_VERIFY" "$work/flat.tgz" "$work/a.tgz"
 
+# Out-of-scope entries: the old verifier diffed only package/ subtrees,
+# so extra TOP-LEVEL files were silently accepted (#225 re-review).
+# package/ content is identical — only the root scope differs.
+mkdir -p "$work/extra-root/package"
+cp -r "$work/a/package/." "$work/extra-root/package/"
+printf 'smuggled\n' > "$work/extra-root/evil.sh"
+tar -czf "$work/extra-pub.tgz" -C "$work/extra-root" package evil.sh
+expect_reject "published tarball with extra top-level file rejected" \
+  bash "$TAR_VERIFY" "$work/extra-pub.tgz" "$work/a.tgz"
+
+mkdir -p "$work/extra-root2/package" "$work/extra-root2/package2"
+cp -r "$work/a/package/." "$work/extra-root2/package/"
+printf 'x\n' > "$work/extra-root2/package2/f"
+tar -czf "$work/extra-loc.tgz" -C "$work/extra-root2" package package2
+expect_reject "local tarball with second root rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/extra-loc.tgz"
+
+# Even IDENTICAL out-of-scope content is rejected: npm tarballs carry
+# exactly one root, so scope itself is part of the contract.
+mkdir -p "$work/extra-both"
+cp -r "$work/a/package" "$work/extra-both/package"
+printf 'same\n' > "$work/extra-both/note.txt"
+tar -czf "$work/extra-both.tgz" -C "$work/extra-both" package note.txt
+expect_reject "identical extra top-level entry still rejected" \
+  bash "$TAR_VERIFY" "$work/extra-both.tgz" "$work/a.tgz"
+
 # nonexistent inputs
 expect_reject "missing published file rejected" \
   bash "$TAR_VERIFY" "$work/nope.tgz" "$work/a.tgz"

@@ -551,3 +551,19 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   32 に抑えるが総 build work・error 蓄積・case 毎 result 膨張は
   別系統の bound が必要（#144 r19）。CLI `search`/`recommend` の
   `--max` も 64 に clamp する（MCP tool と同じ出力上限）。
+
+## 保証と検証の対応（#225）
+
+各保証対象について「不変条件 → 構造的機構 → 検証」を対応付ける。
+検証は性質（正常系だけでなく境界値・敵対的入力・異常系を含む）に
+対して行い、修正前実装で失敗することを確認した回帰テストを伴う。
+
+| 保証対象 | 不変条件 | 構造的機構 | 検証 |
+|---|---|---|---|
+| 入力境界（plugin） | 敵対的・巨大な host payload に対し処理量が O(budget) で有界 | `boundJsonValue`（depth 32 / nodes 8192 / 1 MiB、for..in 遅延走査＋early break）、`resultText`（全ノード計上・64 KiB）、`utf8Slice`（O(budget)）、`detectLoad` の事前 filter | `opencode-plugin.test.ts` の性質テスト: Proxy iterator/descriptor トラップで**走査量そのもの**を観測（旧実装で iters=200,001 / gopd≈50,000 を検出）、2000 件 seeded sweep で safeSessionID 契約、200 件の乱数 result で byte budget |
+| session 状態識別 | sanitize 結果が空の session は per-session state を共有しない。runtime・sanitize 済み id で dedup 名前空間を分離。session_id ≤128 chars | Rust `state_disabled` + `<runtime>-<session>` state file 名。plugin `attributed` gate で dedup/queue/sessionCtx/context を全 bypass。`emitted` は実際に注入可能な時のみ true | `sanitize_session_id_property_contract`（3000 件 adversarial sweep: ≤128・charset・決定性・冪等・非衝突）、`anonymous session state isolation`（fake CLI + mock ctx で実 hook を駆動、匿名 dedup 非抑制・queue 非漏洩・emitted:false を検証） |
+| イベント観測（funnel） | `emitted` は「model が実際に見た注入」のみを表す。recommended[] は注入集合と一致 | plugin は匿名 session に注入経路を持たないため `emitted:false` を記録（Rust は同期 response で匿名注入可能なため true で正しい — 非対称は構造由来） | session 分離テストの `emitted` assertion（匿名 false / attributed true） |
+| ファイル所有権・状態安全 | 検査と操作の間に path が差し替えられない。symlink・他人所有・hardlink を拒否。権限は 0700/0600 | state dir を `O_NOFOLLOW|O_DIRECTORY` dirfd で anchor し全操作を openat/fstatat/fchmod 化。plugin `emit()` は O_NOFOLLOW+O_NONBLOCK+uid 検査 | `tests/` の hook/adapter 系 + contracts.md TMPDIR 契約。dirfd 確立前の path 操作は存在しないことをコード構造で保証 |
+| clean-legacy 所有権 | v0.3.x 成果物のみ削除。`current` は payload 持ち X.Y.Z dir を指す symlink のみ。release dir は `skill-graph` file AND `adapters/` dir の両 marker 必須 | 二相化（全 entry を削除前 FS で classify→delete） | `tests/adapter.rs` clean_legacy 5 件（lookalike・dangling symlink・bin link・nonlegacy target）。旧実装で `current`/marker 無し dir の誤削除を実証 |
+| 配布成果物同一性 | 公開経路の全分岐で「registry が提供する内容」==「この build の pack 内容」。skip も publish 後も同一不変条件 | `publish-npm.sh`（skip/publish 判定 + bin 実行可能性 + 順序保証）→ `verify-npm-registry.sh`（view→curl→pack→比較）→ `verify-npm-tarballs.sh`（package/ 単一 root 強制 + 全木 diff + mode/type listing）/ `verify-npm-arch.sh`（format+arch predicate） | `test-release-verify.sh` 22 件（内容不一致・missing/extra・exec-bit・file→dir・corrupt・root 外ファイル・wrong arch・unknown target）+ `test-npm-publish.sh` 14 件（stub npm registry で fresh publish・同一 skip・divergent 拒否・post-publish tamper 拒否・marker 有り tarball 無し・bin 非実行・publish 失敗伝播）。**mutant 実証**: skip 経路 verify 除去・diff 除去・旧 adapter/plugin 差替で各 suite が FAIL |
+| 性能 | 推薦・discovery・CLI の latency/throughput/memory が spec 範囲内 | オンメモリ engine、LRU graph cache、全走査に上限 | `docs/evidence/` の測定記録（env/SHA/コーパス/再現コマンド）+ `mise run perf`/`bench`。README/SVG は同 evidence から再生成 |

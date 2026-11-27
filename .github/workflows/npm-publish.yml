@@ -176,39 +176,18 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          # Published-content identity is an invariant on EVERY path —
-          # rerun-skip AND fresh publish alike: what the registry serves
-          # must equal this build's packed tree (#225). The verifier is
-          # a standalone process with its own errexit, so invoking it
-          # under `||` cannot mask internal step failures — the defect
-          # that let a failed diff pass as success inline (#225
-          # re-review).
+          # The publish decision path — skip-vs-publish, registry
+          # content identity on BOTH paths, bin executability — lives
+          # in scripts/publish-npm.sh so it is exercised end-to-end by
+          # scripts/test-npm-publish.sh against a stub npm. This
+          # workflow cannot run without NPM_TOKEN, so the logic must
+          # be verifiable outside it (#225 re-review).
+          pkgs=()
           while IFS=: read -r target triple; do
             [ -n "$target" ] || continue
-            pkg="npm/skill-graph-${target}"
-            name="@rebuildup/skill-graph-${target}"
-            [ -x "$pkg/bin/skill-graph" ] || { echo "missing binary in $pkg" >&2; exit 1; }
-            ver="$(node -p "require('./$pkg/package.json').version")"
-            if npm view "$name@$ver" version >/dev/null 2>&1; then
-              # Version exists: presence is not identity — a rerun must
-              # prove the published tarball carries THIS build's
-              # content, not silently skip a divergent artifact (#225).
-              echo "$name@$ver already published — verifying content identity"
-              scripts/verify-npm-registry.sh "$name" "$ver" "$pkg" || {
-                echo "published $name@$ver differs from this build — refusing to skip" >&2
-                exit 1
-              }
-              continue
-            fi
-            npm publish "./$pkg" --access public --provenance
-            # Post-publish verification: the registry must serve THIS
-            # build's content — publish exit status alone does not prove
-            # what landed (#225 re-review).
-            scripts/verify-npm-registry.sh "$name" "$ver" "$pkg" || {
-              echo "published $name@$ver does not match this build" >&2
-              exit 1
-            }
+            pkgs+=("npm/skill-graph-${target}")
           done <<< "$TARGETS"
+          scripts/publish-npm.sh "${pkgs[@]}"
       - name: Publish metapackage
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -216,21 +195,4 @@ jobs:
           set -euo pipefail
           # Same invariant as the platform packages (#225 re-review):
           # registry content must equal this build on skip AND publish.
-          ver="$(node -p "require('./npm/skill-graph/package.json').version")"
-          name="@rebuildup/skill-graph"
-          if npm view "$name@$ver" version >/dev/null 2>&1; then
-            # Same identity rule as the platform packages (#225): an
-            # existing version is skipped only after its published
-            # content verifies against this build.
-            echo "$name@$ver already published — verifying content identity"
-            scripts/verify-npm-registry.sh "$name" "$ver" "npm/skill-graph" || {
-              echo "published $name@$ver differs from this build — refusing to skip" >&2
-              exit 1
-            }
-            exit 0
-          fi
-          npm publish ./npm/skill-graph --access public --provenance
-          scripts/verify-npm-registry.sh "$name" "$ver" "npm/skill-graph" || {
-            echo "published $name@$ver does not match this build" >&2
-            exit 1
-          }
+          scripts/publish-npm.sh npm/skill-graph

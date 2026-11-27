@@ -128,8 +128,8 @@ def fig_latency(theme: str) -> str:
 
     panels = [
         # (title, subtitle, key cold, key proc, ymax, yticks, x0, pw)
-        ("End-to-end latency", "full CLI process incl. spawn · p95 · corpus size (skills)", "cold_total_ms", "process_p95_ms", 12.0, [0, 4, 8, 12], 70, 360),
-        ("Recommendation core", "in-memory recommend · warm p95 · corpus size (skills)", None, "warm_recommend_p95_ms", 1.0, [0, 0.25, 0.5, 0.75, 1.0], 478, 360),
+        ("End-to-end latency", "full CLI process incl. spawn · p95 · corpus size (skills)", "cold_total_ms", "process_p95_ms", 16.0, [0, 4, 8, 12, 16], 70, 360),
+        ("Recommendation core", "in-memory recommend · warm p95 · corpus size (skills)", None, "warm_recommend_p95_ms", 1.6, [0, 0.4, 0.8, 1.2, 1.6], 478, 360),
     ]
 
     for title, sub, k_cold, k_hot, ymax, yticks, x0, pw in panels:
@@ -201,16 +201,16 @@ def fig_memory(theme: str) -> str:
 
     # points: (label, skills, rss_mb, kind)
     pts = [
-        ("this repo's skills", "17", 6.3, "real"),
-        ("design-skills repo", "87", 7.5, "real"),
-        ("synthetic corpus", "500", 7.1, "syn"),
+        ("this repo's skills", "24", 6.4, "real"),
+        ("design-skills repo", "88", 7.3, "real"),
+        ("synthetic corpus", "500", 7.2, "syn"),
     ]
-    # log-scaled x: corpus sizes span 17→500, equal spacing would imply
+    # log-scaled x: corpus sizes span 24→500, equal spacing would imply
     # a continuous trend that does not exist
     import math
     xs = []
     for _, n, _, _ in pts:
-        f = (math.log10(int(n)) - math.log10(17)) / (math.log10(500) - math.log10(17))
+        f = (math.log10(int(n)) - math.log10(24)) / (math.log10(500) - math.log10(24))
         xs.append(130 + f * 620)
     ys = [py + ph - (mb / ymax) * ph for _, _, mb, _ in pts]
     for (label, n, mb, kind), x, y in zip(pts, xs, ys):
@@ -220,7 +220,7 @@ def fig_memory(theme: str) -> str:
         out.append(text(x, py + ph + 20, label, 10.5, t["muted"], anchor="middle"))
         out.append(text(x, py + ph + 36, f"{n} skills · {'real' if kind == 'real' else 'synthetic'}", 10, t["muted"], anchor="middle"))
 
-    out.append(text(70, 276, "hook end-to-end: 6.4 MB peak RSS · recommend @500 skills: ~7.1 MB", 10, t["muted"]))
+    out.append(text(70, 276, "hook end-to-end: 6.4 MB peak RSS · recommend @500 skills: ~7.2 MB", 10, t["muted"]))
     out.append(text(70, 294, "measured with /usr/bin/time -v on release build · RSS includes binary + parsed corpus · x-axis: log scale", 10.5, t["muted"]))
     out.append("</g>\n</svg>\n")
     return "".join(out)
@@ -237,7 +237,7 @@ def fig_eval(theme: str) -> str:
     out.append(f'<g fill="{t["ink"]}">')
 
     out.append(text(70, 34, "Recommendation quality on the offline eval set", 14, t["ink"], weight="600"))
-    out.append(text(70, 52, f'{s["cases"]} cases · synthetic corpus · `skill-graph bench` · 23 ms total', 10.5, t["muted"]))
+    out.append(text(70, 52, f'{s["cases"]} cases · synthetic corpus · `skill-graph bench` · {s["elapsed_ms"]} ms total', 10.5, t["muted"]))
 
     # headline stats
     stats = [

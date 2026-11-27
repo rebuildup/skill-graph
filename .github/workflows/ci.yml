@@ -82,6 +82,13 @@ jobs:
         # is a contract, so it is regression-tested here (#225
         # re-review).
         run: bash scripts/test-release-verify.sh
+      - name: Npm publish path tests
+        # publish-npm.sh decides skip-vs-publish and proves registry
+        # content identity on both paths; test-npm-publish.sh drives it
+        # end-to-end against a stub npm registry — divergent published
+        # content, tampered post-publish artifacts, and missing
+        # executables must all be rejected (#225 re-review).
+        run: bash scripts/test-npm-publish.sh
       - name: Package versions agree
         run: |
           python3 - <<'PY'

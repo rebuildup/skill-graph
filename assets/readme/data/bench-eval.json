@@ -6,17 +6,17 @@
     "required_hits_at5": 52,
     "required_total": 52,
     "forbidden_hits": 0,
-    "optional_hits": 18,
+    "optional_hits": 16,
     "optional_total": 31,
-    "recommended_total": 87,
+    "recommended_total": 88,
     "empty_recommendations": 6,
-    "elapsed_ms": 23,
+    "elapsed_ms": 44,
     "max": 3,
     "required_recall": 1.0,
     "required_recall_at3": 1.0,
     "required_recall_at5": 1.0,
-    "precision_required": 0.5977011494252874,
-    "precision_acceptable": 0.8045977011494253
+    "precision_required": 0.5909090909090909,
+    "precision_acceptable": 0.7727272727272727
   },
   "cases": [
     {
@@ -363,8 +363,8 @@
       "id": "design-refinement",
       "recommended": [
         "design-refinement",
-        "interaction-discipline",
-        "system-quality"
+        "dark-mode-design",
+        "interaction-discipline"
       ],
       "recommended_count": 3,
       "required_hits": 1,
@@ -372,7 +372,7 @@
       "required_hits_at5": 1,
       "required_total": 1,
       "forbidden_hits": 0,
-      "optional_hits": 1,
+      "optional_hits": 0,
       "timing": "mid_task",
       "rationale": "Separating facts from undecided design questions is design-refinement.",
       "case_kind": "positive"
@@ -465,7 +465,7 @@
       "recommended": [
         "onboarding",
         "quality-gate",
-        "system-quality"
+        "layout-system"
       ],
       "recommended_count": 3,
       "required_hits": 1,
@@ -808,8 +808,8 @@
       "id": "holdout-doc-stands-alone",
       "recommended": [
         "design-refinement",
-        "engineering-decisions",
-        "writing-discipline"
+        "writing-discipline",
+        "system-quality"
       ],
       "recommended_count": 3,
       "required_hits": 1,
@@ -843,15 +843,16 @@
       "id": "holdout-japanese-minutes",
       "recommended": [
         "natural-japanese",
-        "writing-discipline"
+        "typesetting",
+        "layout-system"
       ],
-      "recommended_count": 2,
+      "recommended_count": 3,
       "required_hits": 1,
       "required_hits_at3": 1,
       "required_hits_at5": 1,
       "required_total": 1,
       "forbidden_hits": 0,
-      "optional_hits": 1,
+      "optional_hits": 0,
       "timing": "mid_task",
       "rationale": "Holdout: natural Japanese prose request.",
       "case_kind": "cross-lingual"

@@ -28,7 +28,15 @@ chmodSync(fakeBin, 0o755)
 process.env.SKILL_GRAPH_BIN = fakeBin
 process.env.SKILL_GRAPH_EVENT_LOG = join(testDir, "events.jsonl")
 
-const { default: plugin, safeSessionID } = await import("./opencode-plugin")
+const {
+  default: plugin,
+  safeSessionID,
+  boundJsonValue,
+  BOUND_FAIL,
+  MAX_INPUT_NODES,
+  resultText,
+  utf8Slice,
+} = await import("./opencode-plugin")
 
 const sha256 = (s: string) => createHash("sha256").update(s, "utf8").digest("hex")
 
@@ -158,9 +166,16 @@ describe("anonymous session state isolation (#225)", () => {
     await prompt({ sessionID: undefined, prompt: { text: "anon-unique-aaa" } })
 
     // Dedup is per-session state: anonymous prompts must NOT suppress
-    // each other — both emitted a recommendation event.
+    // each other — both emitted a recommendation event. And because an
+    // unattributed session can never receive the queued injection,
+    // `emitted` must record false — claiming true would falsify the
+    // funnel (#225 re-review).
     const recs = recommendationEvents().filter((e) => e.session_id === "")
     expect(recs.length).toBe(2)
+    for (const e of recs) {
+      expect(e.emitted).toBe(false)
+      expect(e.reason).toBe("recommended")
+    }
 
     // Nothing was queued: an anonymous context hook injects nothing.
     const ev = { sessionID: undefined, system: [] as unknown[] }
@@ -181,6 +196,9 @@ describe("anonymous session state isolation (#225)", () => {
       (e) => e.session_id === "s-attr-1" && e.trigger === "prompt_submit",
     )
     expect(own.length).toBe(1)
+    // Attributed sessions DO get the injection queued, so emitted is
+    // truthful here — the anonymous/attributed asymmetry is the point.
+    expect(own[0].emitted).toBe(true)
 
     const ev = { sessionID: "s-attr-1", system: [] as { type: string; text: string }[] }
     await context(ev)
@@ -211,5 +229,177 @@ describe("anonymous session state isolation (#225)", () => {
     const attr = { sessionID: "s-attr-3", system: [] as unknown[] }
     await context(attr)
     expect(attr.system.length).toBe(1)
+  })
+})
+
+// ------------------------------------------------------------------
+// Property / boundary tests for the input-bounding internals (#225
+// re-review). The budgets are contracts: work must be O(budget), not
+// O(input). Proxy traps make the *amount of iteration* observable —
+// a test that only checks output would pass even if the walk scanned
+// the whole hostile input.
+// ------------------------------------------------------------------
+
+// Deterministic PRNG (mulberry32) — property tests must be
+// reproducible; no external dep.
+function mulberry32(seed: number) {
+  let a = seed >>> 0
+  return () => {
+    a |= 0; a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+describe("input-bounding properties (#225)", () => {
+  test("resultText stops iterating primitives at the node budget", () => {
+    // A flat array of primitives: the OLD walk counted only objects,
+    // so `walked` never moved and every element was visited. The
+    // iterator trap counts actual next() calls — the contract is
+    // O(MAX_INPUT_NODES), not O(array length).
+    let iters = 0
+    const src = new Array(200_000).fill("x")
+    const proxy = new Proxy(src, {
+      get(t, p) {
+        if (p === Symbol.iterator) {
+          // [Symbol.iterator]() must return an ITERATOR OBJECT whose
+          // next() we wrap — returning a bare function makes for..of
+          // throw (and resultText's catch would vacuously pass).
+          return () => {
+            const it = t[Symbol.iterator]()
+            return {
+              next: () => {
+                iters++
+                return it.next()
+              },
+            }
+          }
+        }
+        return (t as unknown as Record<PropertyKey, unknown>)[p]
+      },
+    })
+    resultText({ content: proxy })
+    // Lower bound proves the walk actually iterated (a broken proxy
+    // would vacuously satisfy the upper bound with iters == 0).
+    expect(iters).toBeGreaterThan(100)
+    expect(iters).toBeLessThanOrEqual(MAX_INPUT_NODES + 16)
+  })
+
+  test("boundJsonValue does not enumerate all keys of a huge object", () => {
+    // Object.keys() materialized every key before the node budget
+    // applied. for..in + early break must bound getOwnPropertyDescriptor
+    // calls — the observable cost of enumeration.
+    let gopd = 0
+    const KEYS = 50_000
+    const keys = Array.from({ length: KEYS }, (_, i) => `k${i}`)
+    const proxy = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => Object.prototype,
+        ownKeys: () => keys,
+        getOwnPropertyDescriptor: () => {
+          gopd++
+          return { enumerable: true, configurable: true, value: 1 }
+        },
+        get: () => 1,
+      },
+    )
+    const r = boundJsonValue(proxy, 0, { nodes: 0, strBytes: 0 })
+    expect(r).toBe(BOUND_FAIL)
+    // Enumeration must stop at the node budget: ~8192 keys × (for-in
+    // gOPD + hasOwnProperty gOPD) — nowhere near the 50k-key object.
+    // Object.keys() would have paid ~50k gOPD calls up front.
+    expect(gopd).toBeGreaterThan(1_000)
+    expect(gopd).toBeLessThan(40_000)
+  })
+
+  test("boundJsonValue rejects over-budget key counts", () => {
+    const big: Record<string, number> = {}
+    for (let i = 0; i < MAX_INPUT_NODES + 1; i++) big[`k${i}`] = i
+    const st = { nodes: 0, strBytes: 0 }
+    const r = boundJsonValue(big, 0, st)
+    expect(r).toBe(BOUND_FAIL)
+  })
+
+  test("boundJsonValue clones in-budget JSON faithfully", () => {
+    const input = {
+      a: [1, "two", null, true, { b: { c: [3.5] } }],
+      d: "x".repeat(100),
+    }
+    const st = { nodes: 0, strBytes: 0 }
+    const r = boundJsonValue(input, 0, st)
+    expect(r).toEqual(input)
+    expect(st.nodes).toBeGreaterThan(0)
+  })
+
+  test("boundJsonValue rejects non-JSON and oversized strings", () => {
+    const st = () => ({ nodes: 0, strBytes: 0 })
+    expect(boundJsonValue(undefined, 0, st())).toBe(BOUND_FAIL)
+    expect(boundJsonValue(() => {}, 0, st())).toBe(BOUND_FAIL)
+    expect(boundJsonValue("x".repeat(2 * 1024 * 1024), 0, st())).toBe(BOUND_FAIL)
+    // Deep nesting beyond MAX_INPUT_DEPTH fails.
+    let deep: unknown = 1
+    for (let i = 0; i < 100; i++) deep = { v: deep }
+    expect(boundJsonValue(deep, 0, st())).toBe(BOUND_FAIL)
+  })
+
+  test("utf8Slice never exceeds budget and never splits code points", () => {
+    const rand = mulberry32(0x225)
+    const alphabet = ["a", "é", "あ", "😀", "x".repeat(3)]
+    for (let i = 0; i < 500; i++) {
+      const len = Math.floor(rand() * 200)
+      let s = ""
+      for (let j = 0; j < len; j++) s += alphabet[Math.floor(rand() * alphabet.length)]
+      const budget = Math.floor(rand() * 300)
+      const out = utf8Slice(s, budget)
+      expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(budget)
+      expect(s.startsWith(out)).toBe(true)
+      // Output must be valid UTF-8 by construction (string) and a
+      // strict prefix — code points are never split because for..of
+      // iterates them whole.
+    }
+  })
+
+  test("resultText output is always within the byte budget", () => {
+    const rand = mulberry32(0x226)
+    const mk = (depth: number): unknown => {
+      if (depth <= 0) return rand() < 0.5 ? "t".repeat(Math.floor(rand() * 5000)) : rand()
+      const kind = rand()
+      if (kind < 0.4) return { text: "x".repeat(Math.floor(rand() * 3000)), content: mk(depth - 1) }
+      if (kind < 0.7) return { output: Array.from({ length: Math.floor(rand() * 20) }, () => mk(depth - 1)) }
+      return { content: Array.from({ length: Math.floor(rand() * 10) }, () => ({ text: "y".repeat(Math.floor(rand() * 2000)) })) }
+    }
+    for (let i = 0; i < 200; i++) {
+      const out = resultText(mk(4))
+      expect(Buffer.byteLength(out, "utf8")).toBeLessThanOrEqual(64 * 1024 + 64)
+    }
+    // String input path.
+    expect(Buffer.byteLength(resultText("z".repeat(1_000_000)), "utf8")).toBeLessThanOrEqual(64 * 1024)
+  })
+
+  test("safeSessionID property: contract holds for arbitrary inputs", () => {
+    const rand = mulberry32(0x227)
+    const pieces = ["a", "Z", "0", "-", ".", "_", "!", "?", " ", "/", "\n", "é", "\u0000"]
+    const seen = new Map<string, string>()
+    for (let i = 0; i < 2000; i++) {
+      const len = Math.floor(rand() * 300)
+      let raw = ""
+      for (let j = 0; j < len; j++) raw += pieces[Math.floor(rand() * pieces.length)]
+      const out = safeSessionID(raw)
+      // Contract: ≤128 chars, deterministic, idempotent.
+      expect(out.length).toBeLessThanOrEqual(128)
+      expect(safeSessionID(out)).toBe(out)
+      expect(safeSessionID(raw)).toBe(out)
+      // Charset: output is either "" or [A-Za-z0-9._-] plus the
+      // "unknown-"/"<head>-<hash>" shapes — all within the safe set.
+      if (out !== "") expect(/^[A-Za-z0-9._-]+$/.test(out)).toBe(true)
+      // Distinct raws that survive sanitization distinctly must not
+      // collapse — hash suffixes make collisions cryptographically
+      // improbable; assert on a sample basis.
+      if (i < 500) seen.set(raw, out)
+    }
+    const outs = [...seen.values()]
+    expect(new Set(outs).size).toBe(outs.length)
   })
 })
