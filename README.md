@@ -7,14 +7,64 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 
 対応ランタイム: **Claude Code / Codex / OpenCode**（opt-in adapter）。
 
+## 実測パフォーマンスと品質
+
+以下は release build の実測値。測定環境・コーパス・測定条件・再現コマンドは
+[docs/evidence/2026-11-27-v050-readme-perf-eval.md](docs/evidence/2026-11-27-v050-readme-perf-eval.md)
+に記録した。図は `assets/readme/` の SVG で、`scripts/gen-readme-assets.py`
+が実測 JSON（`assets/readme/data/`）から light/dark 両テーマを再生成する。
+
+### レイテンシとスケーラビリティ
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/perf-latency-dark.svg">
+  <img src="assets/readme/perf-latency-light.svg" alt="p95 latency vs corpus size: end-to-end CLI process stays under ~13ms and warm recommend core under ~0.9ms at 500 skills" width="880">
+</picture>
+
+合成コーパス 50→500 skills で計測。推薦コア（warm recommend）はサブミリ秒、
+プロセス起動を含む end-to-end でも 500 skills で p95 約 11ms。コールド
+スタートを含む discovery + グラフ構築はほぼ線形で、500 skills でも
+10ms 未満に収まる。
+
+### 推薦品質
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/eval-quality-dark.svg">
+  <img src="assets/readme/eval-quality-light.svg" alt="Evaluation results: 100% recall at top-3, zero forbidden recommendations, all 6 negative cases abstained" width="880">
+</picture>
+
+オフライン評価セット（58 cases・合成コーパス）で Recall@3 = 52/52、
+forbidden recommendation = 0、ネガティブケース 6/6 で適切に推薦を棄権した。
+これはランキング品質の測定であり、実セッションでの推薦→読込→変換効果は
+`observe --summary` の funnel 指標で別途計測する（合成評価と実利用の
+効果測定は区別する）。
+
+### メモリとフットプリント
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/perf-memory-dark.svg">
+  <img src="assets/readme/perf-memory-light.svg" alt="Peak RSS stays around 7MB regardless of corpus size from 17 to 500 skills" width="880">
+</picture>
+
+ピーク RSS はコーパス規模にほぼ依存せず約 7MB（実コーパス 17/87 skills、
+合成 500 skills で実測）。インデックス・キャッシュ・常駐プロセスを持たない
+ため、コストは呼び出しごとのプロセス起動に限定される。
+
+### アーキテクチャ
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/readme/architecture-dark.svg">
+  <img src="assets/readme/architecture-light.svg" alt="Recommendation flow: agent prompt goes through a thin fail-open hook CLI, an in-memory graph is built per call, top-3 skills are injected as context; no daemon, database, index files, or resident process" width="880">
+</picture>
+
 ## Install
 
 パッケージマネージャから導入する。hook の有効化は install では行われず、
 後述の `skill-graph adapter enable` で明示的に opt-in する。
 
 **利用可能なチャネルは mise（`github:` backend）・Homebrew・npm・
-crates.io の4系統。** v0.5.0 で全チャネルへの正式公開を完了した
-（v0.4.0 時点では npm / crates.io が未公開だった）。
+crates.io の4系統。** v0.5.0 は npm / crates.io を含む全チャネルで
+正式公開するバージョン（v0.4.0 時点では npm / crates.io が未公開だった）。
 
 ### mise（推奨・動作保証チャネル）
 
