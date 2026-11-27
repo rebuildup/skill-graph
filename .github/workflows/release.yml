@@ -83,7 +83,12 @@ jobs:
           strip "$bin" 2>/dev/null || true
           mkdir -p pkg
           cp "$bin" pkg/skill-graph
-          tar -czf "skill-graph-${{ matrix.target }}.tar.gz" -C pkg skill-graph
+          # Deterministic archive: normalized tar metadata + gzip -n so a
+          # rerun on the same commit/toolchain reproduces byte-identical
+          # checksums. Published assets must be immutable; reruns verify
+          # instead of overwriting (#130).
+          tar --sort=name --mtime='@0' --owner=0 --group=0 --numeric-owner \
+            -cf - -C pkg skill-graph | gzip -n > "skill-graph-${{ matrix.target }}.tar.gz"
           rm -rf pkg
       - uses: actions/upload-artifact@v4
         with:
@@ -132,10 +137,43 @@ jobs:
           tag="$RELEASE_TAG"
           notes="docs/release/${tag}.md"
           [ -f "$notes" ] || notes=""
-          # Idempotent on workflow_dispatch reruns: upload --clobber when a
-          # release already exists for the tag.
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/*.tar.gz sha256sums.txt --clobber
+            # Release already exists: published assets are immutable.
+            # Downstream channels (homebrew-tap sha256, npm binaries,
+            # mise) already reference these checksums, so a rerun must
+            # reproduce them byte-identically or fail — never clobber.
+            existing="$(mktemp -d)"
+            if gh release download "$tag" --pattern 'sha256sums.txt' \
+                --dir "$existing" --clobber 2>/dev/null \
+                && [ -f "$existing/sha256sums.txt" ]; then
+              if diff <(sort "$existing/sha256sums.txt") \
+                     <(sort sha256sums.txt) > /dev/null; then
+                # Manifest identical: this build reproduces the published
+                # bytes. Upload is then a no-op, but only needed if an
+                # asset is actually missing from the release.
+                expected="sha256sums.txt skill-graph-x86_64-unknown-linux-gnu.tar.gz skill-graph-aarch64-unknown-linux-gnu.tar.gz skill-graph-aarch64-apple-darwin.tar.gz skill-graph-x86_64-apple-darwin.tar.gz"
+                actual="$(gh release view "$tag" --json assets -q '.assets[].name' | sort | tr '\n' ' ')"
+                missing=""
+                for a in $expected; do
+                  case " $actual " in *" $a "*) ;; *) missing="$missing $a" ;; esac
+                done
+                if [ -z "$missing" ]; then
+                  echo "release $tag assets already published with identical checksums; no-op"
+                else
+                  echo "release $tag missing assets:$missing — re-uploading identical bytes"
+                  gh release upload "$tag" dist/*.tar.gz sha256sums.txt --clobber
+                fi
+              else
+                echo "release $tag assets differ from this build." >&2
+                echo "Published artifacts are immutable; publish a new tag instead." >&2
+                diff <(sort "$existing/sha256sums.txt") <(sort sha256sums.txt) || true
+                exit 1
+              fi
+            else
+              # Release exists but has no checksum manifest (partial or
+              # legacy release): completing the asset set is safe.
+              gh release upload "$tag" dist/*.tar.gz sha256sums.txt --clobber
+            fi
           else
             gh release create "$tag" dist/*.tar.gz sha256sums.txt \
               --title "skill-graph $tag" \
