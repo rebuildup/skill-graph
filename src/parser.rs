@@ -91,7 +91,7 @@ fn de_string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    use serde::de::{SeqAccess, Visitor};
+    use serde::de::{SeqAccess, VariantAccess, Visitor};
     struct Keywords;
     impl<'de> Visitor<'de> for Keywords {
         type Value = Vec<String>;
@@ -150,6 +150,29 @@ where
         }
         fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
             d.deserialize_any(self)
+        }
+        /// Tagged values (`!custom ...`) reach the visitor as enums.
+        /// The old `Value`-based path ignored `Value::Tagged` entirely;
+        /// without this arm a single tag would fail the WHOLE
+        /// frontmatter parse and cost the skill its name/description
+        /// (#144 r19 CR). Consume the tag and its payload, keep the
+        /// empty-keywords behavior.
+        fn visit_enum<A: serde::de::EnumAccess<'de>>(
+            self,
+            data: A,
+        ) -> Result<Self::Value, A::Error> {
+            struct Tag;
+            impl<'de> serde::de::DeserializeSeed<'de> for Tag {
+                type Value = ();
+                fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+                    serde::de::IgnoredAny::deserialize(d).map(|_| ())
+                }
+            }
+            let (_, variant) = data.variant_seed(Tag)?;
+            // The tagged payload may be any YAML node; IgnoredAny
+            // consumes scalars, sequences, and mappings alike.
+            variant.newtype_variant::<serde::de::IgnoredAny>()?;
+            Ok(Vec::new())
         }
     }
     deserializer.deserialize_any(Keywords)
@@ -756,5 +779,22 @@ mod tests {
                     .any(|c| c.is_control() || is_format_char(c))
             );
         }
+    }
+
+    #[test]
+    fn tagged_keywords_do_not_void_frontmatter() {
+        // `!custom` tags reach the keywords visitor as enums; the old
+        // Value path ignored Value::Tagged. A tag must yield empty
+        // keywords WITHOUT failing the whole frontmatter parse
+        // (#144 r19 CR).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_skill(
+            &dir.path().join("tagged-skill"),
+            "name: tagged-skill\ndescription: d\nkeywords: !custom [a, b]",
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(skill.parse_error.is_none(), "{:?}", skill.parse_error);
+        assert_eq!(skill.name, "tagged-skill");
+        assert!(skill.keywords.is_empty());
     }
 }

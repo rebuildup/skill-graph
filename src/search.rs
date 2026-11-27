@@ -561,7 +561,12 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             .saturating_add(if query_whole { query.len() } else { 0 })
             .saturating_add(if context_whole { context.len() } else { 0 })
             .saturating_add(body_len);
-        if body_scanned + body_len > MAX_BODY_SCAN_BYTES || body_work + work > MAX_BODY_TERM_WORK {
+        // saturating_add: `work` tops out at usize::MAX on 32-bit, and
+        // a plain add here could overflow before the budget check
+        // (#144 r19 CR).
+        if body_scanned.saturating_add(body_len) > MAX_BODY_SCAN_BYTES
+            || body_work.saturating_add(work) > MAX_BODY_TERM_WORK
+        {
             continue;
         }
         body_scanned += body_len;

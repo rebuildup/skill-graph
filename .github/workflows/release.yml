@@ -91,7 +91,10 @@ jobs:
           # ref resolution can prefer a same-named branch over the tag,
           # which would build and publish the branch under the tag's
           # provenance (#144 r19).
-          tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG")"
+          # Peel annotated tags to the commit: refs/tags/<tag> alone
+          # resolves to the tag object for annotated tags, which would
+          # never equal HEAD's commit SHA.
+          tag_sha="$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")"
           head_sha="$(git rev-parse HEAD)"
           [ "$head_sha" = "$tag_sha" ] || {
             echo "checked-out HEAD $head_sha is not tag $RELEASE_TAG ($tag_sha)"; exit 1; }

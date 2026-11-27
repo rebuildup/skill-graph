@@ -195,10 +195,12 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
                 graphs.remove(&oldest);
             }
             // The LRU bounds retained graphs, not total work: cap the
-            // number of discover+build passes a dataset can trigger.
+            // number of discover+build passes a dataset can trigger —
+            // including rebuilds after LRU eviction, so the count is
+            // builds, not distinct roots (#144 r19).
             if graph_builds >= MAX_EVAL_BUILDS {
                 return Err(format!(
-                    "dataset triggers more than {MAX_EVAL_BUILDS} distinct skill_root builds"
+                    "dataset triggers more than {MAX_EVAL_BUILDS} graph builds"
                 ));
             }
             graph_builds += 1;

@@ -51,7 +51,10 @@ jobs:
           # Fail fast on malformed or nonexistent tags before the
           # release-asset wait loop.
           [[ "$tag" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $tag" >&2; exit 1; }
-          tag_sha="$(git rev-parse "refs/tags/$tag")" || { echo "tag $tag does not exist" >&2; exit 1; }
+          # Peel annotated tags to the commit: refs/tags/<tag> alone
+          # resolves to the tag object for annotated tags, which would
+          # never equal HEAD's commit SHA.
+          tag_sha="$(git rev-parse --verify "refs/tags/$tag^{commit}")" || { echo "tag $tag does not exist" >&2; exit 1; }
           # The checked-out ref must actually be this tag: checkout's
           # ref resolution can prefer a same-named branch over the tag,
           # which would publish the branch under the tag's provenance

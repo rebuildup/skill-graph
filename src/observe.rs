@@ -864,6 +864,12 @@ struct EmitBudget {
     bytes: usize,
     count: usize,
     truncated: bool,
+    /// Latched on the FIRST rejection: without it a too-large event
+    /// would be skipped while smaller LATER events still fit, so
+    /// survivors would not be a feed-order prefix — earlier lines
+    /// could drop while later ones survive (#144 r19 CR). Counters
+    /// keep aggregating either way.
+    closed: bool,
 }
 
 impl EmitBudget {
@@ -886,6 +892,10 @@ impl EmitBudget {
         {
             return;
         }
+        if self.closed {
+            account_event_counters(&event, obs);
+            return;
+        }
         let charge = event_total_charge(&event, obs.current_file_len);
         if self.count < MAX_OBSERVE_EVENTS
             && self.bytes.saturating_add(charge) <= MAX_OBSERVE_RETAINED_BYTES
@@ -895,6 +905,7 @@ impl EmitBudget {
             events.push((seq, event));
             return;
         }
+        self.closed = true;
         if !self.truncated {
             self.truncated = true;
             obs_error(
