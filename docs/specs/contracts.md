@@ -223,10 +223,17 @@ queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
   feed 順に制限する。budget が最初に event を拒否した時点で
   `closed` latch が立ち、以降の event は全て detail を捨てて
   counter map のみ更新するため、emit される event 列は常に feed
-  順の真の prefix になる（passthrough pending buffer と同じ
-  意味論）。tool_use 1 件あたりの classification 数も
+  順の真の prefix になる（passthrough pending buffer も同一の
+  `closed` latch 意味論: `PendingBuffer` が count+byte 予算の
+  初回拒否で latch し、以降の event は counter のみ更新する）。
+  tool_use 1 件あたりの classification 数も
   `MAX_EVENTS_PER_PAYLOAD`（64）で打ち切る（hook の per-payload
-  cap と同じ上限）。`--summary` の `session_events`/`funnel_for`
+  cap と同じ上限）。1 file scan 中の transient 保持は pending
+  buffer・両 scanner の内部状態・emit runs・`obs.retained` の各段が
+  独立に `MAX_OBSERVE_EVENTS`/`MAX_OBSERVE_RETAINED_BYTES` または
+  `MAX_SCAN_BYTES`（scanner 毎）で bound されるため、peak は推定
+  ~320 MiB — 各段の予算は同一定数を再利用する受容 residual
+  （#144 R25 LOW）。`--summary` の `session_events`/`funnel_for`
   は集計用の transient map（`runtime:session_id` キー等）を
   event 数比例で構築するため、最悪入力では retained
   `MAX_OBSERVE_RETAINED_BYTES` budget の数倍の peak memory に
