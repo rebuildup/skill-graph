@@ -184,11 +184,30 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             0
         })
         .saturating_add(if context_whole { desc_len } else { 0 });
+        // Every term_matches/matches_query call builds a Two-Way
+        // searcher over its needle — O(needle len) preprocessing per
+        // call ON TOP of the O(field) scan. Per skill the main loop
+        // issues ~4 query-term and ~2 context-term matches plus one
+        // whole-query bonus per whitespace-free field_score call, and
+        // matches_query once per link target (#144 r15).
+        let preprocess_work = skill
+            .links
+            .len()
+            .saturating_mul(query.len())
+            .saturating_add(query.len().saturating_mul(4))
+            .saturating_add(context.len().saturating_mul(2))
+            .saturating_add(if query_whole {
+                query.len().saturating_mul(2)
+            } else {
+                0
+            })
+            .saturating_add(if context_whole { context.len() } else { 0 });
         let skill_work = scan_terms
             .saturating_mul(2)
             .saturating_mul(skill_names[index].len() + skill_descriptions[index].len())
             .saturating_add(link_bytes)
-            .saturating_add(whole_query_work);
+            .saturating_add(whole_query_work)
+            .saturating_add(preprocess_work);
         match_work = match_work.saturating_add(skill_work);
         if match_work > MAX_MATCH_TERM_WORK {
             // An exact name match is the strongest possible signal and

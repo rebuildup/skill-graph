@@ -285,8 +285,9 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   するため非 UTF-8 dir でも spec が実 path を指す。
   hook/plugin の env（`TMPDIR`・`SKILL_GRAPH_EVENT_LOG`・
   `SKILL_GRAPH_HOOK_STATE`）は UTF-8 のみ受理し、非 UTF-8 値は
-  未設定として縮退する（plugin は Node の env decode 上
-  非 UTF-8 を受け取れず、完全 parity は不可能）。UTF-8 を
+  未設定として縮退する（hook は `var` の UTF-8 検証で、plugin は
+  Node/Bun が非 UTF-8 byte を U+FFFD に decode するためその
+  置換文字を含む値を拒否する。完全 parity は不可能）。UTF-8 を
   要求するのは hook command へ埋め込む
   `--bin`/`SKILL_GRAPH_BIN`/`PATH` 解決結果のみで、
   その場合は `enable` がエラーを返す。
