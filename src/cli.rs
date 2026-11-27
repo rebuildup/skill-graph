@@ -200,7 +200,15 @@ pub fn run() -> Result<(), String> {
             }
             // Serialize Observation directly: routing through json!(obs)
             // first would materialize a second ~64MiB-budgeted tree as a
-            // Value before pretty-printing (#144 r14).
+            // Value before pretty-printing (#144 r14). `human` is
+            // rejected outright: human() would to_value the whole
+            // Observation (~30x transient) only to fall through to a
+            // pretty-print anyway — meaningless for this shape (#144 r18).
+            if format == "human" {
+                return Err(
+                    "observe: --format human is not supported; use json or --summary".to_string(),
+                );
+            }
             print_result(obs, &format)
         }
         Command::Hook { runtime, mode } => {

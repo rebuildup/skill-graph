@@ -681,9 +681,16 @@ pub fn classify_tool_access_all(
         // only the first Read access may claim it — attributing it to every
         // path would stamp the wrong skill name on the rest.
         let mut frontmatter_available = true;
-        for key in ["command", "cmd", "input"] {
+        // Parity with detect_all_from_payload's per-payload cap: observe
+        // scanners emit one event per classification, so an uncapped
+        // per-use list would fan out ~(uses × ~1.5K classes) before any
+        // downstream budget runs (#144 r18).
+        'keys: for key in ["command", "cmd", "input"] {
             if let Some(command) = input.get(key).and_then(Value::as_str) {
                 for (path, access) in classify_command(command) {
+                    if out.len() >= MAX_EVENTS_PER_PAYLOAD {
+                        break 'keys;
+                    }
                     let c = match access {
                         Access::Read => {
                             let verify = frontmatter_available;

@@ -592,10 +592,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             }
             let mut reasons = std::mem::take(&mut info.reasons);
             reasons.append(&mut extra_reasons);
-            if let Some(backlinks) = graph.backlinks.get(&index)
-                && !backlinks.is_empty()
-            {
-                reasons.push(format!("backlinks: {}", backlinks.len()));
+            // The map only holds positive counts (#144 r18).
+            if let Some(&backlink_count) = graph.backlinks.get(&index) {
+                reasons.push(format!("backlinks: {backlink_count}"));
             }
             reasons.sort();
             reasons.dedup();

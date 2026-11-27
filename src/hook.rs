@@ -828,6 +828,13 @@ fn run_hook_inner(runtime: Runtime, mode: &str) -> Result<(), String> {
         // state-dir path would redirect marker/session writes (and the
         // chmod below) into an arbitrary directory. Refuse state ops in
         // that case; the event log still records observations.
+        // Residual: the symlink_metadata check and the later open in
+        // restrict_dir_perms are not atomic — a same-UID attacker winning
+        // the swap race could get chmod 0700 applied to a directory we
+        // own (the uid==euid guard blocks foreign dirs) and empty marker
+        // files under a redirected path. Impact is minimal and needs a
+        // tight race in a shared TMPDIR; documented rather than fixed
+        // with dirfd anchoring (#144 r18).
         let is_link = std::fs::symlink_metadata(&env.state_dir)
             .map(|m| m.file_type().is_symlink())
             .unwrap_or(false);

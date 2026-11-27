@@ -36,18 +36,11 @@ fn resolves_links_requires_and_backlinks() {
             .any(|l| l.kind == skill_graph::model::LinkKind::Requires
                 && l.resolved_name.as_deref() == Some("beta-skill"))
     );
-    assert!(
-        graph
-            .backlinks
-            .get(&beta)
-            .is_some_and(|v| v.contains(&alpha))
-    );
-    assert!(
-        graph
-            .backlinks
-            .get(&gamma)
-            .is_some_and(|v| v.contains(&alpha))
-    );
+    // backlinks stores deduplicated source counts, not source lists
+    // (#144 r18): alpha reaches beta via Markdown + Requires and gamma
+    // via a body mention, so each target counts alpha exactly once.
+    assert_eq!(graph.backlinks.get(&beta), Some(&1));
+    assert_eq!(graph.backlinks.get(&gamma), Some(&1));
 }
 
 #[test]
@@ -295,11 +288,10 @@ fn backlinks_cover_all_name_copies_and_dedup_sources() {
     ]));
     let deps = &graph.by_name["dep-skill"];
     assert_eq!(deps.len(), 2);
-    let referrer_index = graph.by_name["referrer-skill"][0];
     for &target in deps {
         assert_eq!(
             graph.backlinks.get(&target),
-            Some(&vec![referrer_index]),
+            Some(&1),
             "target {target} must carry exactly one deduped backlink"
         );
     }

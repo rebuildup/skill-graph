@@ -546,8 +546,12 @@ fn observe_jsonl(
         }
         // Other JSON shapes are ignored silently (format drift tolerance).
     }
-    let mut events = codex.finish(obs);
-    events.extend(claude.finish(obs));
+    // Shared pre-merge emission budget for both scanners: without it a
+    // hostile transcript fans out ~(uses × classifications) events
+    // before record_event's caps ever run (#144 r18).
+    let mut emit = EmitBudget::default();
+    let mut events = codex.finish(obs, &mut emit);
+    events.extend(claude.finish(obs, &mut emit));
     events.extend(pending);
     // Emit in feed-line order: transcript scanners emit category-grouped
     // at finish() and passthrough events are buffered, so without the
@@ -708,8 +712,7 @@ fn try_passthrough_event(
     // the counter maps so `runtimes`/`skill_loads` stay exact (#144 r17
     // CR); only their retained detail is dropped, with one latched
     // notice — same truncation semantics as record_event.
-    let charge = event_retained_bytes(&event)
-        .saturating_add(implied_load(&event, obs.current_file_len).map_or(0, |(_, b)| b));
+    let charge = event_total_charge(&event, obs.current_file_len);
     if pending.len() >= MAX_OBSERVE_EVENTS
         || pending_bytes.saturating_add(charge) > MAX_OBSERVE_RETAINED_BYTES
     {
@@ -811,6 +814,81 @@ fn load_retained_bytes(l: &SkillLoad) -> usize {
         + l.file.len()
         + l.runtime.len()
         + l.detection.len()
+}
+
+/// Bytes `record_event` will retain for `event`: the event detail plus
+/// the SkillLoad row it implies — computed from the fields without
+/// materializing either, for pre-merge budget checks (#144 r18).
+fn event_total_charge(event: &SkillUsageEvent, current_file_len: usize) -> usize {
+    let mut n = event_retained_bytes(event);
+    if event.counts_as_load()
+        && let Some(name) = &event.skill_name
+    {
+        // Mirrors implied_load: file is "" at this stage, detection
+        // name is empty when unset.
+        n = n.saturating_add(
+            384 + event.session_id.len()
+                + name.len()
+                + event.timestamp.len()
+                + event.runtime.as_str().len()
+                + event.detection.map_or(0, |d| detection_name(d).len())
+                + current_file_len,
+        );
+    }
+    n
+}
+
+/// Pre-merge emission budget shared by the transcript scanners'
+/// `finish()` passes. `record_event`'s caps only run after the merged
+/// Vec is fully materialized, and a hostile transcript can fan out
+/// ~(uses × classifications) events far beyond the retained budget —
+/// the same hole the r17 passthrough `pending` buffer had (#144 r18).
+/// Overflowed events still update the counter maps via
+/// `account_event_counters`; only their retained detail is dropped,
+/// with one latched notice — same semantics as `record_event`.
+#[derive(Default)]
+struct EmitBudget {
+    bytes: usize,
+    count: usize,
+    truncated: bool,
+}
+
+impl EmitBudget {
+    fn push(
+        &mut self,
+        events: &mut Vec<(u64, SkillUsageEvent)>,
+        seq: u64,
+        event: SkillUsageEvent,
+        obs: &mut Observation,
+    ) {
+        let charge = event_total_charge(&event, obs.current_file_len);
+        if self.count < MAX_OBSERVE_EVENTS
+            && self.bytes.saturating_add(charge) <= MAX_OBSERVE_RETAINED_BYTES
+        {
+            self.count += 1;
+            self.bytes += charge;
+            events.push((seq, event));
+            return;
+        }
+        if !self.truncated {
+            self.truncated = true;
+            obs_error(
+                obs,
+                "transcript events truncated at emission budget".to_string(),
+            );
+        }
+        // Mirror record_event's unattributable-drop rule so counters
+        // stay exact for overflowed events too.
+        if !(event.kind == EventKind::SkillLoad
+            && event
+                .skill_name
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true))
+        {
+            account_event_counters(&event, obs);
+        }
+    }
 }
 
 /// Returns true while `len` is below `max`; emits one truncation notice
@@ -1131,7 +1209,7 @@ impl ClaudeScan {
         }
     }
 
-    fn finish(self, obs: &mut Observation) -> Vec<(u64, SkillUsageEvent)> {
+    fn finish(self, obs: &mut Observation, emit: &mut EmitBudget) -> Vec<(u64, SkillUsageEvent)> {
         let dropped = self.uses_dropped + self.results_dropped + self.prompts_dropped;
         if dropped > 0 {
             obs_error(
@@ -1142,7 +1220,8 @@ impl ClaudeScan {
         let mut events = Vec::new();
         for (seq, session, ts, text) in &self.prompts {
             if is_meaningful_prompt(text) {
-                events.push((
+                emit.push(
+                    &mut events,
                     *seq,
                     SkillUsageEvent::prompt_submit(
                         Runtime::ClaudeCode,
@@ -1151,7 +1230,8 @@ impl ClaudeScan {
                         ts,
                         text,
                     ),
-                ));
+                    obs,
+                );
             }
         }
         // Mirror the codex rule (#144 r13): a captured tool output's
@@ -1176,7 +1256,8 @@ impl ClaudeScan {
                 frontmatter_consumed.insert(id.as_str());
             }
             for c in classes {
-                events.push((
+                emit.push(
+                    &mut events,
                     *seq,
                     SkillUsageEvent::skill_load(
                         Runtime::ClaudeCode,
@@ -1189,7 +1270,8 @@ impl ClaudeScan {
                         c.detection,
                         c.confidence,
                     ),
-                ));
+                    obs,
+                );
             }
         }
         events
@@ -1561,14 +1643,17 @@ impl CodexScan {
         }
     }
 
-    fn finish(self, obs: &mut Observation) -> Vec<(u64, SkillUsageEvent)> {
+    fn finish(self, obs: &mut Observation, emit: &mut EmitBudget) -> Vec<(u64, SkillUsageEvent)> {
         // Events carry their feed line index; observe_jsonl merges all
-        // sources and sorts by (timestamp, line) so equal/missing
-        // timestamps keep true transcript order (#144 r17).
+        // sources in feed-line order so equal/missing timestamps keep
+        // true transcript order (#144 r17).
         let mut events: Vec<(u64, SkillUsageEvent)> = Vec::new();
-        events.extend(self.injected);
+        for (seq, event) in self.injected {
+            emit.push(&mut events, seq, event, obs);
+        }
         for (seq, session, ts, text) in &self.prompts {
-            events.push((
+            emit.push(
+                &mut events,
                 *seq,
                 SkillUsageEvent::prompt_submit(
                     Runtime::Codex,
@@ -1577,7 +1662,8 @@ impl CodexScan {
                     ts,
                     text,
                 ),
-            ));
+                obs,
+            );
         }
         // A captured tool output's frontmatter belongs to exactly one
         // file: the first Read across ALL records sharing a call_id —
@@ -1618,7 +1704,8 @@ impl CodexScan {
                         confidence: Confidence::Low,
                     },
                 };
-                events.push((
+                emit.push(
+                    &mut events,
                     pending.seq,
                     SkillUsageEvent::skill_load(
                         Runtime::Codex,
@@ -1631,7 +1718,8 @@ impl CodexScan {
                         c.detection,
                         c.confidence,
                     ),
-                ));
+                    obs,
+                );
             }
         }
         // Overflow accesses lost their path detail but not their load:
@@ -1669,7 +1757,8 @@ impl CodexScan {
                     (ov.name_hint.clone(), Detection::Mention, Confidence::Low)
                 }
             };
-            events.push((
+            emit.push(
+                &mut events,
                 ov.seq,
                 SkillUsageEvent::skill_load(
                     Runtime::Codex,
@@ -1682,7 +1771,8 @@ impl CodexScan {
                     detection,
                     confidence,
                 ),
-            ));
+                obs,
+            );
         }
         let dropped = self.overflow_dropped
             + self.prompts_dropped

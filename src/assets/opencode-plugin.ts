@@ -274,15 +274,31 @@ async function recommendNames(
   }
 }
 
+// The plugin host is long-lived: an uncapped tool result or input
+// would be buffered here (parts → join → JSON.stringify → stdin),
+// several× amplified, before the child's own 16 MiB/4 MiB stdin caps
+// ever see it (#144 r18). Legitimate hook/plugin payloads are
+// KB-scale, so these bounds are generous.
+const MAX_RESULT_TEXT_BYTES = 64 * 1024
+const MAX_INPUT_JSON_BYTES = 1024 * 1024
+const MAX_PAYLOAD_BYTES = 1024 * 1024
+
 function resultText(result: unknown): string {
-  if (typeof result === "string") return result
+  if (typeof result === "string") return result.slice(0, MAX_RESULT_TEXT_BYTES)
   try {
     const r = result as any
     const parts: string[] = []
+    let total = 0
+    const push = (s: string) => {
+      if (total >= MAX_RESULT_TEXT_BYTES) return
+      const room = MAX_RESULT_TEXT_BYTES - total
+      parts.push(s.length > room ? s.slice(0, room) : s)
+      total += Math.min(s.length, room)
+    }
     const walk = (v: any) => {
-      if (!v || typeof v !== "object") return
-      if (typeof v.text === "string") parts.push(v.text)
-      if (typeof v.content === "string") parts.push(v.content)
+      if (total >= MAX_RESULT_TEXT_BYTES || !v || typeof v !== "object") return
+      if (typeof v.text === "string") push(v.text)
+      if (typeof v.content === "string") push(v.content)
       if (Array.isArray(v.content)) v.content.forEach(walk)
       if (Array.isArray(v.output)) v.output.forEach(walk)
       if (v.output && typeof v.output === "object") walk(v.output)
@@ -300,6 +316,10 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     const tool = String(event.tool ?? "")
     const input = event.input ?? {}
     const inputJson = JSON.stringify(input ?? {})
+    // An oversized input cannot fit the payload budget below anyway —
+    // skip before the SKILL.md scan so a giant object is not walked
+    // twice (#144 r18).
+    if (inputJson.length > MAX_INPUT_JSON_BYTES) return []
     const isSkillTool = tool.toLowerCase() === "skill"
     const touches = inputJson.includes("SKILL.md") ||
       (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
@@ -330,11 +350,17 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       success: (event as any).success,
       error: (event as any).error,
     }
+    const body = JSON.stringify(payload)
+    // The child's stdin parse cap is 4 MiB; anything near it would be
+    // rejected after a wasted spawn, and the forwarded status/error
+    // fields are unbounded event data. Skip detection instead — the
+    // plugin fails open by design (#144 r18).
+    if (body.length > MAX_PAYLOAD_BYTES) return []
     const proc = Bun.spawn(
       [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
       { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
     )
-    proc.stdin.write(JSON.stringify(payload))
+    proc.stdin.write(body)
     proc.stdin.end()
     const out = await collectProc(proc).catch(() => "")
     const trimmed = out.trim()
@@ -372,6 +398,10 @@ export default Plugin.define({
     // load-grade event per prompt.
     const promptSkillSeen = new Map<string, Set<string>>()
 
+    // Per-session entry cap: MAX_PENDING_SESSIONS bounds distinct
+    // sessions, but a session whose context hook never drains would
+    // otherwise grow `list` for its whole lifetime (#144 r18).
+    const MAX_PENDING_ENTRIES_PER_SESSION = 64
     const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
       if (!names.length) return
       if (!pending.has(sessionID) && pending.size >= MAX_PENDING_SESSIONS) {
@@ -381,6 +411,9 @@ export default Plugin.define({
       }
       const list = pending.get(sessionID) ?? []
       list.push({ kind, names })
+      if (list.length > MAX_PENDING_ENTRIES_PER_SESSION) {
+        list.splice(0, list.length - MAX_PENDING_ENTRIES_PER_SESSION)
+      }
       pending.set(sessionID, list)
     }
 

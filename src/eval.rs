@@ -33,6 +33,17 @@ struct Case {
 /// unbounded JSONL read is the one remaining uncapped CLI input — a
 /// multi-GB or hostile dataset would OOM the process (#144 r17).
 const MAX_DATASET_BYTES: u64 = 64 * 1024 * 1024;
+/// Case-count bound: the byte cap limits input size, not case count —
+/// ~1.5M minimal cases would each run `recommend` and retain a result
+/// object, hanging or OOMing the run (#144 r18).
+const MAX_EVAL_CASES: usize = 10_000;
+/// Distinct `skill_root` graphs retained at once. Each Graph can itself
+/// be large, and a dataset naming thousands of roots would otherwise
+/// build and retain all of them simultaneously (#144 r18).
+const MAX_EVAL_GRAPHS: usize = 32;
+/// Per-case expected/forbidden list bound: hits are computed against at
+/// most `fetch` recommended names, so longer lists only burn CPU.
+const MAX_EVAL_EXPECTED: usize = 1024;
 
 /// `max` is the primary recommendation cutoff scored by `required_recall`.
 /// It defaults to the top-N the runtime actually injects (hook/plugin
@@ -59,6 +70,25 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
         }
         let case: Case = serde_json::from_str(line)
             .map_err(|e| format!("{}:{}: {e}", dataset.display(), line_no + 1))?;
+        for (what, list) in [
+            ("expected_required", &case.expected_required),
+            ("expected_optional", &case.expected_optional),
+            ("forbidden", &case.forbidden),
+        ] {
+            if list.len() > MAX_EVAL_EXPECTED {
+                return Err(format!(
+                    "case {}: {what} exceeds {} entries",
+                    case.id, MAX_EVAL_EXPECTED
+                ));
+            }
+        }
+        if cases.len() >= MAX_EVAL_CASES {
+            return Err(format!(
+                "{}: dataset exceeds {} cases",
+                dataset.display(),
+                MAX_EVAL_CASES
+            ));
+        }
         cases.push(case);
     }
 
@@ -83,6 +113,10 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
         .unwrap_or_else(|_| repo_root.clone());
 
     let mut graphs: HashMap<PathBuf, crate::resolver::Graph> = HashMap::new();
+    // Insertion-ordered LRU for the graph cache: datasets cluster cases
+    // by root, so the working set stays tiny while the retained count
+    // stays bounded (#144 r18).
+    let mut graph_lru: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
     let mut discovery_errors: Vec<String> = Vec::new();
     let mut results = Vec::new();
     let mut totals = json!({
@@ -132,10 +166,22 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
                 case.skill_root.display()
             ));
         }
-        if !graphs.contains_key(&root) {
+        if graphs.contains_key(&root) {
+            // Refresh recency: move the key to the back of the LRU.
+            if let Some(pos) = graph_lru.iter().position(|p| p == &root) {
+                graph_lru.remove(pos);
+            }
+            graph_lru.push_back(root.clone());
+        } else {
+            if graphs.len() >= MAX_EVAL_GRAPHS
+                && let Some(oldest) = graph_lru.pop_front()
+            {
+                graphs.remove(&oldest);
+            }
             let discovery = discover(std::slice::from_ref(&root));
             discovery_errors.extend(discovery.errors.iter().cloned());
             graphs.insert(root.clone(), build(discovery));
+            graph_lru.push_back(root.clone());
         }
         let graph = graphs
             .get(&root)

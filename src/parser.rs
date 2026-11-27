@@ -28,9 +28,24 @@ pub fn valid_skill_name(name: &str) -> bool {
 /// into downstream consumers.
 pub fn clean_description(desc: &str) -> String {
     desc.chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_format_char(*c))
         .take(1024)
         .collect()
+}
+
+/// Invisible format characters (Unicode category Cf) with no legitimate
+/// use in a skill description: bidi embedding/override/isolate controls,
+/// BOM, interlinear annotation, tag characters, and deprecated
+/// invisibles. `char::is_control` only covers Cc. ZWJ/ZWNJ (U+200C/D)
+/// are deliberately kept — they are load-bearing in emoji sequences
+/// and several writing systems (#144 r18).
+fn is_format_char(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891
+        | 0x08E2 | 0x180E | 0x200B | 0x200E..=0x200F | 0x202A..=0x202E
+        | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
+        | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3
+        | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
 /// Flatten a YAML scalar/sequence into the string form `Skill.metadata`

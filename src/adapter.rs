@@ -1440,7 +1440,16 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 payload_dirs.sort();
                 payload_dirs.dedup();
                 for dir in payload_dirs {
-                    let _ = std::fs::remove_dir_all(dir);
+                    // The lexical guard above cannot see symlinks in
+                    // intermediate components: a spec naming
+                    // `<any-abs>/skill-graph/opencode-plugin` where
+                    // `skill-graph` is a symlink would still recurse
+                    // into the link target. Canonicalize and re-verify
+                    // the resolved path before deleting (#144 r18).
+                    let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+                    if is_managed_payload_dir(&resolved) {
+                        let _ = std::fs::remove_dir_all(&resolved);
+                    }
                 }
                 outln!(
                     "note: checked user and current-project opencode configs only; \
