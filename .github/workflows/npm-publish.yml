@@ -159,21 +159,10 @@ jobs:
               }
             else
               # cross-compiled binaries cannot exec on this runner;
-              # verify the object format AND architecture match the
-              # target rather than trusting any non-empty `file` output —
-              # an x86-64 ELF inside linux-arm64 still contains 'ELF'.
-              case "$target" in
-                linux-arm64)
-                  file "$pkg/bin/skill-graph" | grep -q 'ELF' \
-                    && file "$pkg/bin/skill-graph" | grep -q 'aarch64' ;;
-                darwin-x64)
-                  file "$pkg/bin/skill-graph" | grep -q 'Mach-O' \
-                    && file "$pkg/bin/skill-graph" | grep -q 'x86_64' ;;
-                darwin-arm64)
-                  file "$pkg/bin/skill-graph" | grep -q 'Mach-O' \
-                    && file "$pkg/bin/skill-graph" | grep -q 'arm64' ;;
-                *) echo "unknown npm target: $target" >&2; exit 1 ;;
-              esac
+              # the standalone verifier checks object format AND
+              # architecture with explicit rejection paths — covered by
+              # scripts/test-release-verify.sh (#225 re-review).
+              scripts/verify-npm-arch.sh "$target" "$pkg/bin/skill-graph"
             fi
           done <<< "$TARGETS"
       - name: Bundle portable plugin into metapackage
@@ -189,21 +178,11 @@ jobs:
           set -euo pipefail
           # Published-content identity is an invariant on EVERY path —
           # rerun-skip AND fresh publish alike: what the registry serves
-          # must equal this build's packed tree (#225 re-review).
-          verify_registry_identity() {
-            local name="$1" ver="$2" pkg="$3"
-            local url
-            url="$(npm view "$name@$ver" dist.tarball)"
-            curl -fsSL "$url" -o /tmp/sg-pub.tgz
-            rm -rf /tmp/sg-cmp /tmp/sg-pack
-            mkdir -p /tmp/sg-cmp/pub /tmp/sg-cmp/local /tmp/sg-pack
-            tar -xzf /tmp/sg-pub.tgz -C /tmp/sg-cmp/pub
-            npm pack "./$pkg" --pack-destination /tmp/sg-pack >/dev/null
-            local_tgz="$(find /tmp/sg-pack -name '*.tgz' | head -1)"
-            tar -xzf "$local_tgz" -C /tmp/sg-cmp/local
-            diff -r /tmp/sg-cmp/pub/package /tmp/sg-cmp/local/package
-            rm -rf /tmp/sg-cmp /tmp/sg-pack /tmp/sg-pub.tgz
-          }
+          # must equal this build's packed tree (#225). The verifier is
+          # a standalone process with its own errexit, so invoking it
+          # under `||` cannot mask internal step failures — the defect
+          # that let a failed diff pass as success inline (#225
+          # re-review).
           while IFS=: read -r target triple; do
             [ -n "$target" ] || continue
             pkg="npm/skill-graph-${target}"
@@ -214,10 +193,8 @@ jobs:
               # Version exists: presence is not identity — a rerun must
               # prove the published tarball carries THIS build's
               # content, not silently skip a divergent artifact (#225).
-              # Compare extracted package trees so gzip/tar metadata
-              # nondeterminism cannot cause false mismatches.
               echo "$name@$ver already published — verifying content identity"
-              verify_registry_identity "$name" "$ver" "$pkg" || {
+              scripts/verify-npm-registry.sh "$name" "$ver" "$pkg" || {
                 echo "published $name@$ver differs from this build — refusing to skip" >&2
                 exit 1
               }
@@ -227,7 +204,7 @@ jobs:
             # Post-publish verification: the registry must serve THIS
             # build's content — publish exit status alone does not prove
             # what landed (#225 re-review).
-            verify_registry_identity "$name" "$ver" "$pkg" || {
+            scripts/verify-npm-registry.sh "$name" "$ver" "$pkg" || {
               echo "published $name@$ver does not match this build" >&2
               exit 1
             }
@@ -239,20 +216,6 @@ jobs:
           set -euo pipefail
           # Same invariant as the platform packages (#225 re-review):
           # registry content must equal this build on skip AND publish.
-          verify_registry_identity() {
-            local name="$1" ver="$2" pkg="$3"
-            local url
-            url="$(npm view "$name@$ver" dist.tarball)"
-            curl -fsSL "$url" -o /tmp/sg-pub.tgz
-            rm -rf /tmp/sg-cmp /tmp/sg-pack
-            mkdir -p /tmp/sg-cmp/pub /tmp/sg-cmp/local /tmp/sg-pack
-            tar -xzf /tmp/sg-pub.tgz -C /tmp/sg-cmp/pub
-            npm pack "./$pkg" --pack-destination /tmp/sg-pack >/dev/null
-            local_tgz="$(find /tmp/sg-pack -name '*.tgz' | head -1)"
-            tar -xzf "$local_tgz" -C /tmp/sg-cmp/local
-            diff -r /tmp/sg-cmp/pub/package /tmp/sg-cmp/local/package
-            rm -rf /tmp/sg-cmp /tmp/sg-pack /tmp/sg-pub.tgz
-          }
           ver="$(node -p "require('./npm/skill-graph/package.json').version")"
           name="@rebuildup/skill-graph"
           if npm view "$name@$ver" version >/dev/null 2>&1; then
@@ -260,14 +223,14 @@ jobs:
             # existing version is skipped only after its published
             # content verifies against this build.
             echo "$name@$ver already published — verifying content identity"
-            verify_registry_identity "$name" "$ver" "npm/skill-graph" || {
+            scripts/verify-npm-registry.sh "$name" "$ver" "npm/skill-graph" || {
               echo "published $name@$ver differs from this build — refusing to skip" >&2
               exit 1
             }
             exit 0
           fi
           npm publish ./npm/skill-graph --access public --provenance
-          verify_registry_identity "$name" "$ver" "npm/skill-graph" || {
+          scripts/verify-npm-registry.sh "$name" "$ver" "npm/skill-graph" || {
             echo "published $name@$ver does not match this build" >&2
             exit 1
           }

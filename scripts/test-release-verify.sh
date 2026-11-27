@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# test-release-verify.sh — fixture tests for the release-verification
+# scripts. Proves the verifiers REJECT the failure modes they exist
+# for, not just accept the happy path (#225 re-review): content
+# mismatch, missing/extra files, permission-bit drift, corrupt
+# archives, and wrong architectures.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+TAR_VERIFY=scripts/verify-npm-tarballs.sh
+ARCH_VERIFY=scripts/verify-npm-arch.sh
+fails=0
+
+say() { printf '%s\n' "$*"; }
+fail() { say "FAIL: $*"; fails=$((fails + 1)); }
+
+expect_ok() { # $1=desc, rest=cmd
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then say "ok: $desc"; else fail "$desc (unexpected rejection)"; fi
+}
+expect_reject() { # $1=desc, rest=cmd
+  local desc="$1"; shift
+  if "$@" >/dev/null 2>&1; then fail "$desc (unexpectedly accepted)"; else say "ok: $desc"; fi
+}
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/sg-verify-test.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+# --- tarball fixtures -------------------------------------------------
+# npm tarballs extract under package/; build two identical trees then
+# pack each with tar (same layout npm produces).
+mkpkg() { # $1=dest-dir $2=variant
+  local d="$1" v="$2"
+  rm -rf "$d"
+  mkdir -p "$d/package/bin" "$d/package/plugin"
+  printf '#!/bin/sh\necho skill-graph 0.5.0\n' > "$d/package/bin/skill-graph"
+  chmod +x "$d/package/bin/skill-graph"
+  printf '{"name":"@rebuildup/skill-graph-linux-x64","version":"0.5.0"}\n' \
+    > "$d/package/package.json"
+  printf 'plugin payload %s\n' "$v" > "$d/package/plugin/index.js"
+}
+
+pack() { # $1=pkgdir $2=out.tgz
+  tar -czf "$2" -C "$1" package
+}
+
+mkdir -p "$work/a" "$work/b"
+mkpkg "$work/a" v1
+mkpkg "$work/b" v1
+pack "$work/a" "$work/a.tgz"
+pack "$work/b" "$work/b.tgz"
+
+expect_ok "identical tarballs accepted" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/b.tgz"
+
+# content mismatch
+mkpkg "$work/b" v2
+pack "$work/b" "$work/b.tgz"
+expect_reject "content mismatch rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/b.tgz"
+
+# missing file
+rm "$work/b/package/plugin/index.js"
+pack "$work/b" "$work/b.tgz"
+expect_reject "missing file rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/b.tgz"
+mkpkg "$work/b" v1
+
+# extra file
+printf 'extra\n' > "$work/b/package/extra.txt"
+pack "$work/b" "$work/b.tgz"
+expect_reject "extra file rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/b.tgz"
+rm "$work/b/package/extra.txt"
+
+# permission drift: same content, exec bit lost — diff -r alone would
+# miss this; the mode listing must catch it.
+chmod -x "$work/b/package/bin/skill-graph"
+pack "$work/b" "$work/b.tgz"
+expect_reject "exec-bit drift rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/b.tgz"
+chmod +x "$work/b/package/bin/skill-graph"
+
+# file-type drift: regular file replaced by a directory of same name
+rm "$work/b/package/bin/skill-graph"
+mkdir "$work/b/package/bin/skill-graph"
+printf 'not a binary\n' > "$work/b/package/bin/skill-graph/x"
+pack "$work/b" "$work/b.tgz"
+expect_reject "file->dir drift rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/b.tgz"
+mkpkg "$work/b" v1
+
+# corrupt archive
+printf 'not a gzip\n' > "$work/corrupt.tgz"
+expect_reject "corrupt tarball rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/corrupt.tgz"
+expect_reject "corrupt published tarball rejected" \
+  bash "$TAR_VERIFY" "$work/corrupt.tgz" "$work/a.tgz"
+
+# missing package/ root (flat tarball)
+mkdir -p "$work/flat/root"
+printf 'x\n' > "$work/flat/root/file.txt"
+tar -czf "$work/flat.tgz" -C "$work/flat/root" .
+expect_reject "tarball without package/ root rejected" \
+  bash "$TAR_VERIFY" "$work/flat.tgz" "$work/a.tgz"
+
+# nonexistent inputs
+expect_reject "missing published file rejected" \
+  bash "$TAR_VERIFY" "$work/nope.tgz" "$work/a.tgz"
+expect_reject "missing local file rejected" \
+  bash "$TAR_VERIFY" "$work/a.tgz" "$work/nope.tgz"
+
+# --- arch verifier ------------------------------------------------------
+expect_ok "arch self-test passes" bash "$ARCH_VERIFY" --self-test
+
+# End-to-end reject paths through the real entry point: FILE_BIN feeds
+# fixture `file(1)` output so no cross-compiled binary is needed.
+printf 'dummy\n' > "$work/dummy-bin"
+cat > "$work/fake-file" <<'SH'
+#!/usr/bin/env bash
+case "$FAKE_FILE_OUT" in
+  __fail__) exit 1 ;;
+  __empty__) printf '' ;;
+  *) printf '%s\n' "$FAKE_FILE_OUT" ;;
+esac
+SH
+chmod +x "$work/fake-file"
+
+arch_case() { # $1=desc $2=expected(ok|reject) $3=target $4=file-output|__fail__|__empty__
+  local desc="$1" want="$2" target="$3" out="$4"
+  local rc=0
+  FAKE_FILE_OUT="$out" FILE_BIN="$work/fake-file" \
+    bash "$ARCH_VERIFY" "$target" "$work/dummy-bin" >/dev/null 2>&1 || rc=$?
+  if [ "$want" = ok ] && [ "$rc" -eq 0 ]; then say "ok: $desc"; return; fi
+  if [ "$want" = reject ] && [ "$rc" -ne 0 ]; then say "ok: $desc"; return; fi
+  fail "$desc (rc=$rc want=$want)"
+}
+
+arch_case "matching arch accepted"            ok      linux-x64    'ELF 64-bit LSB pie executable, x86-64'
+arch_case "wrong arch rejected end-to-end"    reject  linux-arm64  'ELF 64-bit LSB pie executable, x86-64'
+arch_case "Mach-O for ELF target rejected"    reject  linux-x64    'Mach-O 64-bit executable arm64'
+arch_case "unknown target rejected"           reject  plan9-amd64  'ELF 64-bit LSB pie executable, x86-64'
+arch_case "file(1) failure rejected"          reject  linux-x64    __fail__
+arch_case "empty file(1) output rejected"     reject  linux-x64    __empty__
+expect_reject "missing binary rejected" \
+  bash "$ARCH_VERIFY" linux-x64 "$work/no-such-bin"
+
+if [ "$fails" -gt 0 ]; then
+  say "$fails release-verify test(s) FAILED"
+  exit 1
+fi
+say "release-verify tests: all cases pass"

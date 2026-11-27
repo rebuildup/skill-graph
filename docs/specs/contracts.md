@@ -202,7 +202,15 @@ queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
   `detect` 子プロセスの stdout から parse する event は
   1 payload あたり 64 件まで（Rust 側 `MAX_EVENTS_PER_PAYLOAD`
   と同じ）。pending 注入キューは session あたり 64 entry で
-  打ち切る。
+  打ち切る。session id を帰属不能（sanitize 結果が空）とする
+  prompt/tool event は per-session state を一切共有しない:
+  dedup・recommendation queue・session continuity（`sessionCtx`）
+  を bypass し、context hook は空 id で早期 return する
+  （Rust hook の `state_disabled` と同じ契約 — 匿名 session 同士が
+  状態を merge・漏洩しない）。`detect` spawn 予算のみ、帰属不能
+  session 全体で共有する単一の fail-closed 上限を持つ
+  （resource bound であり recommendation state ではない。
+  枯渇時は匿名 session の detection のみ止まる）。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を

@@ -1302,14 +1302,6 @@ fn legacy_home() -> Option<PathBuf> {
         .or_else(|| home().map(|h| h.join(".local/share/skill-graph")))
 }
 
-/// The v0.3.x installer refuses to replace a `current` that is not a
-/// symlink — the legacy contract is `current -> <version>` link only.
-/// A directory or regular file named `current` is user content and
-/// must survive cleanup (#225 re-review).
-fn is_legacy_current(file_type: std::fs::FileType) -> bool {
-    file_type.is_symlink()
-}
-
 /// `<semver>/` release dirs are named exactly `X.Y.Z` (the git tag).
 /// Requiring exactly three all-digit components rejects lookalikes
 /// (`1.2.3.4`, `2024.01.01-backup`); the payload check below rejects
@@ -1326,22 +1318,51 @@ fn is_semver_dir_name(name: &std::ffi::OsStr) -> bool {
 }
 
 /// A semver-named directory is a legacy release dir only when it
-/// carries the v0.3.x payload marker — the `skill-graph` binary the
-/// `current` symlink and bin link resolve through. A user directory
-/// that merely looks like a version (`2024.01.01/`) is kept (#225
-/// re-review).
+/// carries BOTH v0.3.x payload markers — the `skill-graph` binary and
+/// the `adapters/` tree the `current` symlink resolves through. A user
+/// directory that merely looks like a version (`2024.01.01/`) or holds
+/// a stray same-named file is kept (#225 re-review).
 fn is_legacy_release_dir(path: &std::path::Path) -> bool {
-    path.join("skill-graph").symlink_metadata().is_ok()
+    path.join("skill-graph")
+        .symlink_metadata()
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+        && path.join("adapters").is_dir()
 }
 
-/// A top-level home entry is legacy iff it is the `current` symlink or
-/// a `<semver>/` release dir carrying the payload marker. Everything
-/// else — including the current `opencode-plugin/` payload and any
-/// user-added content — is preserved and reported (#225).
-fn is_legacy_home_entry(path: &std::path::Path, file_type: std::fs::FileType) -> bool {
+/// `current` is a legacy artifact only as the v0.3.x symlink pointing
+/// at a payload-carrying `<semver>/` release dir directly inside the
+/// home (`current -> 0.3.1`). A symlink to anything else — or a
+/// same-named user directory/file — is user content (#225 re-review).
+fn is_legacy_current_link(home: &std::path::Path, link: &std::path::Path) -> bool {
+    let Ok(target) = std::fs::read_link(link) else {
+        return false;
+    };
+    let cand = if target.is_absolute() {
+        target
+    } else {
+        home.join(target)
+    };
+    let norm = crate::resolver::normalize_path(&cand);
+    let home_norm = crate::resolver::normalize_path(home);
+    if norm.parent() != Some(home_norm.as_path()) {
+        return false;
+    }
+    norm.file_name()
+        .is_some_and(|n| is_semver_dir_name(n) && is_legacy_release_dir(&norm))
+}
+
+/// Classify one top-level home entry. Must be evaluated BEFORE any
+/// deletion: `current`'s legitimacy depends on the release dir it
+/// points at still existing (#225 re-review).
+fn classify_home_entry(
+    home: &std::path::Path,
+    path: &std::path::Path,
+    file_type: std::fs::FileType,
+) -> bool {
     let name = path.file_name().unwrap_or_default();
     if name == "current" {
-        return is_legacy_current(file_type);
+        return file_type.is_symlink() && is_legacy_current_link(home, path);
     }
     file_type.is_dir() && is_semver_dir_name(name) && is_legacy_release_dir(path)
 }
@@ -1396,13 +1417,10 @@ pub fn clean_legacy() -> Result<(), String> {
                 .is_some_and(|first| {
                     if first == "current" {
                         // `current` counts as legacy only while it is
-                        // still the v0.3.x symlink — a same-named user
-                        // directory is not a legacy subtree.
-                        home_dir
-                            .join("current")
-                            .symlink_metadata()
-                            .map(|m| m.file_type().is_symlink())
-                            .unwrap_or(false)
+                        // the v0.3.x symlink into a marked release dir —
+                        // a same-named user entry is not a legacy
+                        // subtree (#225 re-review).
+                        is_legacy_current_link(&home_dir, &home_dir.join("current"))
                     } else {
                         is_semver_dir_name(std::ffi::OsStr::new(first))
                             && is_legacy_release_dir(&home_dir.join(first))
@@ -1419,16 +1437,23 @@ pub fn clean_legacy() -> Result<(), String> {
     if home_dir.is_dir() {
         let entries =
             std::fs::read_dir(&home_dir).map_err(|e| format!("{}: {e}", home_dir.display()))?;
+        // Two phases: classify EVERY entry against the pre-deletion
+        // filesystem, then delete. `current`'s legitimacy depends on
+        // the release dir it points at, so interleaved classify+delete
+        // could keep `current` only because its target was already
+        // removed (#225 re-review).
+        let mut classified: Vec<(std::path::PathBuf, std::fs::FileType)> = Vec::new();
         for entry in entries {
             let entry = entry.map_err(|e| e.to_string())?;
-            let path = entry.path();
-            // file_type does not follow symlinks: `current` (a symlink)
-            // and symlinked entries are removed as links, never through.
             let file_type = entry.file_type().map_err(|e| e.to_string())?;
-            if !is_legacy_home_entry(&path, file_type) {
+            let path = entry.path();
+            if classify_home_entry(&home_dir, &path, file_type) {
+                classified.push((path, file_type));
+            } else {
                 kept.push(path.display().to_string());
-                continue;
             }
+        }
+        for (path, file_type) in classified {
             let r = if file_type.is_dir() {
                 std::fs::remove_dir_all(&path)
             } else {
