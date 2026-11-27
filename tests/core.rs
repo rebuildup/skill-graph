@@ -385,6 +385,52 @@ fn resolver_mentions_are_capped_per_skill() {
     assert_eq!(mentions, 64, "mention cap should engage deterministically");
 }
 
+/// #225: the per-skill mention cap applies to resolved mentions, not to
+/// scanned tokens — unrelated vocabulary sorting before a real skill
+/// name must not crowd the genuine reference out of the cap.
+#[test]
+fn resolver_mentions_ignore_unrelated_token_flood() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["real-target", "other-skill"] {
+        let d = dir.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: fixture\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    let mentioner = dir.path().join("mentioner");
+    std::fs::create_dir_all(&mentioner).unwrap();
+    // 70 non-skill tokens that sort before "real-target"/"other-skill":
+    // under the old take(64)-then-filter order they consumed the entire
+    // cap and both genuine mentions were lost.
+    let flood = (0..70)
+        .map(|i| format!("aaa-filler-{i:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        mentioner.join("SKILL.md"),
+        format!("---\nname: mentioner\ndescription: flood\n---\n{flood} real-target other-skill\n"),
+    )
+    .unwrap();
+
+    let graph = build(discover(&[dir.path().to_path_buf()]));
+    let skill = graph
+        .skills
+        .iter()
+        .find(|s| s.name == "mentioner")
+        .expect("mentioner discovered");
+    let mut names: Vec<&str> = skill
+        .links
+        .iter()
+        .filter(|l| l.kind == skill_graph::model::LinkKind::Mention)
+        .map(|l| l.target.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["other-skill", "real-target"]);
+}
+
 /// #144 round-11: a CJK run that contains a recognized dictionary word
 /// plus uncovered characters (particles/suffixes like する) must still
 /// count as ONE evidence unit. Previously the uncovered bigrams fell

@@ -1384,3 +1384,136 @@ fn opencode_disable_never_removes_dirs_outside_payload_layout() {
                 == Some(0)
     );
 }
+
+/// #225: `adapter clean-legacy` removes only v0.3.x artifacts — the
+/// `current` symlink, `<semver>/` release dirs, and the bin symlink —
+/// while the current `opencode-plugin/` payload and unrelated entries
+/// under the same home survive. The old documented `rm -rf` of the
+/// whole home deleted a freshly enabled plugin.
+#[cfg(unix)]
+#[test]
+fn clean_legacy_preserves_opencode_plugin_payload() {
+    let f = Fixture::new();
+    let home = f.home.path().join(".local/share/skill-graph");
+    // v0.3.x layout: current -> 0.3.1, plus the release dir itself.
+    std::fs::create_dir_all(home.join("0.3.1/adapters/opencode/skill-graph")).unwrap();
+    std::fs::write(home.join("0.3.1/skill-graph"), "old-binary").unwrap();
+    std::os::unix::fs::symlink("0.3.1", home.join("current")).unwrap();
+    // Current payload + a user-added entry that must survive.
+    std::fs::create_dir_all(home.join("opencode-plugin")).unwrap();
+    std::fs::write(home.join("opencode-plugin/plugin.ts"), "payload").unwrap();
+    std::fs::write(home.join("unrelated.txt"), "user content").unwrap();
+    // v0.3.x bin symlink pointing into the legacy home.
+    let bin_dir = f.home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::os::unix::fs::symlink(
+        "../share/skill-graph/current/skill-graph",
+        bin_dir.join("skill-graph"),
+    )
+    .unwrap();
+
+    let (out, rc) = f.run(&["adapter", "clean-legacy"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(!home.join("current").exists(), "current symlink removed");
+    assert!(!home.join("0.3.1").exists(), "semver dir removed");
+    assert!(
+        home.join("opencode-plugin/plugin.ts").is_file(),
+        "opencode-plugin payload must survive: {out}"
+    );
+    assert!(
+        home.join("unrelated.txt").is_file(),
+        "non-legacy entries are reported and kept: {out}"
+    );
+    assert!(
+        bin_dir.join("skill-graph").symlink_metadata().is_err(),
+        "bin symlink into legacy home removed"
+    );
+}
+
+/// #225: a `skill-graph` symlink in the bin dir that does NOT point
+/// into the legacy home is foreign — clean-legacy must keep it.
+#[cfg(unix)]
+#[test]
+fn clean_legacy_keeps_foreign_bin_symlink() {
+    let f = Fixture::new();
+    let home = f.home.path().join(".local/share/skill-graph");
+    std::fs::create_dir_all(&home).unwrap();
+    let bin_dir = f.home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let foreign = f.home.path().join("elsewhere/skill-graph");
+    std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+    std::fs::write(&foreign, "not ours").unwrap();
+    std::os::unix::fs::symlink(&foreign, bin_dir.join("skill-graph")).unwrap();
+
+    let (out, rc) = f.run(&["adapter", "clean-legacy"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        bin_dir.join("skill-graph").symlink_metadata().is_ok(),
+        "foreign symlink must be kept: {out}"
+    );
+}
+
+/// #225 re-review: clean-legacy must not delete user content that
+/// merely *resembles* a legacy artifact — a `current` directory, a
+/// date-like semver dir without the payload marker, an over-long
+/// version name, or a semver dir missing the `skill-graph` binary.
+#[cfg(unix)]
+#[test]
+fn clean_legacy_keeps_lookalike_user_content() {
+    let f = Fixture::new();
+    let home = f.home.path().join(".local/share/skill-graph");
+    // `current` as a real directory with user content — the v0.3.x
+    // contract is a symlink only; the old code would remove_dir_all it.
+    std::fs::create_dir_all(home.join("current/user-data")).unwrap();
+    std::fs::write(home.join("current/user-data/keep.txt"), "mine").unwrap();
+    // Date-like name parses as semver but has no payload marker.
+    std::fs::create_dir_all(home.join("2024.01.01/notes")).unwrap();
+    std::fs::write(home.join("2024.01.01/notes/a.md"), "mine").unwrap();
+    // Four-component version-ish name.
+    std::fs::create_dir_all(home.join("1.2.3.4")).unwrap();
+    std::fs::write(home.join("1.2.3.4/data"), "mine").unwrap();
+    // Exact semver shape but no `skill-graph` payload marker.
+    std::fs::create_dir_all(home.join("9.9.9")).unwrap();
+    std::fs::write(home.join("9.9.9/readme"), "mine").unwrap();
+
+    let (out, rc) = f.run(&["adapter", "clean-legacy"]);
+    assert_eq!(rc, 0, "{out}");
+    for p in [
+        "current/user-data/keep.txt",
+        "2024.01.01/notes/a.md",
+        "1.2.3.4/data",
+        "9.9.9/readme",
+    ] {
+        assert!(
+            home.join(p).is_file(),
+            "{p} must survive clean-legacy: {out}"
+        );
+    }
+}
+
+/// #225 re-review: a bin symlink into a NON-legacy subtree of the home
+/// (`opencode-plugin/`) is user content — only `current/` or a
+/// payload-carrying `<semver>/` target qualifies.
+#[cfg(unix)]
+#[test]
+fn clean_legacy_keeps_bin_link_into_plugin_payload() {
+    let f = Fixture::new();
+    let home = f.home.path().join(".local/share/skill-graph");
+    std::fs::create_dir_all(home.join("opencode-plugin")).unwrap();
+    std::fs::write(home.join("opencode-plugin/skill-graph"), "payload").unwrap();
+    let bin_dir = f.home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::os::unix::fs::symlink(
+        "../share/skill-graph/opencode-plugin/skill-graph",
+        bin_dir.join("skill-graph"),
+    )
+    .unwrap();
+
+    let (out, rc) = f.run(&["adapter", "clean-legacy"]);
+    assert_eq!(rc, 0, "{out}");
+    assert!(
+        bin_dir.join("skill-graph").symlink_metadata().is_ok(),
+        "bin link into opencode-plugin must be kept: {out}"
+    );
+    assert!(home.join("opencode-plugin/skill-graph").is_file());
+}

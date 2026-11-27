@@ -167,7 +167,10 @@ pub(crate) fn sanitize_session_id(session_id: &str) -> String {
         return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
     }
     let safe = filtered;
-    if safe.is_empty() && !session_id.is_empty() {
+    if safe.is_empty() {
+        if session_id.is_empty() {
+            return safe;
+        }
         // Distinct invalid ids must not collapse into one "unknown"
         // funnel session: derive a deterministic suffix from the
         // original bytes so different ids stay distinct while the same
@@ -175,10 +178,22 @@ pub(crate) fn sanitize_session_id(session_id: &str) -> String {
         // DefaultHasher because the OpenCode plugin must produce the
         // identical id for the same payload — the hash is part of the
         // cross-entrypoint event contract.
-        format!("unknown-{}", &sha256_hex(session_id.as_bytes())[..16])
-    } else {
-        safe
+        return format!("unknown-{}", &sha256_hex(session_id.as_bytes())[..16]);
     }
+    if safe != session_id {
+        // Charset filtering is lossy: "sess!1" and "sess?1" would both
+        // sanitize to "sess1" and share funnel state. When any character
+        // was stripped, suffix a hash of the ORIGINAL id so distinct
+        // inputs stay distinct — the same suffix scheme the >128-char
+        // branch uses, mirrored exactly by the OpenCode plugin's
+        // safeSessionID (#225). The head is capped at 119 chars so the
+        // result can never exceed the 128-char session_id contract —
+        // a 128-char filtered id plus the suffix would otherwise emit
+        // 137 chars (#225 re-review).
+        let head: String = safe.chars().take(119).collect();
+        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
+    }
+    safe
 }
 
 impl SkillUsageEvent {
@@ -425,6 +440,20 @@ pub fn skill_name_from_path(path: &str) -> Option<String> {
 /// Candidates are maximal non-delimiter runs ending at `SKILL.md`; callers
 /// must still validate with `is_skill_md_path`.
 pub fn skill_md_paths(text: &str) -> Vec<String> {
+    skill_md_paths_impl(text, None)
+}
+
+/// Test-visible variant returning the total bytes handed to UTF-8
+/// validation, so the dense-hit regression test can assert bounded work
+/// deterministically instead of relying on wall-clock timing (#225).
+#[cfg(test)]
+fn skill_md_paths_counting(text: &str) -> (Vec<String>, usize) {
+    let mut validated = 0usize;
+    let out = skill_md_paths_impl(text, Some(&mut validated));
+    (out, validated)
+}
+
+fn skill_md_paths_impl(text: &str, mut validated: Option<&mut usize>) -> Vec<String> {
     const NEEDLE: &[u8] = b"SKILL.md";
     fn is_path_byte(b: u8) -> bool {
         b.is_ascii_alphanumeric()
@@ -451,6 +480,8 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut pos = 0usize;
+    const MAX_CANDIDATES: usize = 256;
+    const MAX_CANDIDATE_BYTES: usize = 4096;
     // Start of the contiguous path-byte run ending at `pos`, tracked
     // forward: every byte is classified exactly once (needle bodies are
     // path bytes, so `pos = end` jumps never break the run), giving each
@@ -466,8 +497,6 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     // Distinct candidates and per-candidate length are both bounded: a
     // max-size payload could otherwise materialize hundreds of MB of
     // path strings before any downstream cap applies.
-    const MAX_CANDIDATES: usize = 256;
-    const MAX_CANDIDATE_BYTES: usize = 4096;
     while pos + NEEDLE.len() <= bytes.len() && out.len() < MAX_CANDIDATES {
         if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
             if !is_path_byte(bytes[pos]) {
@@ -488,12 +517,23 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
             pos = end;
             continue;
         }
-        if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
-            && candidate.len() <= MAX_CANDIDATE_BYTES
-            && !candidate.is_empty()
-            && seen.insert(candidate)
-        {
-            out.push(candidate.to_string());
+        // Bound the UTF-8 validation itself: `str::len` is a byte count,
+        // so `end - run_start` is the same length check without
+        // materializing anything — and rejecting over-length runs first
+        // keeps each hit's validation <= MAX_CANDIDATE_BYTES. Running
+        // from_utf8 on the (possibly run-length) slice BEFORE the length
+        // check made dense hits inside one long path-byte run quadratic
+        // (#225).
+        if end - run_start <= MAX_CANDIDATE_BYTES {
+            if let Some(c) = validated.as_mut() {
+                **c += end - run_start;
+            }
+            if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
+                && !candidate.is_empty()
+                && seen.insert(candidate)
+            {
+                out.push(candidate.to_string());
+            }
         }
         pos = end;
     }
@@ -1190,6 +1230,43 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_session_id_stripped_chars_stay_distinct() {
+        // #225: lossy charset filtering must not merge distinct ids —
+        // "sess!1" and "sess?1" both filtered to "sess1" before.
+        let a = sanitize_session_id("sess!1");
+        let b = sanitize_session_id("sess?1");
+        assert_ne!(a, b);
+        assert!(a.starts_with("sess1-"));
+        assert!(b.starts_with("sess1-"));
+        // Deterministic for joins, and a clean id keeps its bare form.
+        assert_eq!(a, sanitize_session_id("sess!1"));
+        assert_eq!(sanitize_session_id("sess1"), "sess1");
+    }
+
+    #[test]
+    fn sanitize_session_id_never_exceeds_contract_limit() {
+        // #225 re-review: the stripped-chars suffix must not push the
+        // result past the 128-char session_id contract — a 128-char
+        // filtered id plus "-" + 8 hash chars emitted 137 before.
+        for raw in [
+            format!("{}!", "x".repeat(128)),
+            format!("{}?", "x".repeat(120)),
+            format!("{}!", "x".repeat(200)),
+            "sess!1".to_string(),
+        ] {
+            let out = sanitize_session_id(&raw);
+            assert!(out.len() <= 128, "{out:?} exceeds 128 chars");
+            // Idempotent: sanitizing an already-sanitized id is a no-op.
+            assert_eq!(sanitize_session_id(&out), out);
+        }
+        // Distinct long ids that share a 119-char filtered head still
+        // separate via the original-bytes hash.
+        let a = format!("{}!a", "x".repeat(128));
+        let b = format!("{}!b", "x".repeat(128));
+        assert_ne!(sanitize_session_id(&a), sanitize_session_id(&b));
+    }
+
+    #[test]
     fn skill_md_paths_extracts_candidates() {
         let paths = skill_md_paths("cat .agents/skills/alpha-skill/SKILL.md now");
         assert_eq!(paths, vec![".agents/skills/alpha-skill/SKILL.md"]);
@@ -1235,16 +1312,25 @@ mod tests {
     #[test]
     fn skill_md_paths_dense_hits_stay_linear() {
         // 5000 'a's + 500 ",SKILL.md" hits: every candidate is the full
-        // run prefix (>4 KiB) — all rejected, and the call must not
-        // degrade to ~500x5000 byte-ops.
-        let hostile = format!("{}{}", "a".repeat(5000), ",SKILL.md".repeat(500));
-        assert!(skill_md_paths(&hostile).is_empty());
+        // run prefix (>4 KiB) — all rejected, and no hit may pay a
+        // run-length UTF-8 validation.
+        let (paths, validated) =
+            skill_md_paths_counting(&format!("{}{}", "a".repeat(5000), ",SKILL.md".repeat(500)));
+        assert!(paths.is_empty());
+        assert_eq!(validated, 0, "over-length hits reached UTF-8 validation");
         // Run-start hits within the bound still extract: "a"*4000 keeps
-        // the first ~10 candidates <= 4096 bytes, the rest reject.
-        let bounded = format!("{}{}", "a".repeat(4000), ",SKILL.md".repeat(500));
-        let paths = skill_md_paths(&bounded);
+        // the first ~10 candidates <= 4096 bytes, the rest reject — and
+        // only those in-bound hits may reach UTF-8 validation.
+        let (paths, validated) =
+            skill_md_paths_counting(&format!("{}{}", "a".repeat(4000), ",SKILL.md".repeat(500)));
         assert_eq!(paths.len(), 10, "{paths:?}");
         assert!(paths.iter().all(|p| p.starts_with(&"a".repeat(100))));
+        // ~12 in-bound hits x <=4096 bytes each; the pre-fix code would
+        // have validated every hit's growing prefix (~500 x ~6 KiB).
+        assert!(
+            validated <= 64 * 4096,
+            "validated {validated} bytes for 500 hits — per-hit work unbounded"
+        );
     }
 
     #[test]

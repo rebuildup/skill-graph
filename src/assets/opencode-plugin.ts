@@ -89,18 +89,39 @@ function validSkillName(name: string): boolean {
 // Mirror events.rs's sanitize_session_id contract: absent/empty ids
 // stay unattributed (""), charset-valid ids pass through bounded, and
 // distinct all-invalid ids hash apart instead of collapsing into one
-// "unknown" funnel session.
-function safeSessionID(id: unknown): string {
+// "unknown" funnel session. Exported for the parity contract test
+// (opencode-plugin.test.ts) — the sanitize rules are part of the
+// cross-entrypoint event contract (#225).
+export function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
-  const filtered = s.replace(/[^A-Za-z0-9._-]/g, "")
+  // Bounded scan parity with events::sanitize_session_id's take(129):
+  // collect at most 129 valid chars — enough to detect the >128
+  // overflow without materializing a multi-MB filtered copy of a
+  // hostile id (#225 re-review). The charset is ASCII-only, so
+  // .length == char count, and reaching 129 means overflow whether or
+  // not a 130th valid char exists (Rust's count > 128 branch).
+  let filtered = ""
+  for (const ch of s) {
+    if (!/[A-Za-z0-9._-]/.test(ch)) continue
+    filtered += ch
+    if (filtered.length === 129) break
+  }
   // Distinct ids sharing a 128-char prefix must not collapse: bounded
   // head plus a hash suffix of the original (parity with Rust).
-  if (filtered.length > 128) {
-    return `${filtered.slice(0, 119)}-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 8)}`
+  if (filtered.length === 129) {
+    return `${filtered.slice(0, 119)}-${sha256(s).slice(0, 8)}`
   }
-  if (filtered) return filtered
-  if (!s) return ""
-  return `unknown-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16)}`
+  if (!filtered) {
+    if (!s) return ""
+    return `unknown-${sha256(s).slice(0, 16)}`
+  }
+  // Charset filtering is lossy: "sess!1" and "sess?1" would both
+  // collapse to "sess1". When any character was stripped, suffix a
+  // hash of the ORIGINAL id so distinct inputs stay distinct — parity
+  // with events::sanitize_session_id (#225). The 119-char head cap
+  // keeps the result inside the 128-char contract even when the
+  // filtered id is already 120-128 chars (#225 re-review).
+  return filtered === s ? filtered : `${filtered.slice(0, 119)}-${sha256(s).slice(0, 8)}`
 }
 
 function emit(event: Record<string, unknown>): boolean {
@@ -137,6 +158,10 @@ function emit(event: Record<string, unknown>): boolean {
       const st = fstatSync(fd)
       if (!st.isFile()) return false
       if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false
+      // Parity with the Rust hook's fd_writeable: a multiply-linked log
+      // is reachable through paths whose lifecycle we do not control —
+      // appending would modify every link, so refuse (#225).
+      if (st.nlink !== 1) return false
       // mode only applies at creation; tighten pre-existing logs too.
       // Isolated: on filesystems where fchmod fails post-open, the event
       // write must still succeed (0600 was already applied at O_CREAT).
@@ -324,15 +349,33 @@ function resultText(result: unknown): string {
       parts.push(t)
       total += utf8Bytes(t) + 1
     }
-    const walk = (v: any) => {
-      if (total >= MAX_RESULT_TEXT_BYTES || !v || typeof v !== "object") return
+    // Depth AND node bounds: a deeply nested `output`/`content` chain
+    // with no text never exhausts `total`, and a giant flat array would
+    // still cost O(n) walk calls — both are capped so hostile result
+    // shapes cannot stall this long-lived plugin (#225 re-review).
+    let walked = 0
+    const walk = (v: any, depth: number) => {
+      if (total >= MAX_RESULT_TEXT_BYTES || depth > MAX_INPUT_DEPTH || !v || typeof v !== "object") return
+      if (++walked > MAX_INPUT_NODES) return
       if (typeof v.text === "string") push(v.text)
       if (typeof v.content === "string") push(v.content)
-      if (Array.isArray(v.content)) v.content.forEach(walk)
-      if (Array.isArray(v.output)) v.output.forEach(walk)
-      if (v.output && typeof v.output === "object") walk(v.output)
+      // for..of + break (not forEach): iteration itself must stop at
+      // the node budget, not merely skip recursion per element.
+      if (Array.isArray(v.content)) {
+        for (const c of v.content) {
+          if (walked > MAX_INPUT_NODES) break
+          walk(c, depth + 1)
+        }
+      }
+      if (Array.isArray(v.output)) {
+        for (const c of v.output) {
+          if (walked > MAX_INPUT_NODES) break
+          walk(c, depth + 1)
+        }
+      }
+      if (v.output && typeof v.output === "object") walk(v.output, depth + 1)
     }
-    walk(r)
+    walk(r, 0)
     return parts.join("\n")
   } catch {
     return ""
@@ -350,17 +393,80 @@ function boundedError(e: unknown): unknown {
   return e
 }
 
+// Input bounding happens BEFORE any serialization: the walker below
+// enforces depth/node/string-byte budgets while cloning, so a hostile
+// or accidental giant `event.input` costs O(budget) — never O(input) —
+// and JSON.stringify only ever sees the bounded clone (#225). JSON
+// escaping can still inflate the clone past MAX_INPUT_JSON_BYTES; the
+// post-serialize size check remains as the final gate.
+const MAX_INPUT_DEPTH = 32
+const MAX_INPUT_NODES = 8192
+const BOUND_FAIL = Symbol("bound-fail")
+
+interface BoundState {
+  nodes: number
+  strBytes: number
+}
+
+// Deep-clone `v` keeping only JSON-shaped data (null/bool/number/
+// string/array/plain object) within the budgets. Returns BOUND_FAIL on
+// any exceed or non-JSON value — callers skip detection (fail-open).
+function boundJsonValue(v: unknown, depth: number, st: BoundState): unknown {
+  if (depth > MAX_INPUT_DEPTH || ++st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
+  if (v === null || typeof v === "boolean" || typeof v === "number") return v
+  if (typeof v === "string") {
+    // UTF-16 units lower-bound UTF-8 bytes: reject on units first so a
+    // giant string is refused without a full byte scan.
+    if (v.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+    st.strBytes += utf8Bytes(v)
+    if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+    return v
+  }
+  if (Array.isArray(v)) {
+    if (v.length > MAX_INPUT_NODES) return BOUND_FAIL
+    const out: unknown[] = new Array(v.length)
+    for (let i = 0; i < v.length; i++) {
+      const c = boundJsonValue(v[i], depth + 1, st)
+      if (c === BOUND_FAIL) return BOUND_FAIL
+      out[i] = c
+    }
+    return out
+  }
+  if (typeof v === "object") {
+    const proto = Object.getPrototypeOf(v)
+    if (proto !== Object.prototype && proto !== null) return BOUND_FAIL
+    const out: Record<string, unknown> = {}
+    let n = 0
+    for (const k of Object.keys(v as Record<string, unknown>)) {
+      if (++n > MAX_INPUT_NODES) return BOUND_FAIL
+      if (k.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+      st.strBytes += utf8Bytes(k)
+      if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+      const c = boundJsonValue((v as Record<string, unknown>)[k], depth + 1, st)
+      if (c === BOUND_FAIL) return BOUND_FAIL
+      out[k] = c
+    }
+    return out
+  }
+  // undefined / function / symbol / bigint / exotic objects: not JSON
+  // data — refuse rather than let an unbounded toJSON through.
+  return BOUND_FAIL
+}
+
 async function detectLoad(event: any): Promise<Record<string, any>[]> {
   try {
     // Cheap pre-filter: only SKILL.md-touching tools reach the binary.
     // tool is host-supplied: bound it before toLowerCase/stringify so a
     // giant string cannot allocate twice in this long-lived process.
     const tool = utf8Slice(String(event.tool ?? ""), MAX_TOOL_NAME_BYTES)
-    const input = event.input ?? {}
-    const inputJson = JSON.stringify(input ?? {})
+    const bounded = boundJsonValue(event.input ?? {}, 0, { nodes: 0, strBytes: 0 })
+    if (bounded === BOUND_FAIL) return []
+    const input = (bounded ?? {}) as Record<string, any>
+    const inputJson = JSON.stringify(input)
     // An oversized input cannot fit the payload budget below anyway —
     // skip before the SKILL.md scan so a giant object is not walked
-    // twice (#144 r18).
+    // twice (#144 r18). The clone is already budget-bounded, so this
+    // stringify is bounded work.
     if (utf8Bytes(inputJson) > MAX_INPUT_JSON_BYTES) return []
     const isSkillTool = tool.toLowerCase() === "skill"
     const touches = inputJson.includes("SKILL.md") ||

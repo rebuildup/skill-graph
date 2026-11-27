@@ -218,7 +218,15 @@ fn add_mentions(
     let mut tokens: Vec<String> = tokens.into_iter().collect();
     tokens.sort_unstable();
     let mut mentions = Vec::new();
-    for token in tokens.into_iter().take(MAX_MENTIONS_PER_SKILL) {
+    // The cap applies to MENTIONS, not scanned tokens: filtering for
+    // real skill names before counting keeps unrelated vocabulary from
+    // crowding genuine references out of the budget (#225). Sorted
+    // token order keeps truncation deterministic.
+    let mut taken = 0usize;
+    for token in tokens {
+        if taken >= MAX_MENTIONS_PER_SKILL {
+            break;
+        }
         if token == self_name {
             continue;
         }
@@ -228,13 +236,13 @@ fn add_mentions(
             // Each mention retains target + resolved_name clones plus
             // the SkillLink itself — derived links the parser's budget
             // never saw, so they draw from the shared resolve budget
-            // (#144 r19). Sorted token order keeps truncation
-            // deterministic.
+            // (#144 r19).
             let charge = token.len() as u64 * 2 + 384;
             if charge > *budget {
                 break;
             }
             *budget -= charge;
+            taken += 1;
             mentions.push(SkillLink {
                 target: token.clone(),
                 kind: LinkKind::Mention,

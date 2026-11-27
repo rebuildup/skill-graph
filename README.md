@@ -247,10 +247,13 @@ v0.3.x の `install.sh` / `adapters/install.sh` で導入した環境は、
 新版インストール後に一度だけ移行する:
 
 ```bash
-skill-graph adapter enable <rt>   # 旧 skill-graph-recommend-hook /
-                                  # /skill-graph plugin 参照を自動検出・除去して置き換え
-skill-graph adapter status <rt>   # enabled を確認後、旧配置を削除
-rm -rf ~/.local/share/skill-graph ~/.local/bin/skill-graph
+skill-graph adapter enable <rt>     # 旧 skill-graph-recommend-hook /
+                                     # /skill-graph plugin 参照を自動検出・除去して置き換え
+skill-graph adapter status <rt>     # enabled を確認後、旧配置を削除
+skill-graph adapter clean-legacy    # v0.3.x の install home 残存物
+                                     # (current symlink・<semver>/・
+                                     # ~/.local/bin/skill-graph) のみ除去。
+                                     # 新しい opencode-plugin/ payload は保持
 ```
 
 Codex の `/hooks` trust はコマンド文字列の hash-pin のため、移行で
