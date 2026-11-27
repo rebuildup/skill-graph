@@ -29,7 +29,10 @@ text content の両方で返す。
 非文字列・32 件超過で落ちた場合でも既定 root へは拡大せず、
 診断付きの空の走査に縮退する（#177 と同一規則）。tool は event
 log・dedup state・設定を変更せず、Skill Usage Event を発行しない
-（`observed_via` に `mcp` は存在しない）。
+（`observed_via` に `mcp` は存在しない）。tool 計算は 1 件ずつ
+直列化される: client が call を pipeline しても同時に走る graph
+構築は 1 つまでで、待機は async 側で行うため blocking pool を
+消費しない（#144 r19）。
 
 ## observe 出力の扱い
 
@@ -155,11 +158,17 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   閾値と bounded drain を持つ。OpenCode plugin の
   `prompt.skills` 由来 skill_load は 1 prompt あたり 1,024 entry・
   session あたり 4,096 name で打ち切る。plugin が扱う外部 payload
-  には上限がある: `resultText` は 64 KiB までに切り詰めて保持、
-  `tool_input` の JSON parse は 1 MiB 以下のみ（超過は event 化を
-  skip）、`skill-graph` への spawn は stdin payload が 1 MiB
-  以下の時のみ（fail-open: 上限超過時は注入なしで継続）。
-  pending 注入キューは session あたり 64 entry で打ち切る。
+  には上限がある（全て UTF-8 byte 数で計測 — UTF-16 code unit
+  数では multibyte 文字を過小計上する）: `resultText` は 64 KiB
+  までに code point を壊さず切り詰めて保持（join の改行分も
+  課金）、`tool_input` の JSON parse は 1 MiB 以下のみ（超過は
+  event 化を skip）、`skill-graph` への spawn は stdin payload が
+  1 MiB 以下の時のみ（fail-open: 上限超過時は注入なしで継続）、
+  `prompt.text` は 1 MiB に切り詰めて hash/dedup/query に使用、
+  `detect` 子プロセスの stdout から parse する event は
+  1 payload あたり 64 件まで（Rust 側 `MAX_EVENTS_PER_PAYLOAD`
+  と同じ）。pending 注入キューは session あたり 64 entry で
+  打ち切る。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を
@@ -300,6 +309,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   open 後 fstat で型を再検証、読み取りは 4 MiB 上限
   （`MAX_CONFIG_BYTES`）。FIFO・`/dev/zero` 等の symlink 先・
   巨大ファイルは `status`/`disable` 経路でも hang/OOM しない。
+  parse は strict JSON（`serde_json`）であり、JSONC の `//`
+  コメントや trailing comma を含む config は `invalid json`
+  エラーになる — fail-closed で書き換えは起きないが、comment 入り
+  config では adapter が使えない（書き込み側は常に strict JSON を
+  出力し、comment は保存されない）。
 - adapter の env 由来パス（`HOME`、`CODEX_HOME`、`XDG_CONFIG_HOME`、
   `XDG_DATA_HOME`、`SKILL_GRAPH_EXTRA_OVERLAY`）は絶対パスのみ有効。
   相対値は未設定として既定解決に縮退し、`file://` spec
@@ -370,6 +384,15 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   指す実 payload を検査・削除するため、状態報告と削除対象が
   OpenCode の実挙動と一致する（#144 r17）。enable は config write
   失敗時に今回作成した payload のみを rollback する。
+- payload 削除の対象は「managed layout」（絶対パス・`.`/`..`
+  なし・`skill-graph/opencode-plugin` で終端）かつ canonicalize
+  後に data-home base（現在の `XDG_DATA_HOME` または
+  `~/.local/share` の canonical path）の配下にある dir に限定
+  される。spec decode だけでは任意の `*/skill-graph/opencode-plugin`
+  を削除対象にできない（#144 r19）。最終 component が symlink の
+  場合は link 自体を unlink し、target は削除しない。残余: enable
+  当時の custom `XDG_DATA_HOME` が unset 等で base 集合から外れた
+  payload は orphan として残る（削除を拒否する方向の fail-safe）。
 - materialize される OpenCode plugin payload は XDG data dir 配下に
   置かれ、最終 component の symlink は拒否するが、中間 component
   （例: `$XDG_DATA_HOME/skill-graph` 自体の symlink）は user 所有
@@ -390,8 +413,12 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   `from_utf8_lossy` の UTF-8 置換拡大（最大 ~3x）と metadata〜read 間の
   file 成長による過小計上を防ぐ。
 - この 512 MiB 境界は **discovery phase の `Skill` データのみ**を
-  対象とする。Graph phase（`resolver::build`）では link 毎に
-  `resolved_name`/`resolved_path` が追加される transient を持つ。
+  対象とする。Graph phase（`resolver::build`）で追加される保持量は
+  別の global budget（`MAX_RESOLVE_BYTES` = 128 MiB）で bound する:
+  link 解決の `resolved_name`/`resolved_path` clone と skill 毎最大
+  64 件の derived Mention link は discovery の per-link 課金を
+  通らないため、budget 尽きた場合は link を未解決のまま残す
+  （backlink/requires の証拠が落ちるだけの graceful degradation）。
   backlinks は name-resolved link を name 毎・path-resolved link を
   target 毎の source 集合として集約し、最終的には target 毎の
   dedup 済み source **件数**のみを保持する（消費側は件数のみ使用）。
@@ -399,6 +426,14 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   （#144 r18）。MCP `recommend`/`resolve` は call 毎にこの Graph を
   再構築するため、実メモリは名目値を超えうる既知の residual として
   記録する（`discover` tool は resolver を通らずこの上乗せを持たない）。
+- WalkDir は `sort_by_file_name` を使わない: per-directory の全
+  dentry を buffer してから yield するため、敵対 corpus の巨大な
+  単一 directory で entry cap 到達前に memory を枯渇させうる
+  （#144 r19）。代わりに entry を stream し SKILL.md candidate のみ
+  bounded に collect、path component 単位の sort で
+  `sort_by_file_name` と同一の DFS 順序を再現する。entry cap
+  （100,000）超過時の candidate **集合**は filesystem 順序依存に
+  なる — cap 超過 corpus は既に truncated 報告される受容 residual。
 - discovery の `errors` は収集時点で 1024 件（`MAX_DISCOVER_ERRORS`）に
   制限され、打ち切りは latched notice で通知される。parse 失敗は
   skill/byte cap を消費しないが、error エントリ自体は bounded。
@@ -422,3 +457,21 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   へ差し替えられる窓は残るが、影響は ≤1 MiB の untrusted parse
   入力に限定され、project config / `.db` open と同じ受容 TOCTOU
   区分として記録する。
+- link・requires の target は description と同じ control+Cf strip を
+  経てから保持する: target は `Recommendation.reasons` に verbatim
+  で載るため、bidi override 等の不可視文字を agent context へ
+  到達させない。strip により `requires`照合も正直になる — 不可視
+  文字で name 解決を潜らせることはできない（#144 r19）。
+- frontmatter `keywords` は sequence を 1 要素ずつ stream して
+  32 件・各 128 文字に bound する。全 `serde_yaml::Value` を先に
+  materialize すると ~50 万 entry の sequence が bound 適用前に
+  全木を allocate する（#144 r19）。`metadata` map は sorted-key
+  の決定的 truncation を保つため全 Value を materialize したまま
+  — 影響は frontmatter ≤1 MiB に比例する transient に限定される
+  受容 residual。
+- `bench`（eval::run）は dataset 64 MiB・case 10,000 件に加え、
+  graph build の総数 256・recommend cutoff `--max` 64・収集する
+  discovery error 合計 4,096 件で bound する。LRU は保持 graph を
+  32 に抑えるが総 build work・error 蓄積・case 毎 result 膨張は
+  別系統の bound が必要（#144 r19）。CLI `search`/`recommend` の
+  `--max` も 64 に clamp する（MCP tool と同じ出力上限）。

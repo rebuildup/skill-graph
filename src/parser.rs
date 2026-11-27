@@ -48,6 +48,18 @@ fn is_format_char(c: char) -> bool {
         | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
 }
 
+/// Link/requires targets flow verbatim into Recommendation.reasons
+/// (`"link target: {target}"`), so they get the same control+Cf strip
+/// as descriptions — a bidi override or ANSI escape in a SKILL.md must
+/// not reach the agent's context injection (#144 r19). Sanitizing also
+/// keeps `requires` matching honest: an invisible char can no longer
+/// smuggle a target past name resolution.
+fn clean_link_target(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| !c.is_control() && !is_format_char(*c))
+        .collect()
+}
+
 /// Flatten a YAML scalar/sequence into the string form `Skill.metadata`
 /// and `requires-*` handling expect. Maps and nulls are dropped.
 fn yaml_text(value: &serde_yaml::Value) -> Option<String> {
@@ -70,22 +82,100 @@ const MAX_KEYWORDS: usize = 32;
 const MAX_KEYWORD_CHARS: usize = 128;
 
 /// Accept `keywords` as either a single string or a sequence of strings.
+/// Streams the sequence one element at a time: materializing the whole
+/// `serde_yaml::Value` first would let a SKILL.md with ~500k keyword
+/// entries allocate the full tree before the 32-entry bound applies
+/// (#144 r19). Retention stays bounded; per-element Values are dropped
+/// as they are consumed.
 fn de_string_or_seq<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let bounded = |items: Vec<String>| {
-        items
-            .into_iter()
-            .take(MAX_KEYWORDS)
-            .map(|k| k.chars().take(MAX_KEYWORD_CHARS).collect())
-            .collect()
-    };
-    match serde_yaml::Value::deserialize(deserializer)? {
-        serde_yaml::Value::String(s) => Ok(bounded(vec![s])),
-        serde_yaml::Value::Sequence(seq) => Ok(bounded(seq.iter().filter_map(yaml_text).collect())),
-        _ => Ok(Vec::new()),
+    use serde::de::{SeqAccess, VariantAccess, Visitor};
+    struct Keywords;
+    impl<'de> Visitor<'de> for Keywords {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or a sequence of strings")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.chars().take(MAX_KEYWORD_CHARS).collect()])
+        }
+        fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::new();
+            while let Some(value) = seq.next_element::<serde_yaml::Value>()? {
+                // Same order as before: flatten first, keep the first
+                // MAX_KEYWORDS flattenable items, 128 chars each.
+                if out.len() < MAX_KEYWORDS
+                    && let Some(text) = yaml_text(&value)
+                {
+                    out.push(text.chars().take(MAX_KEYWORD_CHARS).collect());
+                }
+            }
+            Ok(out)
+        }
+        // Scalars/maps/nulls yield no keywords, matching the old
+        // `Value` match's `_ => Vec::new()` arm. Maps must be drained
+        // so the deserializer stays in sync.
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            while map
+                .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                .is_some()
+            {}
+            Ok(Vec::new())
+        }
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Vec::new())
+        }
+        fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+            d.deserialize_any(self)
+        }
+        /// Tagged values (`!custom ...`) reach the visitor as enums.
+        /// The old `Value`-based path ignored `Value::Tagged` entirely;
+        /// without this arm a single tag would fail the WHOLE
+        /// frontmatter parse and cost the skill its name/description
+        /// (#144 r19 CR). Consume the tag and its payload, keep the
+        /// empty-keywords behavior.
+        fn visit_enum<A: serde::de::EnumAccess<'de>>(
+            self,
+            data: A,
+        ) -> Result<Self::Value, A::Error> {
+            struct Tag;
+            impl<'de> serde::de::DeserializeSeed<'de> for Tag {
+                type Value = ();
+                fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+                    serde::de::IgnoredAny::deserialize(d).map(|_| ())
+                }
+            }
+            let (_, variant) = data.variant_seed(Tag)?;
+            // The tagged payload may be any YAML node; IgnoredAny
+            // consumes scalars, sequences, and mappings alike.
+            variant.newtype_variant::<serde::de::IgnoredAny>()?;
+            Ok(Vec::new())
+        }
     }
+    deserializer.deserialize_any(Keywords)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -326,8 +416,8 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
             break;
         }
         if let Event::Start(Tag::Link { dest_url, .. }) = event {
-            let target = dest_url.to_string();
-            if target.chars().count() > MAX_LINK_TARGET_CHARS {
+            let target = clean_link_target(dest_url.as_ref());
+            if target.is_empty() || target.chars().count() > MAX_LINK_TARGET_CHARS {
                 continue;
             }
             let kind = if target.contains("://") || target.starts_with("mailto:") {
@@ -356,13 +446,13 @@ pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
                 if requires_seen.len() >= MAX_REQUIRES {
                     break;
                 }
-                let item = item.trim();
+                let item = clean_link_target(item.trim());
                 if !item.is_empty()
                     && item.chars().count() <= MAX_LINK_TARGET_CHARS
-                    && requires_seen.insert(item.to_string())
+                    && requires_seen.insert(item.clone())
                 {
                     links.push(SkillLink {
-                        target: item.to_string(),
+                        target: item,
                         kind: LinkKind::Requires,
                         resolved_name: None,
                         resolved_path: None,
@@ -652,5 +742,59 @@ mod tests {
         assert!(skill.parse_error.is_none(), "{:?}", skill.parse_error);
         assert_eq!(skill.name, "anchor-skill");
         assert_eq!(skill.metadata.get("a").map(String::as_str), Some("hello"));
+    }
+
+    #[test]
+    fn link_and_requires_targets_are_cf_stripped() {
+        // Link targets flow verbatim into Recommendation.reasons; Cf
+        // controls (bidi override U+202E, ZWSP) must not survive, and a
+        // requires target padded with invisibles must still resolve to
+        // the clean name (#144 r19).
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("cf-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let path = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &path,
+            "---\nname: cf-skill\ndescription: d\nmetadata:\n  requires-skills: dep\u{200B}-a\n---\n\nSee [x](tar\u{202E}get).\n",
+        )
+        .unwrap();
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        let req = skill
+            .links
+            .iter()
+            .find(|l| l.kind == crate::model::LinkKind::Requires)
+            .unwrap();
+        assert_eq!(req.target, "dep-a");
+        let md = skill
+            .links
+            .iter()
+            .find(|l| l.kind == crate::model::LinkKind::Markdown)
+            .unwrap();
+        assert_eq!(md.target, "target");
+        for l in &skill.links {
+            assert!(
+                !l.target
+                    .chars()
+                    .any(|c| c.is_control() || is_format_char(c))
+            );
+        }
+    }
+
+    #[test]
+    fn tagged_keywords_do_not_void_frontmatter() {
+        // `!custom` tags reach the keywords visitor as enums; the old
+        // Value path ignored Value::Tagged. A tag must yield empty
+        // keywords WITHOUT failing the whole frontmatter parse
+        // (#144 r19 CR).
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_skill(
+            &dir.path().join("tagged-skill"),
+            "name: tagged-skill\ndescription: d\nkeywords: !custom [a, b]",
+        );
+        let skill = parse_skill(&path, dir.path()).unwrap();
+        assert!(skill.parse_error.is_none(), "{:?}", skill.parse_error);
+        assert_eq!(skill.name, "tagged-skill");
+        assert!(skill.keywords.is_empty());
     }
 }

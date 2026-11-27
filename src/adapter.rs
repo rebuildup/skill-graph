@@ -1157,6 +1157,24 @@ fn is_managed_payload_dir(dir: &Path) -> bool {
             .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
 }
 
+/// Absolute bases `adapter enable opencode` could have materialized the
+/// payload under across XDG_DATA_HOME/HOME env states. A spec-decoded
+/// dir must live under one of them: the managed-layout suffix check
+/// alone would let a crafted project config aim `remove_dir_all` at
+/// any `*/skill-graph/opencode-plugin` on the system (#144 r19).
+/// Payloads left under a since-unset custom XDG_DATA_HOME become
+/// orphans — safe residue, documented in contracts.md.
+fn payload_base_dirs() -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    if let Some(xdg) = env_absolute_dir("XDG_DATA_HOME") {
+        bases.push(xdg);
+    }
+    if let Some(home) = home() {
+        bases.push(home.join(".local/share"));
+    }
+    bases
+}
+
 /// Payload dirs referenced by v0.4.x `file://` plugin specs in `config`.
 /// Legacy-marker entries point into removed adapter bundles, not the
 /// shared payload dir, and specs that fail to decode — or decode to a
@@ -1439,6 +1457,15 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 }
                 payload_dirs.sort();
                 payload_dirs.dedup();
+                // Canonicalized data-home bases: the resolved payload
+                // dir must live under one of them, not merely end with
+                // the managed suffix — otherwise a crafted spec could
+                // delete a foreign `*/skill-graph/opencode-plugin`
+                // (#144 r19).
+                let bases: Vec<PathBuf> = payload_base_dirs()
+                    .iter()
+                    .filter_map(|b| b.canonicalize().ok())
+                    .collect();
                 for dir in payload_dirs {
                     // The lexical guard above cannot see symlinks in
                     // intermediate components: a spec naming
@@ -1460,7 +1487,9 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                         continue;
                     }
                     let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                    if is_managed_payload_dir(&resolved) {
+                    if is_managed_payload_dir(&resolved)
+                        && bases.iter().any(|b| resolved.starts_with(b))
+                    {
                         let _ = std::fs::remove_dir_all(&resolved);
                     }
                 }

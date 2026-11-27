@@ -546,17 +546,23 @@ fn observe_jsonl(
         }
         // Other JSON shapes are ignored silently (format drift tolerance).
     }
-    // Shared pre-merge emission budget for both scanners: without it a
-    // hostile transcript fans out ~(uses × classifications) events
-    // before record_event's caps ever run (#144 r18).
+    // Shared pre-merge emission budget for both scanners' runs: without
+    // it a hostile transcript fans out ~(uses × classifications) events
+    // before record_event's caps ever run (#144 r18). The runs are
+    // k-way merged by feed-line seq BEFORE budgeting so truncation
+    // drops the latest lines first, not whichever category a scanner
+    // emitted first (#144 r19).
     let mut emit = EmitBudget::default();
-    let mut events = codex.finish(obs, &mut emit);
-    events.extend(claude.finish(obs, &mut emit));
+    let mut events: Vec<(u64, SkillUsageEvent)> = Vec::new();
+    let mut runs = codex.emit_runs(obs);
+    runs.extend(claude.emit_runs(obs));
+    merge_emit_runs(runs, &mut emit, &mut events, obs);
     events.extend(pending);
-    // Emit in feed-line order: transcript scanners emit category-grouped
-    // at finish() and passthrough events are buffered, so without the
-    // merge a same-line or missing-timestamp event would land far from
-    // its true position (#144 r17). The sort key is the feed line ONLY —
+    // Emit in feed-line order: scanner runs are already seq-merged and
+    // passthrough events are buffered, so without this final stable
+    // sort a passthrough event would land far from its true position
+    // relative to transcript events (#144 r17). The sort key is the
+    // feed line ONLY —
     // not the timestamp: `obs.events` order is the encounter order that
     // `session_funnel`'s untimestamped fallback (`li > ri`) compares,
     // and timestamp ordering is already applied downstream in
@@ -839,18 +845,31 @@ fn event_total_charge(event: &SkillUsageEvent, current_file_len: usize) -> usize
 }
 
 /// Pre-merge emission budget shared by the transcript scanners'
-/// `finish()` passes. `record_event`'s caps only run after the merged
-/// Vec is fully materialized, and a hostile transcript can fan out
+/// emit runs. `record_event`'s caps only run after the merged Vec is
+/// fully materialized, and a hostile transcript can fan out
 /// ~(uses × classifications) events far beyond the retained budget —
 /// the same hole the r17 passthrough `pending` buffer had (#144 r18).
 /// Overflowed events still update the counter maps via
 /// `account_event_counters`; only their retained detail is dropped,
 /// with one latched notice — same semantics as `record_event`.
+///
+/// This is a CONSERVATIVE pre-filter, not exact `record_event`
+/// parity: it charges event+implied-load bytes as one unit and drops
+/// the whole event at the boundary, where `record_event` applies two
+/// sequential retained-byte decisions and could keep one row. Counters
+/// stay exact either way; only which detail survives truncation
+/// differs (#144 r19).
 #[derive(Default)]
 struct EmitBudget {
     bytes: usize,
     count: usize,
     truncated: bool,
+    /// Latched on the FIRST rejection: without it a too-large event
+    /// would be skipped while smaller LATER events still fit, so
+    /// survivors would not be a feed-order prefix — earlier lines
+    /// could drop while later ones survive (#144 r19 CR). Counters
+    /// keep aggregating either way.
+    closed: bool,
 }
 
 impl EmitBudget {
@@ -873,6 +892,10 @@ impl EmitBudget {
         {
             return;
         }
+        if self.closed {
+            account_event_counters(&event, obs);
+            return;
+        }
         let charge = event_total_charge(&event, obs.current_file_len);
         if self.count < MAX_OBSERVE_EVENTS
             && self.bytes.saturating_add(charge) <= MAX_OBSERVE_RETAINED_BYTES
@@ -882,6 +905,7 @@ impl EmitBudget {
             events.push((seq, event));
             return;
         }
+        self.closed = true;
         if !self.truncated {
             self.truncated = true;
             obs_error(
@@ -892,6 +916,45 @@ impl EmitBudget {
         // The early return above guarantees the event is attributable,
         // so counters stay exact for overflowed events too.
         account_event_counters(&event, obs);
+    }
+}
+
+/// A lazily-pulled run of transcript-derived `(feed seq, event)` pairs
+/// in non-decreasing seq order. Scanners hand these to
+/// `merge_emit_runs`, which k-way merges ALL runs (both scanners)
+/// through the shared `EmitBudget` — so under truncation the LATEST
+/// feed lines are dropped first, never whichever emission category a
+/// scanner happened to finish first (#144 r19).
+type EmitRun<'a> = Box<dyn Iterator<Item = (u64, SkillUsageEvent)> + 'a>;
+
+/// K-way merge of seq-sorted emit runs through the shared budget.
+/// Each step emits the smallest head seq; ties resolve by run order
+/// (deterministic). Runs are few (≤5), so the head scan is trivial.
+fn merge_emit_runs<'a>(
+    mut runs: Vec<EmitRun<'a>>,
+    emit: &mut EmitBudget,
+    events: &mut Vec<(u64, SkillUsageEvent)>,
+    obs: &mut Observation,
+) {
+    let mut heads: Vec<Option<(u64, SkillUsageEvent)>> =
+        runs.iter_mut().map(|run| run.next()).collect();
+    loop {
+        let mut best_seq = u64::MAX;
+        let mut best = None;
+        for (i, head) in heads.iter().enumerate() {
+            if let Some((seq, _)) = head
+                && *seq < best_seq
+            {
+                best_seq = *seq;
+                best = Some(i);
+            }
+        }
+        let Some(i) = best else { break };
+        let Some((seq, event)) = heads[i].take() else {
+            break;
+        };
+        heads[i] = runs[i].next();
+        emit.push(events, seq, event, obs);
     }
 }
 
@@ -1213,7 +1276,11 @@ impl ClaudeScan {
         }
     }
 
-    fn finish(self, obs: &mut Observation, emit: &mut EmitBudget) -> Vec<(u64, SkillUsageEvent)> {
+    /// Lazy seq-ordered emit runs; `merge_emit_runs` pulls them through
+    /// the shared budget so truncation drops the latest feed lines
+    /// first (#144 r19). Frontmatter claims still resolve in uses-vec
+    /// (feed) order inside `ClaudeUseRun`.
+    fn emit_runs(&self, obs: &mut Observation) -> Vec<EmitRun<'_>> {
         let dropped = self.uses_dropped + self.results_dropped + self.prompts_dropped;
         if dropped > 0 {
             obs_error(
@@ -1221,11 +1288,12 @@ impl ClaudeScan {
                 format!("claude transcript records truncated at scan budgets: {dropped}"),
             );
         }
-        let mut events = Vec::new();
-        for (seq, session, ts, text) in &self.prompts {
-            if is_meaningful_prompt(text) {
-                emit.push(
-                    &mut events,
+        let prompts = self
+            .prompts
+            .iter()
+            .filter(|p| is_meaningful_prompt(&p.3))
+            .map(|(seq, session, ts, text)| {
+                (
                     *seq,
                     SkillUsageEvent::prompt_submit(
                         Runtime::ClaudeCode,
@@ -1234,20 +1302,50 @@ impl ClaudeScan {
                         ts,
                         text,
                     ),
-                    obs,
-                );
+                )
+            });
+        vec![
+            Box::new(prompts),
+            Box::new(ClaudeUseRun {
+                uses: self.uses.iter(),
+                results: &self.results,
+                consumed: std::collections::HashSet::new(),
+                pending: Vec::new().into_iter(),
+                cur_seq: 0,
+            }),
+        ]
+    }
+}
+
+/// Lazy run over Claude `tool_use` records in feed order. Each use is
+/// classified only when the merge pulls it; the per-tool_use_id
+/// `consumed` set preserves the "first Read claims the captured
+/// output's frontmatter" rule across ALL uses sharing an id — crafted
+/// or buggy transcripts can repeat ids; without this each use would
+/// verify the same output into a separate file_read event (#144 r13).
+struct ClaudeUseRun<'a> {
+    uses: std::slice::Iter<'a, (u64, String, String, String, String, Value)>,
+    results: &'a std::collections::HashMap<String, String>,
+    /// tool_use_ids whose output frontmatter was already claimed;
+    /// borrows the id strings from `uses`.
+    consumed: std::collections::HashSet<&'a str>,
+    /// Events classified from the current use, drained one per next().
+    pending: std::vec::IntoIter<SkillUsageEvent>,
+    cur_seq: u64,
+}
+
+impl Iterator for ClaudeUseRun<'_> {
+    type Item = (u64, SkillUsageEvent);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(event) = self.pending.next() {
+                return Some((self.cur_seq, event));
             }
-        }
-        // Mirror the codex rule (#144 r13): a captured tool output's
-        // frontmatter belongs to exactly one file — the first Read
-        // across ALL uses sharing a tool_use_id may claim it. Crafted
-        // or buggy transcripts can repeat ids; without this each use
-        // would verify the same output into a separate file_read event.
-        let mut frontmatter_consumed: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
-        for (seq, id, session, ts, tool, input) in &self.uses {
+            let (seq, id, session, ts, tool, input) = self.uses.next()?;
+            self.cur_seq = *seq;
             let raw = self.results.get(id).map(String::as_str).unwrap_or("");
-            let output = if frontmatter_consumed.contains(id.as_str()) {
+            let output = if self.consumed.contains(id.as_str()) {
                 ""
             } else {
                 raw
@@ -1257,12 +1355,11 @@ impl ClaudeScan {
                 .iter()
                 .any(|c| c.detection == events::Detection::FileRead)
             {
-                frontmatter_consumed.insert(id.as_str());
+                self.consumed.insert(id.as_str());
             }
-            for c in classes {
-                emit.push(
-                    &mut events,
-                    *seq,
+            self.pending = classes
+                .into_iter()
+                .map(|c| {
                     SkillUsageEvent::skill_load(
                         Runtime::ClaudeCode,
                         ObservedVia::Transcript,
@@ -1273,12 +1370,11 @@ impl ClaudeScan {
                         c.skill_path,
                         c.detection,
                         c.confidence,
-                    ),
-                    obs,
-                );
-            }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_iter();
         }
-        events
     }
 }
 
@@ -1647,137 +1743,12 @@ impl CodexScan {
         }
     }
 
-    fn finish(self, obs: &mut Observation, emit: &mut EmitBudget) -> Vec<(u64, SkillUsageEvent)> {
-        // Events carry their feed line index; observe_jsonl merges all
-        // sources in feed-line order so equal/missing timestamps keep
-        // true transcript order (#144 r17).
-        let mut events: Vec<(u64, SkillUsageEvent)> = Vec::new();
-        for (seq, event) in self.injected {
-            emit.push(&mut events, seq, event, obs);
-        }
-        for (seq, session, ts, text) in &self.prompts {
-            emit.push(
-                &mut events,
-                *seq,
-                SkillUsageEvent::prompt_submit(
-                    Runtime::Codex,
-                    ObservedVia::Transcript,
-                    session,
-                    ts,
-                    text,
-                ),
-                obs,
-            );
-        }
-        // A captured tool output's frontmatter belongs to exactly one
-        // file: the first Read across ALL records sharing a call_id —
-        // pending and overflow alike — may claim it. Crafted rollouts
-        // can repeat call_ids; without this each would verify the same
-        // output into a separate file_read event (#144 r13).
-        let mut frontmatter_consumed: std::collections::HashSet<&str> =
-            std::collections::HashSet::new();
-        for pending in &self.pending {
-            let call_id: &str = &pending.call_id;
-            let output = self.outputs.get(call_id).map(String::as_str).unwrap_or("");
-            // One captured output can cover several SKILL.md reads; its
-            // frontmatter block belongs to the first file emitted, so only
-            // the first Read access may claim it.
-            let mut frontmatter_available = true;
-            for (path, access) in &pending.accesses {
-                let c = match access {
-                    events::Access::Read => {
-                        let verify =
-                            frontmatter_available && !frontmatter_consumed.contains(call_id);
-                        frontmatter_available = false;
-                        if verify {
-                            frontmatter_consumed.insert(call_id);
-                            classify_with_output(path, output)
-                        } else {
-                            events::LoadClassification {
-                                skill_name: events::skill_name_from_path(path),
-                                skill_path: Some(path.clone()),
-                                detection: events::Detection::PathReference,
-                                confidence: events::Confidence::Medium,
-                            }
-                        }
-                    }
-                    events::Access::Reference => events::LoadClassification {
-                        skill_name: events::skill_name_from_path(path),
-                        skill_path: Some(path.clone()),
-                        detection: Detection::Mention,
-                        confidence: Confidence::Low,
-                    },
-                };
-                emit.push(
-                    &mut events,
-                    pending.seq,
-                    SkillUsageEvent::skill_load(
-                        Runtime::Codex,
-                        ObservedVia::Transcript,
-                        &pending.session_id,
-                        &pending.timestamp,
-                        Some("exec".to_string()),
-                        c.skill_name,
-                        c.skill_path,
-                        c.detection,
-                        c.confidence,
-                    ),
-                    obs,
-                );
-            }
-        }
-        // Overflow accesses lost their path detail but not their load:
-        // emit the same event shape minus skill_path so counters, the
-        // funnel, and the retained-events budget treat them identically.
-        for ov in &self.overflow {
-            // Only the call's first Read may claim the captured output's
-            // frontmatter — same rule as the pending path, shared across
-            // duplicate call_ids via `frontmatter_consumed`.
-            let call_id: &str = &ov.call_id;
-            let may_claim = ov.first_read && !frontmatter_consumed.contains(call_id);
-            let output = if may_claim {
-                self.outputs.get(call_id).map(String::as_str).unwrap_or("")
-            } else {
-                ""
-            };
-            let (name, detection, confidence) = match ov.access {
-                events::Access::Read if may_claim => {
-                    frontmatter_consumed.insert(call_id);
-                    match events::frontmatter_name(output) {
-                        Some(n) => (Some(n), Detection::FileRead, Confidence::High),
-                        None => (
-                            ov.name_hint.clone(),
-                            Detection::PathReference,
-                            Confidence::Medium,
-                        ),
-                    }
-                }
-                events::Access::Read => (
-                    ov.name_hint.clone(),
-                    Detection::PathReference,
-                    Confidence::Medium,
-                ),
-                events::Access::Reference => {
-                    (ov.name_hint.clone(), Detection::Mention, Confidence::Low)
-                }
-            };
-            emit.push(
-                &mut events,
-                ov.seq,
-                SkillUsageEvent::skill_load(
-                    Runtime::Codex,
-                    ObservedVia::Transcript,
-                    &ov.session_id,
-                    &ov.timestamp,
-                    Some("exec".to_string()),
-                    name,
-                    None,
-                    detection,
-                    confidence,
-                ),
-                obs,
-            );
-        }
+    /// Lazy seq-ordered emit runs; `merge_emit_runs` pulls them through
+    /// the shared budget so truncation drops the latest feed lines
+    /// first (#144 r19). Frontmatter claims are pre-resolved in
+    /// pending-then-overflow order (identical to the old finish()) into
+    /// per-access flags so the lazy runs need no shared mutable state.
+    fn emit_runs(&self, obs: &mut Observation) -> Vec<EmitRun<'_>> {
         let dropped = self.overflow_dropped
             + self.prompts_dropped
             + self.injected_dropped
@@ -1797,7 +1768,212 @@ impl CodexScan {
                 ),
             );
         }
-        events
+        // A captured tool output's frontmatter belongs to exactly one
+        // file: the first Read across ALL records sharing a call_id —
+        // pending and overflow alike — may claim it. Crafted rollouts
+        // can repeat call_ids; without this each would verify the same
+        // output into a separate file_read event (#144 r13). Pending
+        // accesses all precede overflow accesses in feed order (overflow
+        // only fills after the pending budget is exhausted), so the
+        // pending-then-overflow pass IS feed order.
+        let mut frontmatter_consumed: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
+        let mut pending_verify: Vec<Vec<bool>> = Vec::with_capacity(self.pending.len());
+        for pending in &self.pending {
+            let call_id: &str = &pending.call_id;
+            // One captured output can cover several SKILL.md reads; its
+            // frontmatter block belongs to the first file emitted, so only
+            // the first Read access may claim it.
+            let mut frontmatter_available = true;
+            let mut flags = Vec::with_capacity(pending.accesses.len());
+            for (_path, access) in &pending.accesses {
+                let verify = matches!(access, events::Access::Read)
+                    && frontmatter_available
+                    && !frontmatter_consumed.contains(call_id);
+                if matches!(access, events::Access::Read) {
+                    frontmatter_available = false;
+                    if verify {
+                        frontmatter_consumed.insert(call_id);
+                    }
+                }
+                flags.push(verify);
+            }
+            pending_verify.push(flags);
+        }
+        // Overflow accesses lost their path detail but not their load:
+        // emit the same event shape minus skill_path so counters, the
+        // funnel, and the retained-events budget treat them identically.
+        // Only the call's first Read may claim the captured output's
+        // frontmatter — same rule as the pending path, shared across
+        // duplicate call_ids via `frontmatter_consumed`.
+        let mut overflow_claim: Vec<bool> = Vec::with_capacity(self.overflow.len());
+        for ov in &self.overflow {
+            let may_claim = ov.first_read
+                && matches!(ov.access, events::Access::Read)
+                && !frontmatter_consumed.contains(ov.call_id.as_ref());
+            if may_claim {
+                frontmatter_consumed.insert(ov.call_id.as_ref());
+            }
+            overflow_claim.push(may_claim);
+        }
+        vec![
+            Box::new(self.injected.iter().cloned()),
+            Box::new(self.prompts.iter().map(|(seq, session, ts, text)| {
+                (
+                    *seq,
+                    SkillUsageEvent::prompt_submit(
+                        Runtime::Codex,
+                        ObservedVia::Transcript,
+                        session,
+                        ts,
+                        text,
+                    ),
+                )
+            })),
+            Box::new(CodexPendingRun {
+                pending: self.pending.iter(),
+                flags: pending_verify.into_iter(),
+                outputs: &self.outputs,
+                call: None,
+                call_flags: Vec::new(),
+                access_idx: 0,
+            }),
+            Box::new(CodexOverflowRun {
+                overflow: self.overflow.iter(),
+                flags: overflow_claim.into_iter(),
+                outputs: &self.outputs,
+            }),
+        ]
+    }
+}
+
+/// Lazy run over retained Codex `PendingCall` accesses in feed order.
+/// `flags[i][j]` records whether access j of call i may claim its
+/// call's captured-output frontmatter (pre-resolved in feed order).
+struct CodexPendingRun<'a> {
+    pending: std::slice::Iter<'a, PendingCall>,
+    flags: std::vec::IntoIter<Vec<bool>>,
+    outputs: &'a std::collections::HashMap<String, String>,
+    call: Option<&'a PendingCall>,
+    call_flags: Vec<bool>,
+    access_idx: usize,
+}
+
+impl Iterator for CodexPendingRun<'_> {
+    type Item = (u64, SkillUsageEvent);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let Some(call) = self.call else {
+                let call = self.pending.next()?;
+                self.call_flags = self.flags.next().unwrap_or_default();
+                self.call = Some(call);
+                self.access_idx = 0;
+                continue;
+            };
+            if self.access_idx >= call.accesses.len() {
+                self.call = None;
+                continue;
+            }
+            let (path, access) = &call.accesses[self.access_idx];
+            let verify = self.call_flags[self.access_idx];
+            self.access_idx += 1;
+            let output = if verify {
+                self.outputs
+                    .get(call.call_id.as_ref())
+                    .map(String::as_str)
+                    .unwrap_or("")
+            } else {
+                ""
+            };
+            let c = match access {
+                events::Access::Read if verify => classify_with_output(path, output),
+                events::Access::Read => events::LoadClassification {
+                    skill_name: events::skill_name_from_path(path),
+                    skill_path: Some(path.clone()),
+                    detection: events::Detection::PathReference,
+                    confidence: events::Confidence::Medium,
+                },
+                events::Access::Reference => events::LoadClassification {
+                    skill_name: events::skill_name_from_path(path),
+                    skill_path: Some(path.clone()),
+                    detection: Detection::Mention,
+                    confidence: Confidence::Low,
+                },
+            };
+            return Some((
+                call.seq,
+                SkillUsageEvent::skill_load(
+                    Runtime::Codex,
+                    ObservedVia::Transcript,
+                    &call.session_id,
+                    &call.timestamp,
+                    Some("exec".to_string()),
+                    c.skill_name,
+                    c.skill_path,
+                    c.detection,
+                    c.confidence,
+                ),
+            ));
+        }
+    }
+}
+
+/// Lazy run over compact `OverflowAccess` records in feed order.
+/// `flags[i]` records whether record i claims its call's captured
+/// output frontmatter (pre-resolved in feed order).
+struct CodexOverflowRun<'a> {
+    overflow: std::slice::Iter<'a, OverflowAccess>,
+    flags: std::vec::IntoIter<bool>,
+    outputs: &'a std::collections::HashMap<String, String>,
+}
+
+impl Iterator for CodexOverflowRun<'_> {
+    type Item = (u64, SkillUsageEvent);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let ov = self.overflow.next()?;
+        let may_claim = self.flags.next().unwrap_or(false);
+        let output = if may_claim {
+            self.outputs
+                .get(ov.call_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        let (name, detection, confidence) = match ov.access {
+            events::Access::Read if may_claim => match events::frontmatter_name(output) {
+                Some(n) => (Some(n), Detection::FileRead, Confidence::High),
+                None => (
+                    ov.name_hint.clone(),
+                    Detection::PathReference,
+                    Confidence::Medium,
+                ),
+            },
+            events::Access::Read => (
+                ov.name_hint.clone(),
+                Detection::PathReference,
+                Confidence::Medium,
+            ),
+            events::Access::Reference => {
+                (ov.name_hint.clone(), Detection::Mention, Confidence::Low)
+            }
+        };
+        Some((
+            ov.seq,
+            SkillUsageEvent::skill_load(
+                Runtime::Codex,
+                ObservedVia::Transcript,
+                &ov.session_id,
+                &ov.timestamp,
+                Some("exec".to_string()),
+                name,
+                None,
+                detection,
+                confidence,
+            ),
+        ))
     }
 }
 

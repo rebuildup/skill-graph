@@ -551,8 +551,22 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             } else {
                 0
             })
+            // term_matches/matches_query build a Two-Way searcher per
+            // call — O(needle len) preprocessing ON TOP of the field
+            // scan. The two field_score calls below iterate query_terms
+            // and context_terms once each, plus one whole-query needle
+            // per whitespace-free field (#144 r19).
+            .saturating_add(query_term_bytes)
+            .saturating_add(context_term_bytes)
+            .saturating_add(if query_whole { query.len() } else { 0 })
+            .saturating_add(if context_whole { context.len() } else { 0 })
             .saturating_add(body_len);
-        if body_scanned + body_len > MAX_BODY_SCAN_BYTES || body_work + work > MAX_BODY_TERM_WORK {
+        // saturating_add: `work` tops out at usize::MAX on 32-bit, and
+        // a plain add here could overflow before the budget check
+        // (#144 r19 CR).
+        if body_scanned.saturating_add(body_len) > MAX_BODY_SCAN_BYTES
+            || body_work.saturating_add(work) > MAX_BODY_TERM_WORK
+        {
             continue;
         }
         body_scanned += body_len;

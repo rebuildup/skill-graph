@@ -21,6 +21,12 @@ struct Cli {
     command: Command,
 }
 
+/// Output-size bound for `search`/`recommend --max`: an unbounded value
+/// would materialize every unique-name recommendation (up to the
+/// discovery skill cap) with reasons — the same class of bound the MCP
+/// surface applies at 64 (#144 r19).
+const MAX_CLI_MAX: usize = 64;
+
 #[derive(Subcommand)]
 enum Command {
     Discover {
@@ -134,7 +140,7 @@ pub fn run() -> Result<(), String> {
             format,
         } => {
             let graph = graph_for(roots_or_default(root))?;
-            let recs = recommend(&graph, &query, "", max);
+            let recs = recommend(&graph, &query, "", max.min(MAX_CLI_MAX));
             print_result(json!(recs), &format)
         }
         Command::Recommend {
@@ -168,7 +174,12 @@ pub fn run() -> Result<(), String> {
                 }
             };
             let graph = graph_for(roots_or_default(root))?;
-            let recs = recommend(&graph, &query, context.as_deref().unwrap_or(""), max);
+            let recs = recommend(
+                &graph,
+                &query,
+                context.as_deref().unwrap_or(""),
+                max.min(MAX_CLI_MAX),
+            );
             print_result(json!(recs), &format)
         }
         Command::Resolve {

@@ -103,6 +103,13 @@ const MAX_SKILL_BYTES: u64 = 512 * 1024 * 1024;
 /// consume neither the skill nor the byte budget, so an unreadable
 /// corpus would otherwise grow `errors` without limit.
 const MAX_DISCOVER_ERRORS: usize = 1024;
+/// SKILL.md candidates collected per root before parsing. Parse
+/// consumes at most MAX_SKILLS successes plus MAX_SKILLS errors
+/// (pigeonhole: candidate 2*MAX_SKILLS+1 can never be reached), so
+/// collecting more is wasted traversal — and stopping here restores
+/// the early exit the pre-collect implementation had once caps bind
+/// (#144 r19 CR).
+const MAX_SKILL_CANDIDATES: usize = 2 * MAX_SKILLS;
 
 /// Every diagnostic shares one bound — root errors, walk errors,
 /// parse errors, and truncation notices alike — so no input shape can
@@ -155,21 +162,34 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         if !seen_roots.insert(root.clone()) {
             continue;
         }
-        // Sort entries so discovery order — and therefore Graph.skills
-        // index order, the deterministic body-scan budget order in
-        // recommend(), and equal-score output ordering — does not depend
-        // on filesystem directory order.
+        // Stream entries WITHOUT sort_by_file_name: it buffers every
+        // dentry of a directory before yielding anything, so a hostile
+        // corpus with millions of entries in one directory would
+        // exhaust memory before the entry cap applies (#144 r19).
+        // Collect bounded SKILL.md candidates instead, then sort them
+        // component-wise — the same order sort_by_file_name's DFS
+        // traversal produces — so discovery order stays deterministic.
+        // Under entry-cap pressure the candidate SET is filesystem
+        // order dependent (accepted residual: corpora beyond the cap
+        // are already reported truncated).
+        //
+        // max_open(usize::MAX): walkdir's default (10) CLOSES the
+        // oldest open dir stream when deeper levels accumulate, and
+        // close() drains that directory's remaining entries into a
+        // Vec — before the entry cap counts them. A wide directory
+        // above a >10-deep chain would still be fully buffered
+        // (#144 r19 CR). Never closing keeps every stream lazy; the
+        // bound becomes open-fd count ≈ tree depth (fd limit errors
+        // surface as ordinary walk errors).
         let mut entries = WalkDir::new(&root)
             .follow_links(false)
-            .sort_by_file_name()
+            .max_open(usize::MAX)
             .into_iter();
         let mut consumed = 0usize;
         let mut walk_errors = 0usize;
+        let mut candidates: Vec<PathBuf> = Vec::new();
         for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {
             consumed += 1;
-            if capacity_truncated {
-                break;
-            }
             // Surface IO errors (permission-denied dirs etc.) instead of
             // silently reporting a partial scan as clean.
             let entry = match entry {
@@ -207,6 +227,35 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             if !seen_files.insert(canonical) {
                 continue;
             }
+            candidates.push(path.to_path_buf());
+            if candidates.len() >= MAX_SKILL_CANDIDATES {
+                // Parse can consume at most 2*MAX_SKILLS candidates
+                // (skill + error caps), so further SKILL.md files are
+                // unreachable — stop the traversal instead of scanning
+                // to the entry cap (#144 r19 CR).
+                push_discovery_error(
+                    &mut errors,
+                    format!(
+                        "{}: SKILL.md candidate limit {} reached",
+                        root.display(),
+                        MAX_SKILL_CANDIDATES
+                    ),
+                    &mut errors_noted,
+                );
+                break;
+            }
+        }
+        // Component-wise compare reproduces per-directory name sort +
+        // DFS descent: "a" < "a-b" puts a/'s whole subtree first,
+        // matching sort_by_file_name traversal order for SKILL.md
+        // leaves (#144 r19).
+        candidates.sort_by(|a, b| {
+            a.components()
+                .map(|c| c.as_os_str())
+                .cmp(b.components().map(|c| c.as_os_str()))
+        });
+        for path in &candidates {
+            let path = path.as_path();
             let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if skills.len() >= MAX_SKILLS || total_bytes + file_bytes > MAX_SKILL_BYTES {
                 capacity_truncated = true;

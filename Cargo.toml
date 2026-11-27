@@ -23,7 +23,7 @@ sha2 = "0.10"
 rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
 walkdir = "2"
 rmcp = { version = "3.11.0", features = ["server", "transport-io"] }
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync"] }
 tempfile = "3"
 unsafe-libyaml = "0.2.11"
 
