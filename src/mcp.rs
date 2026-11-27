@@ -229,9 +229,7 @@ impl ServerHandler for SkillGraphMcp {
             .compute_permit
             .clone()
             .try_acquire_owned()
-            .map_err(|_| {
-                McpError::internal_error("skill-graph is busy; retry the call", None)
-            })?;
+            .map_err(|_| McpError::internal_error("skill-graph is busy; retry the call", None))?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             compute_tool(name.as_ref(), &args)
