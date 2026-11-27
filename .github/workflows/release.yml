@@ -87,9 +87,14 @@ jobs:
           got=$(grep -m1 '^version' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')
           [ "$want" = "$got" ] || {
             echo "tag $RELEASE_TAG does not match Cargo.toml version $got"; exit 1; }
-          # The checked-out ref must actually be this tag.
-          git rev-parse "refs/tags/$RELEASE_TAG" >/dev/null || {
-            echo "tag $RELEASE_TAG does not exist"; exit 1; }
+          # The checked-out ref must actually be this tag: checkout's
+          # ref resolution can prefer a same-named branch over the tag,
+          # which would build and publish the branch under the tag's
+          # provenance (#144 r19).
+          tag_sha="$(git rev-parse "refs/tags/$RELEASE_TAG")"
+          head_sha="$(git rev-parse HEAD)"
+          [ "$head_sha" = "$tag_sha" ] || {
+            echo "checked-out HEAD $head_sha is not tag $RELEASE_TAG ($tag_sha)"; exit 1; }
       - name: Checksums
         run: |
           cd dist

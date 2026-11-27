@@ -36,11 +36,21 @@ const MAX_TOOL_ROOTS: usize = 32;
 /// the tool into an unbounded filesystem enumeration oracle.
 const MAX_DISCOVER_SKILLS: usize = 512;
 
-struct SkillGraphMcp;
+struct SkillGraphMcp {
+    /// Serializes tool computations. spawn_blocking has no concurrency
+    /// bound of its own, and MCP clients may pipeline calls: without
+    /// this, N queued calls each build a full in-memory graph (up to
+    /// the 512 MiB discovery bound) simultaneously (#144 r19). One
+    /// permit keeps peak memory at a single graph; queued calls wait
+    /// asynchronously without consuming blocking-pool threads.
+    compute_permit: Arc<tokio::sync::Semaphore>,
+}
 
 impl SkillGraphMcp {
     fn new() -> Self {
-        Self
+        Self {
+            compute_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
     }
 }
 
@@ -205,9 +215,20 @@ impl ServerHandler for SkillGraphMcp {
         // Discovery/recommend/resolve do synchronous filesystem scans and
         // CPU-bound scoring; run them on the blocking pool so a slow or
         // huge corpus cannot stall the stdio server's async runtime.
-        tokio::task::spawn_blocking(move || compute_tool(name.as_ref(), &args))
+        // The permit serializes computations across pipelined calls —
+        // see compute_permit (#144 r19).
+        let permit = self
+            .compute_permit
+            .clone()
+            .acquire_owned()
             .await
-            .map_err(|e| McpError::internal_error(format!("tool task failed: {e}"), None))?
+            .map_err(|e| McpError::internal_error(format!("compute permit: {e}"), None))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            compute_tool(name.as_ref(), &args)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("tool task failed: {e}"), None))?
     }
 }
 

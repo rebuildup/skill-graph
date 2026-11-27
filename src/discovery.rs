@@ -155,21 +155,22 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         if !seen_roots.insert(root.clone()) {
             continue;
         }
-        // Sort entries so discovery order — and therefore Graph.skills
-        // index order, the deterministic body-scan budget order in
-        // recommend(), and equal-score output ordering — does not depend
-        // on filesystem directory order.
-        let mut entries = WalkDir::new(&root)
-            .follow_links(false)
-            .sort_by_file_name()
-            .into_iter();
+        // Stream entries WITHOUT sort_by_file_name: it buffers every
+        // dentry of a directory before yielding anything, so a hostile
+        // corpus with millions of entries in one directory would
+        // exhaust memory before the entry cap applies (#144 r19).
+        // Collect bounded SKILL.md candidates instead, then sort them
+        // component-wise — the same order sort_by_file_name's DFS
+        // traversal produces — so discovery order stays deterministic.
+        // Under entry-cap pressure the candidate SET is filesystem
+        // order dependent (accepted residual: corpora beyond the cap
+        // are already reported truncated).
+        let mut entries = WalkDir::new(&root).follow_links(false).into_iter();
         let mut consumed = 0usize;
         let mut walk_errors = 0usize;
+        let mut candidates: Vec<PathBuf> = Vec::new();
         for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {
             consumed += 1;
-            if capacity_truncated {
-                break;
-            }
             // Surface IO errors (permission-denied dirs etc.) instead of
             // silently reporting a partial scan as clean.
             let entry = match entry {
@@ -207,6 +208,19 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             if !seen_files.insert(canonical) {
                 continue;
             }
+            candidates.push(path.to_path_buf());
+        }
+        // Component-wise compare reproduces per-directory name sort +
+        // DFS descent: "a" < "a-b" puts a/'s whole subtree first,
+        // matching sort_by_file_name traversal order for SKILL.md
+        // leaves (#144 r19).
+        candidates.sort_by(|a, b| {
+            a.components()
+                .map(|c| c.as_os_str())
+                .cmp(b.components().map(|c| c.as_os_str()))
+        });
+        for path in &candidates {
+            let path = path.as_path();
             let file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
             if skills.len() >= MAX_SKILLS || total_bytes + file_bytes > MAX_SKILL_BYTES {
                 capacity_truncated = true;

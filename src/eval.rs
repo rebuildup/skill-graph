@@ -44,6 +44,19 @@ const MAX_EVAL_GRAPHS: usize = 32;
 /// Per-case expected/forbidden list bound: hits are computed against at
 /// most `fetch` recommended names, so longer lists only burn CPU.
 const MAX_EVAL_EXPECTED: usize = 1024;
+/// Recommendation cutoff bound: `max` flows into `fetch` and the
+/// per-case `recommended` name list, so an unbounded `--max` would
+/// materialize ~#skills names × #cases result entries (#144 r19).
+const MAX_EVAL_MAX: usize = 64;
+/// Total graph builds across the whole run. The LRU bounds *retained*
+/// graphs, but a dataset naming a fresh `skill_root` per case still
+/// pays a full discover+build per case — 10k hostile builds is a
+/// hang, not just memory (#144 r19).
+const MAX_EVAL_BUILDS: usize = 256;
+/// Total discovery-error strings retained across all builds: each
+/// build can contribute ~1k errors, so builds × errors is unbounded
+/// without a run-level cap (#144 r19).
+const MAX_EVAL_DISCOVERY_ERRORS: usize = 4096;
 
 /// `max` is the primary recommendation cutoff scored by `required_recall`.
 /// It defaults to the top-N the runtime actually injects (hook/plugin
@@ -51,6 +64,7 @@ const MAX_EVAL_EXPECTED: usize = 1024;
 /// the same `recommend` pass so metric drift stays visible.
 pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
     use std::io::Read;
+    let max = max.min(MAX_EVAL_MAX);
     let file = fs::File::open(dataset).map_err(|e| format!("read {}: {e}", dataset.display()))?;
     let mut text = String::new();
     file.take(MAX_DATASET_BYTES + 1)
@@ -118,6 +132,8 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
     // stays bounded (#144 r18).
     let mut graph_lru: std::collections::VecDeque<PathBuf> = std::collections::VecDeque::new();
     let mut discovery_errors: Vec<String> = Vec::new();
+    let mut discovery_errors_capped = false;
+    let mut graph_builds = 0usize;
     let mut results = Vec::new();
     let mut totals = json!({
         "cases": cases.len(),
@@ -178,8 +194,22 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
             {
                 graphs.remove(&oldest);
             }
+            // The LRU bounds retained graphs, not total work: cap the
+            // number of discover+build passes a dataset can trigger.
+            if graph_builds >= MAX_EVAL_BUILDS {
+                return Err(format!(
+                    "dataset triggers more than {MAX_EVAL_BUILDS} distinct skill_root builds"
+                ));
+            }
+            graph_builds += 1;
             let discovery = discover(std::slice::from_ref(&root));
-            discovery_errors.extend(discovery.errors.iter().cloned());
+            if !discovery_errors_capped {
+                let room = MAX_EVAL_DISCOVERY_ERRORS.saturating_sub(discovery_errors.len());
+                discovery_errors.extend(discovery.errors.iter().take(room).cloned());
+                if discovery.errors.len() > room {
+                    discovery_errors_capped = true;
+                }
+            }
             graphs.insert(root.clone(), build(discovery));
             graph_lru.push_back(root.clone());
         }
@@ -284,7 +314,12 @@ pub fn run(dataset: &Path, max: usize) -> Result<Value, String> {
     totals["cases"] = json!(results.len());
 
     let mut out = json!({ "summary": totals, "cases": results });
-    if !discovery_errors.is_empty() {
+    if !discovery_errors.is_empty() || discovery_errors_capped {
+        if discovery_errors_capped {
+            discovery_errors.push(format!(
+                "discovery_errors truncated at {MAX_EVAL_DISCOVERY_ERRORS}"
+            ));
+        }
         out["discovery_errors"] = json!(discovery_errors);
     }
     Ok(out)

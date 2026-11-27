@@ -391,9 +391,15 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     const trimmed = out.trim()
     if (!trimmed) return []
     // `detect` emits one JSON object per line (a payload may touch
-    // several SKILL.md files); parse each line independently.
+    // several SKILL.md files); parse each line independently. Cap at
+    // the Rust side's per-payload event bound: stdout is bounded in
+    // BYTES, not lines, so ~30-byte events could otherwise yield
+    // ~140k parsed objects — each then costs a synchronous emit()
+    // (mkdir/lstat/open/write) in the long-lived host (#144 r19).
+    const MAX_EVENTS_PER_PAYLOAD = 64
     const events: Record<string, any>[] = []
     for (const line of trimmed.split("\n")) {
+      if (events.length >= MAX_EVENTS_PER_PAYLOAD) break
       try {
         events.push(JSON.parse(line))
       } catch {
@@ -463,7 +469,15 @@ export default Plugin.define({
     }
 
     await ctx.session.hook("prompt", async (event) => {
-      const text = event.prompt?.text ?? ""
+      // prompt.text is host-supplied and unbounded: it feeds sha256
+      // (CPU), the dedup key, and the child's --query-stdin. Cap it at
+      // the payload bound — hash/dedup/query all use the same
+      // truncated text so they stay consistent within the plugin
+      // (#144 r19). Non-string text is treated as empty (the Rust
+      // hook's as_str() does the same).
+      const rawText = (event.prompt as any)?.text
+      const text =
+        typeof rawText === "string" ? utf8Slice(rawText, MAX_PAYLOAD_BYTES) : ""
       const sessionID = safeSessionID(event.sessionID)
       if (text) {
         emit({

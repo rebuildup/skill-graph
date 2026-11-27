@@ -16,10 +16,21 @@ pub struct Graph {
     pub ambiguous_names: Vec<String>,
 }
 
+/// Resolver-added retention (resolved_name/resolved_path clones and
+/// derived Mention links) is NOT covered by discovery's per-link
+/// `target.len() + 64` charge: a resolved_path carries the full parent
+/// path plus target, and each skill can gain 64 mention links after
+/// parsing. On a max corpus that is gigabytes of unaccounted memory,
+/// so resolution draws from this global budget instead (#144 r19).
+/// Exhaustion leaves links unresolved — a graceful degradation that
+/// only drops backlink/requires evidence on hostile corpora.
+const MAX_RESOLVE_BYTES: u64 = 128 * 1024 * 1024;
+
 pub fn build(discovery: crate::discovery::Discovery) -> Graph {
     let mut skills = discovery.skills;
     let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
     let mut by_path = HashMap::new();
+    let mut resolve_budget = MAX_RESOLVE_BYTES;
 
     for (index, skill) in skills.iter().enumerate() {
         by_name.entry(skill.name.clone()).or_default().push(index);
@@ -37,14 +48,14 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
         for link in &mut links {
             match link.kind {
                 LinkKind::Markdown => {
-                    resolve_markdown(&parents[index], link, &by_path, &names);
+                    resolve_markdown(&parents[index], link, &by_path, &names, &mut resolve_budget);
                 }
-                LinkKind::Requires => resolve_requires(link, &by_name),
+                LinkKind::Requires => resolve_requires(link, &by_name, &mut resolve_budget),
                 _ => {}
             }
         }
         skills[index].links = links;
-        add_mentions(&mut skills, index, &by_name);
+        add_mentions(&mut skills, index, &by_name, &mut resolve_budget);
     }
 
     // Backlinks attach to resolved target copies, not just the first one.
@@ -119,6 +130,7 @@ fn resolve_markdown(
     link: &mut SkillLink,
     by_path: &HashMap<PathBuf, usize>,
     names: &[String],
+    budget: &mut u64,
 ) {
     let joined = normalize_path(&parent.join(&link.target));
     let candidates = if link.target.ends_with(".md") {
@@ -129,22 +141,40 @@ fn resolve_markdown(
 
     for candidate in candidates {
         if let Some(index) = by_path.get(&candidate) {
+            // Charge the retained clones: resolved_name is a full name
+            // copy and resolved_path the whole normalized path — both
+            // larger than discovery's flat per-link allowance (#144 r19).
+            let charge = candidate.as_os_str().len() as u64 + names[*index].len() as u64;
+            if charge > *budget {
+                return;
+            }
+            *budget -= charge;
             link.resolved_name = Some(names[*index].clone());
             link.resolved_path = Some(candidate);
             return;
         }
         if link.target.ends_with(".md") && candidate.starts_with(parent) {
+            let charge = candidate.as_os_str().len() as u64;
+            if charge > *budget {
+                return;
+            }
+            *budget -= charge;
             link.resolved_path = Some(candidate);
             return;
         }
     }
 }
 
-fn resolve_requires(link: &mut SkillLink, by_name: &HashMap<String, Vec<usize>>) {
+fn resolve_requires(link: &mut SkillLink, by_name: &HashMap<String, Vec<usize>>, budget: &mut u64) {
     // Resolution is to the skill *name*: duplicate installs across roots share
     // the name, so the link resolves even when copies are ambiguous. Consumers
     // decide how to handle multiplicity.
     if by_name.contains_key(&link.target) {
+        let charge = link.target.len() as u64;
+        if charge > *budget {
+            return;
+        }
+        *budget -= charge;
         link.resolved_name = Some(link.target.clone());
     }
 }
@@ -155,7 +185,12 @@ fn resolve_requires(link: &mut SkillLink, by_name: &HashMap<String, Vec<usize>>)
 /// Deterministic: tokens are visited in sorted order.
 const MAX_MENTIONS_PER_SKILL: usize = 64;
 
-fn add_mentions(skills: &mut [Skill], index: usize, by_name: &HashMap<String, Vec<usize>>) {
+fn add_mentions(
+    skills: &mut [Skill],
+    index: usize,
+    by_name: &HashMap<String, Vec<usize>>,
+    budget: &mut u64,
+) {
     if skills[index].parse_error.is_some() {
         return;
     }
@@ -185,6 +220,16 @@ fn add_mentions(skills: &mut [Skill], index: usize, by_name: &HashMap<String, Ve
         if let Some(indexes) = by_name.get(&token)
             && indexes.len() == 1
         {
+            // Each mention retains target + resolved_name clones plus
+            // the SkillLink itself — derived links the parser's budget
+            // never saw, so they draw from the shared resolve budget
+            // (#144 r19). Sorted token order keeps truncation
+            // deterministic.
+            let charge = token.len() as u64 * 2 + 384;
+            if charge > *budget {
+                break;
+            }
+            *budget -= charge;
             mentions.push(SkillLink {
                 target: token.clone(),
                 kind: LinkKind::Mention,

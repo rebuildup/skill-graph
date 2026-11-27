@@ -51,7 +51,13 @@ jobs:
           # Fail fast on malformed or nonexistent tags before the
           # release-asset wait loop.
           [[ "$tag" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $tag" >&2; exit 1; }
-          git rev-parse "refs/tags/$tag" >/dev/null || { echo "tag $tag does not exist" >&2; exit 1; }
+          tag_sha="$(git rev-parse "refs/tags/$tag")" || { echo "tag $tag does not exist" >&2; exit 1; }
+          # The checked-out ref must actually be this tag: checkout's
+          # ref resolution can prefer a same-named branch over the tag,
+          # which would publish the branch under the tag's provenance
+          # (#144 r19).
+          [ "$(git rev-parse HEAD)" = "$tag_sha" ] || {
+            echo "checked-out HEAD is not tag $tag" >&2; exit 1; }
           echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
       - name: Verify manifest versions match tag
         run: |
