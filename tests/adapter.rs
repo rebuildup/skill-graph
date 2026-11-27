@@ -1261,3 +1261,20 @@ fn relative_extra_overlay_is_ignored() {
         "relative overlay path must be ignored: {text}"
     );
 }
+
+/// Round-16: empty SKILL_GRAPH_BIN means unset for the plugin bin
+/// check too — status must fall back to the PATH probe instead of
+/// reporting broken while the plugin resolves `skill-graph` fine.
+#[test]
+fn opencode_status_empty_skill_graph_bin_uses_path() {
+    let f = Fixture::new();
+    let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
+    assert_eq!(rc, 0);
+    let path = format!("{}:/usr/bin:/bin", f.fake_bin.parent().unwrap().display());
+    let (out, _) = f.run_env(
+        &["adapter", "status", "opencode", "--user"],
+        &[("SKILL_GRAPH_BIN", ""), ("PATH", path.as_str())],
+    );
+    assert!(out.contains("enabled"), "{out}");
+    assert!(!out.contains("broken"), "{out}");
+}

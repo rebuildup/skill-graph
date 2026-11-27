@@ -394,7 +394,9 @@ fn unquote_shell(word: &str) -> String {
 /// only, nothing is executed — so enable/status can diagnose a missing
 /// runtime binary. Hook runtimes embed a resolved path instead.
 fn opencode_bin_resolvable() -> bool {
-    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN") {
+    // Empty means unset — same rule as resolve_bin and the plugin's
+    // `|| "skill-graph"` fallback (#144 r16).
+    if let Some(p) = std::env::var_os("SKILL_GRAPH_BIN").filter(|p| !p.is_empty()) {
         let raw = PathBuf::from(&p);
         // The plugin spawns SKILL_GRAPH_BIN directly, so a bare command
         // name resolves via PATH — mirror resolve_bin's path/bare-name
@@ -588,11 +590,16 @@ fn valid_env_name(name: &str) -> bool {
 /// `name=value` arguments are recognized on the unquoted text because
 /// env itself does no quote processing.
 fn command_word_index(words: &[ShellWord]) -> Option<usize> {
+    // `env` may be path-qualified (`/usr/bin/env FOO=1 cmd`); a word
+    // whose file name is `env` gets the same operand skipping (#144 r16).
+    let is_env = |w: &ShellWord| {
+        w.text == "env" || Path::new(&w.text).file_name().and_then(|n| n.to_str()) == Some("env")
+    };
     let mut i = 0;
     let mut after_env = false;
     while i < words.len() {
-        if is_env_assignment(&words[i]) || words[i].text == "env" {
-            after_env = after_env || words[i].text == "env";
+        if is_env_assignment(&words[i]) || is_env(&words[i]) {
+            after_env = after_env || is_env(&words[i]);
             i += 1;
         } else if after_env && (is_env_arg(&words[i]) || words[i].text.starts_with('-')) {
             // env options (-i, -u NAME, --unset=NAME, ...) and their

@@ -22,9 +22,11 @@ const SKILL_GRAPH_BIN = process.env.SKILL_GRAPH_BIN || "skill-graph"
 // Parity with the Rust hook's env_absolute_path: env-supplied paths
 // must be absolute — a relative value resolves against the OpenCode
 // server process cwd (an arbitrary project tree) (#144 r13/r14).
-// Node/Bun decode non-UTF-8 env bytes to U+FFFD rather than failing,
-// so a replacement char marks a value that cannot name a real path;
-// reject it and fall back like an unset value (#144 r15).
+// Node/Bun decode non-UTF-8 env bytes to U+FFFD rather than failing.
+// Rejecting any value containing the replacement char treats those as
+// unset — the unavoidable false positive is a legitimate path whose
+// own bytes encode U+FFFD (the Rust hook accepts it via env::var),
+// an accepted divergence documented in contracts.md (#144 r15/r16).
 const absPath = (v: string | undefined): string | undefined =>
   v !== undefined && v !== "" && !v.includes("\uFFFD") && isAbsolute(v)
     ? v

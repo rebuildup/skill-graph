@@ -100,7 +100,9 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   （収集・ファイル毎の双方を含む。latched な打ち切り通知
   数件を別途含みうる）、ファイル毎 256 MiB
   （`.db` は `-wal` 込み）、JSONL 行・`.db` 行の `data` ペイロード毎
-  4 MiB（`serde_json::Value` は入力の ~16-30 倍を占めるため、
+  4 MiB（文字数・UTF-8 byte 数の双方で判定。`session_id`/`type` 列も
+  substr + length で同上限を適用し、超過行は skip する。
+  `serde_json::Value` は入力の ~16-30 倍を占めるため、
   ファイル上限だけでは 1 行で数 GB を確保しうる）、retained
   events/loads 各 1,000,000、retained detail 合計 64 MiB
   （イベント/ロードの推定バイト数 —
@@ -122,6 +124,10 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   いずれの打ち切りも `errors` に latched 通知が入り、
   `runtimes`/`skill_loads` の集計カウンタは正確なまま維持される
   （`skill_loads` の name cardinality 打ち切りを除く）。
+  なお走査中は canonical 化した dir path（最大 ~4 KiB ×
+  65,536 dir ≒ worst case ~270 MB）を visited set として保持する
+  — 256 MiB ファイル上限と同程度の transient であり、dir 数上限が
+  そのまま memory 暗黙上限になる点は既知の residual。
   transcript scanner（Claude/Codex）が finish まで保持する
   record にも count+byte の共有予算がある（`MAX_SCAN_ITEMS`
   65,536・`MAX_SCAN_BYTES` 64 MiB/ scanner）: tool_use input は
@@ -227,8 +233,13 @@ Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts
 
 CLI・hook・MCP・plugin の全入口で同一規則を使う（`src/discovery.rs::resolve_roots`）:
 
-1. `SKILL_GRAPH_ROOTS`（プラットフォームの path-list 区切り）— **非空値が設定されていれば常に最優先**で、設定値が探索範囲の全体を定義する。存在しない・ファイル・権限不足の entry は `discover` の `errors` で診断され、有効 entry のみが走査される。**有効 entry が 0 件でも explicit 引数や既定 root へは拡大しない**（空の走査 + 診断に縮退する）。空文字列は未設定と同等。非 UTF-8 値も `var_os` で「設定済み」と判定される。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。OpenCode plugin のみ `:` 区切りで split する（Windows は非対応のため実害なし）。
-2. 明示引数（CLI `--root`、MCP tool `roots`。MCP は 32 件上限）— env 未設定時のみ
+1. `SKILL_GRAPH_ROOTS`（プラットフォームの path-list 区切り）— **非空値が設定されていれば常に最優先**で、設定値が探索範囲の全体を定義する。存在しない・ファイル・権限不足の entry は `discover` の `errors` で診断され、有効 entry のみが走査される。**有効 entry が 0 件でも explicit 引数や既定 root へは拡大しない**（空の走査 + 診断に縮退する）。空文字列は未設定と同等。非 UTF-8 値も `var_os` で「設定済み」と判定される。operator が agent 供給の引数より優先されることを保証する（ADR-0005）。OpenCode plugin のみ `:` 区切りで split し、空 entry を drop する
+（Rust `split_paths` は空要素を保持して診断に回すが、plugin は
+`--root ""` を spawn できないため drop する。Windows は非対応の
+ため実害なし）。
+2. 明示引数（CLI `--root`、MCP tool `roots`。いずれも 32 件上限
+   — CLI は超過分を捨てて stderr に通知、MCP は診断付きで drop）—
+env 未設定時のみ
 3. 呼び出し側の既定 root（CLI/plugin 既定、hook は runtime 別 fallback）— env 未設定かつ明示引数なしのときのみ
 
 `discover` は canonical 化した SKILL.md パスで重複を除くため、包含・重複する root を渡しても同一 skill を二重計上しない。
@@ -287,7 +298,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   `SKILL_GRAPH_HOOK_STATE`）は UTF-8 のみ受理し、非 UTF-8 値は
   未設定として縮退する（hook は `var` の UTF-8 検証で、plugin は
   Node/Bun が非 UTF-8 byte を U+FFFD に decode するためその
-  置換文字を含む値を拒否する。完全 parity は不可能）。UTF-8 を
+  置換文字を含む値を拒否する。完全 parity は不可能 — plugin は
+  valid UTF-8 の U+FFFD を含む正当な path も拒否しうるが、
+  hook 側は `var` で受理するため、その環境では両入口の event log
+  が分かれうる。raw-bytes env access がない以上の受容差異）。
+  UTF-8 を
   要求するのは hook command へ埋め込む
   `--bin`/`SKILL_GRAPH_BIN`/`PATH` 解決結果のみで、
   その場合は `enable` がエラーを返す。
@@ -303,6 +318,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   literal first word であることを要求し、`FOO=bar` 前置や
   `env -u NAME` のような env 前置を持つ v0.4.x hook は認識
   しない（under-claim：既存 entry を残したまま新規追加しうる）。
+  なお `'FOO'=bar` のように name を quote した代入は POSIX shell
+  では有効な assignment だが、本 parser は command word とみなす
+  （under-claim 方向）。path 修飾された `env`（`/usr/bin/env`）は
+  file name 判定で認識するが、`nice env`/`command env` のような
+  さらに外側の wrapper は対象外。
   v0.4.x hook command の parse は binary path の single/double
   quote と引数の quote を受理する。
 - transcript/exec の read 判定 heuristic（`segment_has_read_verb`）
