@@ -1,8 +1,8 @@
 # v0.5.0 README/SVG 用パフォーマンス・評価エビデンス
 
 Issue: #213。README の性能・精度・効率セクションと `assets/readme/*.svg` の
-データソース。全て release-0-5-0 @ `7c9d6bf` (v0.5.0 release candidate、
-PR #214 merge 後) の release build で実測した。
+データソース。全て release-0-5-0 最終候補 @ `e4f2f5f` (#225 第4回レビュー対応後、
+PR #228 merge 前の ticket head) の release build で実測した。
 
 ## 測定環境
 
@@ -10,7 +10,7 @@ PR #214 merge 後) の release build で実測した。
 - CPU: このマシンのシングルスレッド性能 (WSL2、他負荷なし)
 - Rust: rustc 1.100.0、`cargo build --release`
 - Binary: `target/release/skill-graph` (version 0.5.0)
-- 測定日: 2026-11-27
+- 測定日: 2026-11-27（初回）、2026-11-28（最終候補で再測定）
 
 ## 再現コマンド
 
@@ -33,26 +33,28 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test"}' \
 
 | skills | cold_discover | cold_build | cold_total | warm p50 | warm p95 | warm max | process p50 | process p95 |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 50  | 1.04 | 0.17 | 1.21  | 0.078 | 0.092 | 0.123 | 2.03 | 2.30  |
-| 100 | 1.41 | 0.37 | 1.78  | 0.150 | 0.186 | 0.225 | 3.01 | 3.16  |
-| 200 | 2.74 | 0.76 | 3.50* | 0.337 | 0.438 | 0.486 | 5.06 | 5.44  |
-| 500 | 6.88 | 1.56 | 8.44* | 0.730 | 0.847 | 0.981 | 10.66| 13.16 |
+| 50  | 1.00 | 0.19 | 1.19  | 0.100 | 0.159 | 0.164 | 2.64 | 2.82  |
+| 100 | 1.68 | 0.37 | 2.05  | 0.195 | 0.276 | 0.294 | 4.05 | 5.11  |
+| 200 | 3.37 | 0.76 | 4.13  | 0.368 | 0.452 | 0.524 | 5.87 | 6.28  |
+| 500 | 8.75 | 1.89 | 10.64 | 0.986 | 1.279 | 1.506 | 12.72| 14.77 |
 
-*2回目の実行では cold_total 3.58 / 9.07ms (filesystem cache 状態の差)。
-表は初回実行値、両者を含めてもオーダーは同じ。
+filesystem cache 状態で cold_total は ±20% 程度変動する
+(500 skills で ~9–11ms)。表は最終候補での実測値 (1 run)。
 
 読み方:
 
-- **cold_total はほぼ線形** (50→500 で約 7 倍)。500 skills でも 10ms 未満。
-- **warm recommend はサブミリ秒** — グラフ構築は cold のみ、推薦は常駐不要の
-  都度プロセスで p95 < 1ms のコア処理。
-- **process p95 (CLI spawn 込み) は 500 skills で ~13ms** — hook として
+- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~11ms。
+- **warm recommend はサブミリ秒〜1ms 台** — グラフ構築は cold のみ、推薦は常駐不要の
+  都度プロセスで p95 ~1.3ms (500 skills)。
+- **process p95 (CLI spawn 込み) は 500 skills で ~15ms** — hook として
   実用上無視できるレイテンシ。
 
 ## 2. 推薦精度 (`skill-graph bench evals/dataset/cases.jsonl`)
 
 合成評価データセット 58 cases (required 52 / optional 31 / forbidden は
-expected set に含まれない)。`elapsed_ms: 23` で全件評価。
+expected set に含まれない)。`elapsed_ms: 44` で全件評価。
+最終候補での再測定: recall/forbidden は不変、recommended_total は
+resolver mention-cap 修正 (#225) による推薦集合の変化を反映 (87→88)。
 
 | 指標 | 値 |
 |---|---|
@@ -60,9 +62,9 @@ expected set に含まれない)。`elapsed_ms: 23` で全件評価。
 | required_recall@3 | **1.000** (52/52) |
 | required_recall@5 | 1.000 |
 | forbidden_hits | **0** |
-| precision_required | 0.598 |
-| precision_acceptable | 0.805 |
-| recommended_total | 87 (max=3/case) |
+| precision_required | 0.591 |
+| precision_acceptable | 0.773 |
+| recommended_total | 88 (max=3/case) |
 | empty_recommendations | 6 |
 
 注意: これは**合成コーパスに対するオフライン評価**であり、実セッションでの
@@ -71,24 +73,24 @@ skill_load→conversion とは別物。実利用効果は `observe --summary` �
 
 ## 3. 実コーパスでの計測
 
-### 3a. このリポジトリの開発スキル群 (`.agents/skills`, 17 skills)
+### 3a. このリポジトリの開発スキル群 (`.agents/skills`, 24 skills)
 
-- `discover`: wall <10ms、**Maximum RSS 6.3 MB**
+- `discover`: wall <10ms、**Maximum RSS 6.4 MB**
 - 実際の第三者製 Agent Skills (aude-skills / writing-skills /
   mattpocock/skills / design-skills 由来、keywords 非依存が大半) を含む。
 
-### 3b. design-skills リポジトリ (`skills/`, 87 skills)
+### 3b. design-skills リポジトリ (`skills/`, 88 skills)
 
-- `discover`: wall ~10ms、**Maximum RSS 7.5 MB**
+- `discover`: wall ~10ms、**Maximum RSS 7.3 MB**
 - 公開されている実在の大規模スキルコーパスでの動作確認。
 
 ### 3c. 合成 500 skills コーパス (手動生成、perf と同規模)
 
-- `discover`: wall <10ms、**Maximum RSS 7.1 MB**
+- `discover`: wall <10ms、**Maximum RSS 7.2 MB**
 - `recommend --root /tmp/corpus500 "performance testing"`: wall ~10–16ms
   (5 回計測 0.01s 表示 = /usr/bin/time 分解能)、RSS ~7.1 MB
 
-メモリはコーパス 17→87→500 skills で 6.3→7.5→7.1 MB と**ほぼ一定**
+メモリはコーパス 24→88→500 skills で 6.4→7.3→7.2 MB と**ほぼ一定**
 (パース済み構造が小さいため)。常駐プロセスがないので、コストは呼び出し
 ごとのプロセス起動 + 都度 discovery に限定される。
 
@@ -115,7 +117,7 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
 ## 6. アーキテクチャ上の帰結 (README 記載の根拠)
 
 - **永続キャッシュ・常駐サービス不要**: グラフは呼び出しごとにオンメモリ構築。
-  cold でも 500 skills で ~9ms、warm recommend はサブミリ秒。
+  cold でも 500 skills で ~11ms、warm recommend は ~1ms。
   デーモン・DB・index ファイルの運用コストがゼロ。
 - **プロセスモデル**: 各呼び出しは独立プロセス。state は event log
   (append-only JSONL) のみで、クラッシュしても推薦経路に影響しない。
