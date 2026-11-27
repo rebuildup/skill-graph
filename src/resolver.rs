@@ -42,6 +42,11 @@ pub fn build(discovery: crate::discovery::Discovery) -> Graph {
         .iter()
         .filter_map(|s| s.path.parent().map(Path::to_path_buf))
         .collect();
+    // `parents[index]` below assumes 1:1 alignment with `skills` — true
+    // today because every discovered path ends in SKILL.md under a
+    // canonicalized root, but `filter_map` would silently misalign the
+    // index→parent mapping if a parentless path ever slipped in.
+    debug_assert_eq!(parents.len(), skills.len());
 
     for index in 0..skills.len() {
         let mut links = skills[index].links.clone();

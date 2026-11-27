@@ -1772,49 +1772,59 @@ impl CodexScan {
         // file: the first Read across ALL records sharing a call_id —
         // pending and overflow alike — may claim it. Crafted rollouts
         // can repeat call_ids; without this each would verify the same
-        // output into a separate file_read event (#144 r13). Pending
-        // accesses all precede overflow accesses in feed order (overflow
-        // only fills after the pending budget is exhausted), so the
-        // pending-then-overflow pass IS feed order.
+        // output into a separate file_read event (#144 r13).
+        //
+        // Claims must resolve in TRUE feed order: the byte-charge path
+        // demotes a whole call to overflow non-contiguously, so an
+        // earlier call can sit in `overflow` while a later call sits in
+        // `pending` — a pending-then-overflow pass would invert
+        // duplicate call_id claims (#144 r20). Each call contributes at
+        // most one candidate (its first Read: `first_read` /
+        // `frontmatter_available` semantics), feed-line seqs are unique
+        // per call, and pending accesses precede their call's overflow
+        // suffix at equal seq — so sorting candidates by seq alone
+        // reconstructs feed order.
+        enum ClaimTarget {
+            Pending(usize, usize),
+            Overflow(usize),
+        }
+        let mut claims: Vec<(u64, ClaimTarget)> = Vec::new();
+        for (pi, pending) in self.pending.iter().enumerate() {
+            if let Some(ai) = pending
+                .accesses
+                .iter()
+                .position(|(_, a)| matches!(a, events::Access::Read))
+            {
+                claims.push((pending.seq, ClaimTarget::Pending(pi, ai)));
+            }
+        }
+        for (oi, ov) in self.overflow.iter().enumerate() {
+            if ov.first_read && matches!(ov.access, events::Access::Read) {
+                claims.push((ov.seq, ClaimTarget::Overflow(oi)));
+            }
+        }
+        claims.sort_by_key(|(seq, _)| *seq);
         let mut frontmatter_consumed: std::collections::HashSet<&str> =
             std::collections::HashSet::new();
-        let mut pending_verify: Vec<Vec<bool>> = Vec::with_capacity(self.pending.len());
-        for pending in &self.pending {
-            let call_id: &str = &pending.call_id;
-            // One captured output can cover several SKILL.md reads; its
-            // frontmatter block belongs to the first file emitted, so only
-            // the first Read access may claim it.
-            let mut frontmatter_available = true;
-            let mut flags = Vec::with_capacity(pending.accesses.len());
-            for (_path, access) in &pending.accesses {
-                let verify = matches!(access, events::Access::Read)
-                    && frontmatter_available
-                    && !frontmatter_consumed.contains(call_id);
-                if matches!(access, events::Access::Read) {
-                    frontmatter_available = false;
-                    if verify {
-                        frontmatter_consumed.insert(call_id);
-                    }
+        let mut pending_verify: Vec<Vec<bool>> = self
+            .pending
+            .iter()
+            .map(|p| vec![false; p.accesses.len()])
+            .collect();
+        let mut overflow_claim: Vec<bool> = vec![false; self.overflow.len()];
+        for (_seq, target) in claims {
+            let call_id: &str = match &target {
+                ClaimTarget::Pending(pi, _) => self.pending[*pi].call_id.as_ref(),
+                ClaimTarget::Overflow(oi) => self.overflow[*oi].call_id.as_ref(),
+            };
+            // HashSet::insert reports newness — the first candidate in
+            // feed order for a call_id claims the frontmatter.
+            if frontmatter_consumed.insert(call_id) {
+                match target {
+                    ClaimTarget::Pending(pi, ai) => pending_verify[pi][ai] = true,
+                    ClaimTarget::Overflow(oi) => overflow_claim[oi] = true,
                 }
-                flags.push(verify);
             }
-            pending_verify.push(flags);
-        }
-        // Overflow accesses lost their path detail but not their load:
-        // emit the same event shape minus skill_path so counters, the
-        // funnel, and the retained-events budget treat them identically.
-        // Only the call's first Read may claim the captured output's
-        // frontmatter — same rule as the pending path, shared across
-        // duplicate call_ids via `frontmatter_consumed`.
-        let mut overflow_claim: Vec<bool> = Vec::with_capacity(self.overflow.len());
-        for ov in &self.overflow {
-            let may_claim = ov.first_read
-                && matches!(ov.access, events::Access::Read)
-                && !frontmatter_consumed.contains(ov.call_id.as_ref());
-            if may_claim {
-                frontmatter_consumed.insert(ov.call_id.as_ref());
-            }
-            overflow_claim.push(may_claim);
         }
         vec![
             Box::new(self.injected.iter().cloned()),

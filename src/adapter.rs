@@ -1458,13 +1458,15 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                 payload_dirs.sort();
                 payload_dirs.dedup();
                 // Canonicalized data-home bases: the resolved payload
-                // dir must live under one of them, not merely end with
-                // the managed suffix — otherwise a crafted spec could
-                // delete a foreign `*/skill-graph/opencode-plugin`
-                // (#144 r19).
+                // dir must BE `<base>/skill-graph/opencode-plugin` for
+                // one of them — `starts_with` would also admit a
+                // foreign `other-vendor/skill-graph/opencode-plugin`
+                // nested under the same base, and the managed payload
+                // is never nested deeper than the marker (#144 r19/r20).
                 let bases: Vec<PathBuf> = payload_base_dirs()
                     .iter()
                     .filter_map(|b| b.canonicalize().ok())
+                    .map(|b| b.join(PLUGIN_MARKER))
                     .collect();
                 for dir in payload_dirs {
                     // The lexical guard above cannot see symlinks in
@@ -1487,9 +1489,7 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                         continue;
                     }
                     let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                    if is_managed_payload_dir(&resolved)
-                        && bases.iter().any(|b| resolved.starts_with(b))
-                    {
+                    if is_managed_payload_dir(&resolved) && bases.contains(&resolved) {
                         let _ = std::fs::remove_dir_all(&resolved);
                     }
                 }

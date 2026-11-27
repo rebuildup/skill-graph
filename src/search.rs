@@ -542,12 +542,21 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
         } else {
             body_len.saturating_add(max_gloss_bytes)
         };
+        // expand_gloss/gloss_terms run their ~|GLOSS| `contains` scans
+        // and the to_lowercase copy on the LOWERED text, whose byte
+        // length can reach ~4x body_len for non-ASCII (same factor as
+        // est_field) — charging raw body_len undercounts ~4x (#144 r20).
+        let lowered_bound = if non_ascii {
+            body_len.saturating_mul(4)
+        } else {
+            body_len
+        };
         let work = term_count
             .saturating_mul(est_field)
             .saturating_add(if query_whole { est_field } else { 0 })
             .saturating_add(if context_whole { est_field } else { 0 })
             .saturating_add(if non_ascii {
-                GLOSS.len().saturating_mul(body_len)
+                GLOSS.len().saturating_mul(lowered_bound)
             } else {
                 0
             })
@@ -560,7 +569,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
             .saturating_add(context_term_bytes)
             .saturating_add(if query_whole { query.len() } else { 0 })
             .saturating_add(if context_whole { context.len() } else { 0 })
-            .saturating_add(body_len);
+            .saturating_add(lowered_bound);
         // saturating_add: `work` tops out at usize::MAX on 32-bit, and
         // a plain add here could overflow before the budget check
         // (#144 r19 CR).
