@@ -304,8 +304,8 @@ async function recommendNames(
 // several× amplified, before the child's own 16 MiB/4 MiB stdin caps
 // ever see it (#144 r18). Legitimate hook/plugin payloads are
 // KB-scale, so these bounds are generous.
-const MAX_RESULT_TEXT_BYTES = 64 * 1024
-const MAX_INPUT_JSON_BYTES = 1024 * 1024
+export const MAX_RESULT_TEXT_BYTES = 64 * 1024
+export const MAX_INPUT_JSON_BYTES = 1024 * 1024
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 // Tool names are small identifiers; error/status text is forwarded
 // only for the Rust-side failure guard, which checks shape (== "error",
@@ -322,7 +322,7 @@ const utf8Bytes = (s: string) => Buffer.byteLength(s, "utf8")
 // Work is O(budget), not O(input): iteration stops as soon as the byte
 // budget is exceeded, so a multi-hundred-MB host string cannot force a
 // full scan before being sliced (#225 re-review).
-function utf8Slice(s: string, maxBytes: number): string {
+export function utf8Slice(s: string, maxBytes: number): string {
   let out = ""
   let used = 0
   for (const ch of s) {
@@ -334,7 +334,7 @@ function utf8Slice(s: string, maxBytes: number): string {
   return s
 }
 
-function resultText(result: unknown): string {
+export function resultText(result: unknown): string {
   if (typeof result === "string") return utf8Slice(result, MAX_RESULT_TEXT_BYTES)
   try {
     const r = result as any
@@ -357,8 +357,11 @@ function resultText(result: unknown): string {
     // shapes cannot stall this long-lived plugin (#225 re-review).
     let walked = 0
     const walk = (v: any, depth: number) => {
-      if (total >= MAX_RESULT_TEXT_BYTES || depth > MAX_INPUT_DEPTH || !v || typeof v !== "object") return
+      // Count EVERY visited node — primitives included. Counting only
+      // objects let a flat array of 10M strings iterate to completion
+      // because `walked` never moved (#225 re-review).
       if (++walked > MAX_INPUT_NODES) return
+      if (total >= MAX_RESULT_TEXT_BYTES || depth > MAX_INPUT_DEPTH || !v || typeof v !== "object") return
       if (typeof v.text === "string") push(v.text)
       if (typeof v.content === "string") push(v.content)
       // for..of + break (not forEach): iteration itself must stop at
@@ -401,11 +404,11 @@ function boundedError(e: unknown): unknown {
 // and JSON.stringify only ever sees the bounded clone (#225). JSON
 // escaping can still inflate the clone past MAX_INPUT_JSON_BYTES; the
 // post-serialize size check remains as the final gate.
-const MAX_INPUT_DEPTH = 32
-const MAX_INPUT_NODES = 8192
-const BOUND_FAIL = Symbol("bound-fail")
+export const MAX_INPUT_DEPTH = 32
+export const MAX_INPUT_NODES = 8192
+export const BOUND_FAIL = Symbol("bound-fail")
 
-interface BoundState {
+export interface BoundState {
   nodes: number
   strBytes: number
 }
@@ -413,7 +416,7 @@ interface BoundState {
 // Deep-clone `v` keeping only JSON-shaped data (null/bool/number/
 // string/array/plain object) within the budgets. Returns BOUND_FAIL on
 // any exceed or non-JSON value — callers skip detection (fail-open).
-function boundJsonValue(v: unknown, depth: number, st: BoundState): unknown {
+export function boundJsonValue(v: unknown, depth: number, st: BoundState): unknown {
   if (depth > MAX_INPUT_DEPTH || ++st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
   if (v === null || typeof v === "boolean" || typeof v === "number") return v
   if (typeof v === "string") {
@@ -439,7 +442,13 @@ function boundJsonValue(v: unknown, depth: number, st: BoundState): unknown {
     if (proto !== Object.prototype && proto !== null) return BOUND_FAIL
     const out: Record<string, unknown> = {}
     let n = 0
-    for (const k of Object.keys(v as Record<string, unknown>)) {
+    // for..in enumerates lazily and we break at the node budget —
+    // Object.keys() would materialize ALL keys of a hostile object
+    // before the budget could apply (#225 re-review). hasOwnProperty
+    // keeps the walk to own keys (proto is already plain, but a
+    // polluted Object.prototype must not leak keys into the clone).
+    for (const k in v as Record<string, unknown>) {
+      if (!Object.prototype.hasOwnProperty.call(v, k)) continue
       if (++n > MAX_INPUT_NODES) return BOUND_FAIL
       if (k.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
       st.strBytes += utf8Bytes(k)
@@ -689,7 +698,13 @@ export default Plugin.define({
         trigger: "prompt_submit",
         prompt_hash: text ? sha256(text) : undefined,
         recommended: recs,
-        emitted: names.length > 0,
+        // `emitted` means "injected where the model can see it". An
+        // unattributed session queues nothing (no session id to
+        // correlate the context hook), so recording emitted:true would
+        // falsify the funnel — the Rust hook injects anonymously via
+        // its synchronous response, this plugin cannot (#225
+        // re-review).
+        emitted: attributed && names.length > 0,
         reason: names.length > 0 ? "recommended" : "no_recommendations",
       })
       if (names.length > 0 && attributed) {
@@ -755,7 +770,10 @@ export default Plugin.define({
           session_id: sessionID,
           trigger: "skill_load",
           recommended: injected,
-          emitted: names.length > 0,
+          // Same funnel rule as the prompt path — unattributed sessions
+          // cannot receive the queued injection, so emitted stays
+          // false even when names were recommended (#225 re-review).
+          emitted: attributed && names.length > 0,
           reason: names.length > 0 ? "recommended" : "no_recommendations",
         })
         if (names.length > 0 && attributed) queue(sessionID, "deps", names)

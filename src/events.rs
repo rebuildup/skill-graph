@@ -1267,6 +1267,67 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_session_id_property_contract() {
+        // Property sweep over adversarial inputs (#225 re-review): the
+        // contract — ≤128 chars, charset-safe, deterministic,
+        // idempotent — must hold for ARBITRARY session ids, not just
+        // the hand-picked cases above. Deterministic LCG, no external
+        // deps; mirrors the plugin-side property test in
+        // opencode-plugin.test.ts.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pieces: [&str; 14] = [
+            "a",
+            "Z",
+            "0",
+            "-",
+            ".",
+            "_",
+            "!",
+            "?",
+            " ",
+            "/",
+            "\n",
+            "é",
+            "\u{0}",
+            "\u{1f600}",
+        ];
+        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        for i in 0..3000u32 {
+            let len = (rand() % 300) as usize;
+            let mut raw = String::new();
+            for _ in 0..len {
+                raw.push_str(pieces[(rand() as usize) % pieces.len()]);
+            }
+            let out = sanitize_session_id(&raw);
+            assert!(out.len() <= 128, "{out:?} exceeds 128 chars for {raw:?}");
+            // Charset: output is "" or [A-Za-z0-9._-] only — "unknown-"
+            // and hash-suffix forms use the same safe alphabet.
+            assert!(
+                out.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+                "unsafe charset in {out:?} from {raw:?}"
+            );
+            // Deterministic + idempotent.
+            assert_eq!(sanitize_session_id(&raw), out);
+            assert_eq!(sanitize_session_id(&out), out);
+            if i < 1000 {
+                seen.insert(raw, out);
+            }
+        }
+        // Distinct raws must not collapse into one sanitized id —
+        // hash suffixes make accidental collisions cryptographically
+        // improbable across this sample.
+        let outs: std::collections::HashSet<&String> = seen.values().collect();
+        assert_eq!(outs.len(), seen.len(), "distinct raws collapsed");
+    }
+
+    #[test]
     fn skill_md_paths_extracts_candidates() {
         let paths = skill_md_paths("cat .agents/skills/alpha-skill/SKILL.md now");
         assert_eq!(paths, vec![".agents/skills/alpha-skill/SKILL.md"]);
