@@ -1446,6 +1446,19 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
                     // `skill-graph` is a symlink would still recurse
                     // into the link target. Canonicalize and re-verify
                     // the resolved path before deleting (#144 r18).
+                    //
+                    // A symlink AT the final component is different:
+                    // canonicalize() would resolve it and delete the
+                    // link target's contents. Unlink the link itself
+                    // instead — the payload entry is gone either way.
+                    if dir
+                        .symlink_metadata()
+                        .map(|m| m.file_type().is_symlink())
+                        .unwrap_or(false)
+                    {
+                        let _ = std::fs::remove_file(&dir);
+                        continue;
+                    }
                     let resolved = dir.canonicalize().unwrap_or_else(|_| dir.clone());
                     if is_managed_payload_dir(&resolved) {
                         let _ = std::fs::remove_dir_all(&resolved);

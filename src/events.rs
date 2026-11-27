@@ -688,9 +688,6 @@ pub fn classify_tool_access_all(
         'keys: for key in ["command", "cmd", "input"] {
             if let Some(command) = input.get(key).and_then(Value::as_str) {
                 for (path, access) in classify_command(command) {
-                    if out.len() >= MAX_EVENTS_PER_PAYLOAD {
-                        break 'keys;
-                    }
                     let c = match access {
                         Access::Read => {
                             let verify = frontmatter_available;
@@ -708,6 +705,18 @@ pub fn classify_tool_access_all(
                             confidence: Confidence::Low,
                         },
                     };
+                    // Unnamed classifications are dropped downstream
+                    // (detect_all_from_payload emits no event for
+                    // them); counting them against the cap would let
+                    // 64 junk paths starve a later valid one (#144 r18
+                    // CR). Frontmatter consumption above already ran,
+                    // so ordering semantics are unchanged.
+                    if c.skill_name.is_none() {
+                        continue;
+                    }
+                    if out.len() >= MAX_EVENTS_PER_PAYLOAD {
+                        break 'keys;
+                    }
                     if seen.insert((c.skill_path.clone(), c.detection)) {
                         out.push(c);
                     }

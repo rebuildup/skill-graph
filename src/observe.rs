@@ -861,6 +861,18 @@ impl EmitBudget {
         event: SkillUsageEvent,
         obs: &mut Observation,
     ) {
+        // record_event discards unattributable skill_load events
+        // entirely; charging them here would let junk paths exhaust
+        // the budget and starve later valid events (#144 r18 CR).
+        if event.kind == EventKind::SkillLoad
+            && event
+                .skill_name
+                .as_deref()
+                .map(str::is_empty)
+                .unwrap_or(true)
+        {
+            return;
+        }
         let charge = event_total_charge(&event, obs.current_file_len);
         if self.count < MAX_OBSERVE_EVENTS
             && self.bytes.saturating_add(charge) <= MAX_OBSERVE_RETAINED_BYTES
@@ -877,17 +889,9 @@ impl EmitBudget {
                 "transcript events truncated at emission budget".to_string(),
             );
         }
-        // Mirror record_event's unattributable-drop rule so counters
-        // stay exact for overflowed events too.
-        if !(event.kind == EventKind::SkillLoad
-            && event
-                .skill_name
-                .as_deref()
-                .map(str::is_empty)
-                .unwrap_or(true))
-        {
-            account_event_counters(&event, obs);
-        }
+        // The early return above guarantees the event is attributable,
+        // so counters stay exact for overflowed events too.
+        account_event_counters(&event, obs);
     }
 }
 

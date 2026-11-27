@@ -283,17 +283,41 @@ const MAX_RESULT_TEXT_BYTES = 64 * 1024
 const MAX_INPUT_JSON_BYTES = 1024 * 1024
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 
+// Caps are UTF-8 BYTES, not UTF-16 code units: `"あ".repeat(400000)`
+// is ~1.2 MB but only 400k `String.length` (#144 r18 CR).
+const utf8Bytes = (s: string) => Buffer.byteLength(s, "utf8")
+
+// Largest prefix of `s` within `maxBytes` UTF-8 bytes, never splitting
+// a code point (for..of iterates code points, not UTF-16 units).
+function utf8Slice(s: string, maxBytes: number): string {
+  if (utf8Bytes(s) <= maxBytes) return s
+  let out = ""
+  let used = 0
+  for (const ch of s) {
+    const b = utf8Bytes(ch)
+    if (used + b > maxBytes) break
+    out += ch
+    used += b
+  }
+  return out
+}
+
 function resultText(result: unknown): string {
-  if (typeof result === "string") return result.slice(0, MAX_RESULT_TEXT_BYTES)
+  if (typeof result === "string") return utf8Slice(result, MAX_RESULT_TEXT_BYTES)
   try {
     const r = result as any
     const parts: string[] = []
+    // `total` charges each part's bytes PLUS one for the "\n" the
+    // join will insert — otherwise 64Ki parts of {text:""} would
+    // still double the budget via separators (#144 r18 CR).
     let total = 0
     const push = (s: string) => {
-      if (total >= MAX_RESULT_TEXT_BYTES) return
       const room = MAX_RESULT_TEXT_BYTES - total
-      parts.push(s.length > room ? s.slice(0, room) : s)
-      total += Math.min(s.length, room)
+      if (room <= 1) return
+      const t = utf8Slice(s, room - 1)
+      if (!t) return
+      parts.push(t)
+      total += utf8Bytes(t) + 1
     }
     const walk = (v: any) => {
       if (total >= MAX_RESULT_TEXT_BYTES || !v || typeof v !== "object") return
@@ -319,24 +343,13 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     // An oversized input cannot fit the payload budget below anyway —
     // skip before the SKILL.md scan so a giant object is not walked
     // twice (#144 r18).
-    if (inputJson.length > MAX_INPUT_JSON_BYTES) return []
+    if (utf8Bytes(inputJson) > MAX_INPUT_JSON_BYTES) return []
     const isSkillTool = tool.toLowerCase() === "skill"
     const touches = inputJson.includes("SKILL.md") ||
       (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
     if (!isSkillTool && !touches) return []
 
-    // Bound actual `detect` subprocess spawns per session. Counting
-    // happens HERE, after the prefilter — charging every tool call
-    // would let 512 unrelated executions silently disable detection
-    // for the rest of a long session.
     const sid = safeSessionID(event.sessionID)
-    const detects = detectCounts.get(sid) ?? 0
-    if (detects >= MAX_DETECT_PER_SESSION) return []
-    if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
-      const oldest = detectCounts.keys().next().value
-      if (oldest !== undefined) detectCounts.delete(oldest)
-    }
-    detectCounts.set(sid, detects + 1)
 
     const payload = {
       tool_name: tool,
@@ -355,7 +368,19 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     // rejected after a wasted spawn, and the forwarded status/error
     // fields are unbounded event data. Skip detection instead — the
     // plugin fails open by design (#144 r18).
-    if (body.length > MAX_PAYLOAD_BYTES) return []
+    if (utf8Bytes(body) > MAX_PAYLOAD_BYTES) return []
+    // Bound actual `detect` subprocess spawns per session. Counting
+    // happens HERE — after the prefilter AND the payload gate — so
+    // oversized events that skip spawn cannot burn the session's
+    // detect budget, while 512 unrelated executions still cannot
+    // silently disable detection (#144 r18 CR).
+    const detects = detectCounts.get(sid) ?? 0
+    if (detects >= MAX_DETECT_PER_SESSION) return []
+    if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
+      const oldest = detectCounts.keys().next().value
+      if (oldest !== undefined) detectCounts.delete(oldest)
+    }
+    detectCounts.set(sid, detects + 1)
     const proc = Bun.spawn(
       [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
       { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
