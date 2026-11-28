@@ -2,23 +2,34 @@
 
 導入済みの Agent Skills の中から、**いまのタスクに本当に必要な
 スキルを見つけてエージェントに届ける**ランタイム非依存 CLI。
-スキルが「入っているのに使われない」状態を解消し、
-Claude Code / Codex / OpenCode で同じ仕組みが使える
-（opt-in adapter）。標準の Agent Skills 仕様は変更しない。
+Claude Code / Codex / OpenCode で同じ仕組みが使え
+（opt-in adapter）、runtime の native discovery が届かない
+スキルも推薦経由でエージェントへ届けられる。
+標準の Agent Skills 仕様は変更しない。
 
-## 実測: 推薦は必ず文脈へ届く
+## 実測: 効果が出る条件を実ランタイムで確認した
 
-実ランタイム A/B 実験（OpenCode・同一 model・同一タスク・
-2 種の skill corpus、計 n=24 session/群）を実施した。
-正直な結果として、**skill 呼び出し数の有意な増加は現時点で
-確認できていない**（plugin 有効 1.29 vs 無効 1.25
-invocations/session、正解スキルのロード率 87.5% vs 83.3%
-— いずれも非有意）。一方で、推薦が実際に model の文脈へ
-届く delivery と、推薦→スキル読込の conversion は実測で
-確認できている。実利用効果の継続計測は `observe --summary`
-の funnel 指標と観測 pilot で行う。条件・分母・生データ・
-限界は
-[実測記録](docs/evidence/2026-11-28-v050-usage-effect-ab.md)
+実ランタイム A/B 実験（OpenCode・Devin、同一 model・同一タスク・
+複数 skill corpus）を実施した。結果は条件で分かれる。
+
+- **runtime が既に全スキルを surface する環境では差が出ない**:
+  OpenCode（plugin on/off、n=24 session/群）で呼び出し数
+  1.29 vs 1.25/session、正解ロード率 87.5% vs 83.3%（いずれも
+  非有意）。Devin でも corpus 8件・157件の両方で 8/8 vs 8/8。
+- **runtime が surface しない root のスキルには明確な効果**:
+  実務 skill 8件を runtime 非検出の場所へ移した条件で、
+  推薦注入群は **7/8 が正解スキルをロード**、対照群は **0/8**
+  （そのスキルに到達する経路が存在しない）。唯一の失敗は
+  推薦 recall の既知欠陥（Issue #319）に起因。
+
+つまり「入っているのに使われない」の解消は、runtime の
+native discovery が届かないスキル集合に対して実測で確認
+できた。delivery（推薦が文脈へ届く）と conversion
+（推薦→SKILL.md 読込）は全条件で機能している。
+条件・分母・生データ・限界は
+[OpenCode 記録](docs/evidence/2026-11-28-v050-usage-effect-ab.md)・
+[Devin 記録](docs/evidence/2026-11-29-v050-usage-effect-devin-ab.md)
+・[surface 分析](docs/evidence/2026-11-28-v050-skill-surface-analysis.md)
 を参照。
 
 ## 課題: スキルは入れたのに使われない
