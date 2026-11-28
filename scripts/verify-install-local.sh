@@ -188,7 +188,8 @@ class SkillGraph < Formula
   end
 end
 EOF
-  if brew install "$formula" >/dev/null 2>&1; then
+  brew_log="$tmp/brew-install.log"
+  if brew install "$formula" >"$brew_log" 2>&1; then
     bbin="$(brew --prefix)/bin/skill-graph"
     bout="$("$bbin" --version 2>/dev/null || true)"
     [ "$bout" = "skill-graph $version" ] \
@@ -202,6 +203,8 @@ EOF
       && ok "brew uninstall lifecycle" \
       || bad "brew uninstall lifecycle"
   else
+    echo "brew install output:" >&2
+    tail -30 "$brew_log" >&2
     bad "brew install (formula -> file:// tarball)"
   fi
 else
