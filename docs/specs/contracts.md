@@ -128,7 +128,10 @@ queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
   detect・observe の全 producer が同一 domain・同一結果を保証し、
   かつ任意長入力に対し O(8192) に有界化される）。同一 domain を
   共有する raw id は契約上同一 session であり、domain 内で異なる
-  id は区別される。`skill_path` 1024、`tool`/`skill_name`/
+  id は区別される。**identity domain（8192 code points）を超える
+  raw id は帰属不能（空）へ収束する**（#225 C01: 超過 id は domain
+  内で衝突し得るため、状態を共有しない unattributed namespace に
+  落とす — session 分離を後退させない）。`skill_path` 1024、`tool`/`skill_name`/
   `recommended[].name` 256、
   `reason` 1024、`prompt_hash`/`skill_digest`/`recommended[].digest` 128、
   `timestamp` 64 文字。`recommended` は最大 32 件
@@ -150,14 +153,22 @@ queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
   残すが、OpenCode plugin は dedup 時に event を出さない。`reason`
   語彙と dedup event の有無は runtime 間で一致せず、delivery_rate の
   分母構造が異なる（pilot spec は runtime 間比較を前提としない）。
-  plugin の `emitted` は injection キュー投入時点の値であり、context
-  hook での実注入までは保証しない（pending FIFO eviction で未注入に
-  なりうる）。
-- `SKILL_GRAPH_HOOK_NOSTATE=1` の dedup 意味論は adapter 間で異なる:
-  Rust hook は state marker を無効化し repeat prompt 毎に recommend を
-  再実行するが、OpenCode plugin の in-memory dedup map は NOSTATE 下でも
-  有効で、repeat `(session, prompt)` と skill-load 依存パスを抑制し続ける。
-  NOSTATE は永続化の抑止であり、plugin のメモリ内重複排除は残る。
+  plugin の `emitted` は context hook での実注入成功時にのみ true
+  として記録される（#225 C09: queue 投入時点ではなく drain 時点）。
+  drain 前に queue から落ちた entry は `emitted:false` で終端記録
+  される — 理由語彙は `evicted`（session/entry 上限超過）・
+  `expired`（15 分超の未 drain）・`process_exit`（exit 時の未 drain
+  flush）・`inject_failed`（system 注入失敗）の 4 種。
+- `SKILL_GRAPH_HOOK_NOSTATE=1` は**保持される session state**（dedup
+  marker・prompt dedup set・skill-load dedup set・event log）を抑止
+  する。Rust hook は repeat prompt 毎に recommend を再実行し、
+  OpenCode plugin も dedup map を bypass して同じ意味論を持つ
+  （#225 C03 で旧契約「plugin の in-memory dedup は残る」を撤回）。
+  prompt→context の pending queue は**一時輸送**であり保持 state
+  ではない — NOSTATE 下でも帰属可能 session への注入は維持され、
+  emit() は no-op のまま（event は記録されない）。process exit 時に
+  未 drain の queue は `process_exit` として flush を試みるが、
+  NOSTATE では emit が no-op のため記録は残らない。
 - `observe --summary` の `by_session` は `(runtime, session_id)` キーの
   辞書順先頭 500 session まで。`collection_errors` / `errors` /
   `errors_omitted` / `by_session_omitted` で打ち切り・収集失敗を通知する。
@@ -664,8 +675,8 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
 
 | 保証対象 | 不変条件 | 構造的機構 | 検証 |
 |---|---|---|---|
-| 入力境界（plugin） | 敵対的・巨大な host payload に対し処理量が O(budget) で有界。**全 key 反復（own・継承 enumerable を含む）がグローバル node 予算を消費する** — per-object 計上だけでは nodes×keys の総量が bound を逸脱し得る | `boundJsonValue`（depth 32 / nodes 8192 / 1 MiB、for..in 遅延走査＋early break、**yield された全 key が `n` と `st.nodes` の双方を消費**、array length は一度だけ読む — Proxy get trap の再読で確保量が検査をすり抜けない、clone は defineProperty で `__proto__` 等の特殊キーを own data property として保持）、`resultText`（全ノード計上・64 KiB）、`utf8Slice`（O(budget)）、`detectLoad` の事前 filter | `opencode-plugin.test.ts` の性質テスト: Proxy iterator/descriptor トラップで**走査量そのもの**を観測（旧実装で iters=200,001 / gopd≈50,000 を検出）、**継承 enumerable key がグローバル予算を消費することを検証**、2000 件 seeded sweep で safeSessionID 契約、200 件の乱数 result で byte budget、`__proto__` own-property 保持テスト（旧実装で key 喪失を検出） |
-| session 識別・状態分離 | session_id の正規化は ingest boundary で**一度だけ**。正規化済み id と raw id は `SessionId` 型で分離され、再 transform は型レベルで不可能。producer→detect の payload は raw id を運ぶ契約（plugin は `safeSessionID` 済み値を送らない）。sanitize は単射的（literal id が別 id の生成形状と衝突しない — `-`+32hex suffix は reserved）。正規化結果が空の session は per-session state を共有しない。runtime・正規化済み id で dedup 名前空間を分離。session_id ≤128 chars | `SessionId::normalize` が唯一の transform 地点。event constructor は `&SessionId` のみ受付。hook `event_session_id`・observe の `Rc<SessionId>`・passthrough の Deserialize 検証（不適合は lines_skipped）。detect stdin は raw 契約で `detect_all_from_payload` が一度だけ normalize。plugin detect payload は raw session_id（UTF-8 先頭 32 KiB 輸送 slice — identity domain 全体を必ず内包）を転送。**identity domain = 先頭 8192 code points は normalize 契約の内側で一度だけ定義**され、head・hash がともに domain のみから導出されるため任意長入力で O(8192) に有界。Rust `state_disabled` + `<runtime>-<session>` state file 名。plugin `attributed` gate で dedup/queue/sessionCtx/context を全 bypass。`emitted` は実際に注入可能な時のみ true | `SessionId::normalize` property sweep（3000 件 adversarial: ≤128・charset・決定性・非衝突）+ reserved-shape 衝突拒否 + `sanitize_session_id_identity_domain_is_first_8192_chars`（domain 共有 id の同一性・domain 内差異の区別・1 MiB+ 入力の有界性 — **旧実装の全文 hash で FAIL を実証**）+ `noncanonical_session_id_normalizes_once_across_entrypoints`（prompt/skill-load で同一 session_id — **旧実装で二重 transform を実際に検出**）+ `detect_normalizes_raw_session_id_once`/`detect_treats_reserved_shape_input_as_raw`（**実バイナリ**で normalize 出力と contract 形を検証）+ plugin の detect stdin が raw session_id を運ぶことを spawn capture で検証（**旧実装で normalized sid 送信を検出**）+ 20K-emoji session id が ≤32 KiB slice に制限され `safeSessionID(slice)===safeSessionID(full)` であることを spawn capture で検証 + passthrough reserved-shape verbatim + invalid session_id → lines_skipped、TS 側 parity、`anonymous session state isolation` |
+| 入力境界（plugin） | 敵対的・巨大な host payload に対し、plugin が反復・読取する処理量が O(budget) で有界。**全 key 反復（own・継承 enumerable を含む）がグローバル node 予算を消費する** — per-object 計上だけでは nodes×keys の総量が bound を逸脱し得る。**明示的境界（#225 C02）**: JS には key 数を実体化せずに列挙する primitive がなく、Proxy の ownKeys/getOwnPropertyDescriptor trap が返す key 配列は host 側で一度 materialize される — この1回の host materialization は plugin の制御外であり trusted-host 境界として契約に明記する。plugin 自身が反復・保持・serialize する量は全て MAX_INPUT_NODES / MAX_INPUT_JSON_BYTES で cap される | `boundJsonValue`（depth 32 / nodes 8192 / 1 MiB、for..in 遅延走査＋early break、**yield された全 key が `n` と `st.nodes` の双方を消費**、array length は一度だけ読む — Proxy get trap の再読で確保量が検査をすり抜けない、clone は defineProperty で `__proto__` 等の特殊キーを own data property として保持）、`resultText`（全ノード計上・64 KiB）、`utf8Slice`（O(budget)）、`detectLoad` の事前 filter | `opencode-plugin.test.ts` の性質テスト: Proxy iterator/descriptor トラップで**走査量そのもの**を観測（旧実装で iters=200,001 / gopd≈50,000 を検出）、**継承 enumerable key がグローバル予算を消費することを検証**、2000 件 seeded sweep で safeSessionID 契約、200 件の乱数 result で byte budget、`__proto__` own-property 保持テスト（旧実装で key 喪失を検出） |
+| session 識別・状態分離 | session_id の正規化は ingest boundary で**一度だけ**。正規化済み id と raw id は `SessionId` 型で分離され、再 transform は型レベルで不可能。producer→detect の payload は raw id を運ぶ契約（plugin は `safeSessionID` 済み値を送らない）。sanitize は単射的（literal id が別 id の生成形状と衝突しない — `-`+32hex suffix は reserved）。正規化結果が空の session は per-session state を共有しない。runtime・正規化済み id で dedup 名前空間を分離。session_id ≤128 chars | `SessionId::normalize` が唯一の transform 地点。event constructor は `&SessionId` のみ受付。hook `event_session_id`・observe の `Rc<SessionId>`・passthrough の Deserialize 検証（不適合は lines_skipped）。detect stdin は raw 契約で `detect_all_from_payload` が一度だけ normalize。plugin detect payload は raw session_id（UTF-8 先頭 32 KiB 輸送 slice — identity domain 全体を必ず内包）を転送。**identity domain = 先頭 8192 code points は normalize 契約の内側で一度だけ定義**され、head・hash がともに domain のみから導出されるため任意長入力で O(8192) に有界。Rust `state_disabled` + `<runtime>-<session>` state file 名。plugin は dedup/injection を分離する（#225 C03/C04）: **dedup**（prompt emitted set・loadDedup・promptSkillSeen）は STATE_ON かつ帰属可能 session のみ、**injection transport**（pending queue→context drain）は帰属可能 session なら NOSTATE 下でも動作し、drain 時に `emitted:true` を記録。dedup mark は recommend/declaredDeps 成功後にのみ立つ（失敗で retry を阻害しない）。queue entry は 15 分で expire・process exit で `process_exit` flush され、未 drain 損失は全て `emitted:false` で終端記録される。`emitted` は実際に注入成功した時のみ true | `SessionId::normalize` property sweep（3000 件 adversarial: ≤128・charset・決定性・非衝突）+ reserved-shape 衝突拒否 + `sanitize_session_id_identity_domain_is_first_8192_chars`（domain 共有 id の同一性・domain 内差異の区別・1 MiB+ 入力の有界性 — **旧実装の全文 hash で FAIL を実証**）+ `noncanonical_session_id_normalizes_once_across_entrypoints`（prompt/skill-load で同一 session_id — **旧実装で二重 transform を実際に検出**）+ `detect_normalizes_raw_session_id_once`/`detect_treats_reserved_shape_input_as_raw`（**実バイナリ**で normalize 出力と contract 形を検証）+ plugin の detect stdin が raw session_id を運ぶことを spawn capture で検証（**旧実装で normalized sid 送信を検出**）+ 20K-emoji session id が ≤32 KiB slice に制限され `safeSessionID(slice)===safeSessionID(full)` であることを spawn capture で検証 + passthrough reserved-shape verbatim + invalid session_id → lines_skipped、TS 側 parity、`anonymous session state isolation` |
 | イベント観測（funnel） | `emitted` は「model が実際に見た注入」のみを表す。recommended[] は注入集合と一致 | plugin は匿名 session に注入経路を持たないため `emitted:false` を記録（Rust は同期 response で匿名注入可能なため true で正しい — 非対称は構造由来） | session 分離テストの `emitted` assertion（匿名 false / attributed true） |
 | ファイル所有権・状態安全 | 検査と操作の間に path が差し替えられない。symlink・他人所有・hardlink を拒否。権限は 0700/0600 | state dir を `O_NOFOLLOW|O_DIRECTORY` dirfd で anchor し全操作を openat/fstatat/fchmod 化。plugin `emit()` は O_NOFOLLOW+O_NONBLOCK+uid 検査 | `tests/` の hook/adapter 系 + contracts.md TMPDIR 契約。dirfd 確立前の path 操作は存在しないことをコード構造で保証 |
 | clean-legacy 所有権 | v0.3.x 成果物のみ削除。`current` は payload 持ち X.Y.Z dir を指す symlink のみ。release dir は `skill-graph` file AND `adapters/` dir の両 marker 必須 | 二相化（全 entry を削除前 FS で classify→delete） | `tests/adapter.rs` clean_legacy 5 件（lookalike・dangling symlink・bin link・nonlegacy target）。旧実装で `current`/marker 無し dir の誤削除を実証 |

@@ -177,6 +177,36 @@ else
 fi
 printf '{"schema":"skill-graph/freeze-manifest/1","run_id":1}\n' > "$store/$TAG3/freeze-manifest.json"
 
+# 8b. Checksums-only partial publish (sums present, ZERO tarballs)
+#     -> additive recovery uploads every manifest asset (#225 A10).
+TAG4=v9.9.12
+mkdir -p "$store/$TAG4"
+cp "$d6/sha256sums.txt" "$store/$TAG4/sha256sums.txt"
+d8b="$tmp/d8b"; mkdist "$d8b"
+"$script" "$TAG4" "$d8b" >"$tmp/out8b" 2>&1 \
+  || bad "checksums-only recovery failed: $(cat "$tmp/out8b")"
+[ "$(ls "$store/$TAG4" | grep -c 'tar.gz$')" = "2" ] \
+  && [ -f "$store/$TAG4/freeze-manifest.json" ] \
+  && ok "checksums-only partial release recovered additively" \
+  || bad "checksums-only recovery wrong: $(ls "$store/$TAG4")"
+
+# 8c. No-sums release with a DIVERGENT published manifest -> refuse
+#     AND no side effects: tarballs/checksums must NOT have been
+#     uploaded before the refusal (#225 A09 read-all-then-mutate).
+TAG5=v9.9.13
+mkdir -p "$store/$TAG5"
+printf '{"different":true}\n' > "$store/$TAG5/freeze-manifest.json"
+d8c="$tmp/d8c"; mkdist "$d8c"
+if "$script" "$TAG5" "$d8c" >"$tmp/out8c" 2>&1; then
+  bad "no-sums divergent manifest was accepted"
+else
+  grep -q "differs from the" "$tmp/out8c" && ok "no-sums divergent manifest refused" \
+    || bad "wrong refusal reason: $(cat "$tmp/out8c")"
+fi
+[ "$(ls "$store/$TAG5" | wc -l)" = "1" ] \
+  && ok "refusal left zero side effects (no tarballs/checksums uploaded)" \
+  || bad "refusal had side effects: $(ls "$store/$TAG5")"
+
 # 9. Published asset missing from release (in sums, not uploaded) ->
 #    additive upload of exactly the missing asset.
 rm "$store/$TAG3/skill-graph-aarch64-apple-darwin.tar.gz"

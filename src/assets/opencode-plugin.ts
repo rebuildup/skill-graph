@@ -375,11 +375,16 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<ProcResu
   return { text: drained, exitCode, timedOut, truncated, ok }
 }
 
+// Returns null on FAILURE (spawn budget exhausted, timeout, non-zero
+// exit, truncated or unparseable output) and an array — possibly
+// empty — on success. The distinction matters for dedup (#225 C04):
+// a failed lookup must not mark the session's dedup key, or the next
+// identical prompt would be suppressed without ever being retried.
 async function recommendNames(
   query: string,
   max = 5,
   context = "",
-): Promise<{ name: string; digest?: string }[]> {
+): Promise<{ name: string; digest?: string }[] | null> {
   // No --root args: the spawned CLI inherits SKILL_GRAPH_ROOTS, and
   // resolve_roots gives that env var precedence over explicit args, so
   // argv roots would be dead whenever the env is set (#144 r17).
@@ -391,7 +396,7 @@ async function recommendNames(
   ]
   if (context) args.push("--context", context)
   const release = await acquireProc()
-  if (!release) return []
+  if (!release) return null
   let res: ProcResult
   try {
     const proc = Bun.spawn(args, {
@@ -409,7 +414,7 @@ async function recommendNames(
   }
   // A timed-out, killed, non-zero, or truncated child produced no
   // trustworthy result — do not parse partial output (#225 C11).
-  if (!res.ok) return []
+  if (!res.ok) return null
   try {
     const recs = JSON.parse(res.text) as { skill: { name: string; digest?: string } }[]
     // `recommend` output is operator-trusted but still normalized like
@@ -420,7 +425,7 @@ async function recommendNames(
       .slice(0, 64)
       .map((r) => ({ name: r.skill.name, digest: r.skill.digest }))
   } catch {
-    return []
+    return null
   }
 }
 
@@ -429,13 +434,15 @@ async function recommendNames(
 // the Rust hook — generic recommendations are never mislabeled as
 // dependencies. Output is [{name, digest}] sorted by the CLI.
 const MAX_INJECTED_DEPS = 8
+// Same failure/success distinction as recommendNames (#225 C04):
+// null = lookup failed, retry must stay possible.
 async function declaredDeps(
   skillName: string,
-): Promise<{ name: string; digest?: string }[]> {
+): Promise<{ name: string; digest?: string }[] | null> {
   const name = utf8Slice(skillName, 1024)
   if (!validSkillName(name)) return []
   const release = await acquireProc()
-  if (!release) return []
+  if (!release) return null
   let res: ProcResult
   try {
     const proc = Bun.spawn(
@@ -448,10 +455,10 @@ async function declaredDeps(
   } finally {
     release()
   }
-  if (!res.ok) return []
+  if (!res.ok) return null
   try {
     const deps = JSON.parse(res.text) as { name?: unknown; digest?: unknown }[]
-    if (!Array.isArray(deps)) return []
+    if (!Array.isArray(deps)) return null
     return deps
       .filter((d) => typeof d?.name === "string" && validSkillName(d.name))
       .slice(0, 64)
@@ -460,7 +467,7 @@ async function declaredDeps(
         digest: typeof d.digest === "string" ? d.digest : undefined,
       }))
   } catch {
-    return []
+    return null
   }
 }
 
@@ -771,11 +778,16 @@ export default Plugin.define({
   id: "skill-graph",
   async setup(ctx) {
     dbg("setup called")
-    // #225 C03: NOSTATE means NO mutable session state at all — every
-    // dedup/queue map below is bypassed, matching the Rust hook's
-    // state_disabled contract. detectCounts stays unconditional: it is
-    // a subprocess resource bound, not user-visible state, and removing
-    // it under NOSTATE would let a hostile event flood spawn children.
+    // #225 C03: NOSTATE suppresses RETAINED session state — dedup
+    // sets and event emission — matching the Rust hook's
+    // state_disabled contract. The pending queue is NOT retained
+    // state: it is transient transport between the prompt/tool hooks
+    // and the context hook, bounded per session and drained (or
+    // recorded evicted) on every context call. Disabling it under
+    // NOSTATE would make recommendation injection impossible for
+    // attributable sessions — the hook contract requires delivery.
+    // detectCounts stays unconditional: it is a subprocess resource
+    // bound, not user-visible state.
     const STATE_ON = !NOSTATE
     // sessionID -> queued injections for the next context hook. Each
     // entry carries everything needed to emit its recommendation event
@@ -789,6 +801,9 @@ export default Plugin.define({
       recs: { name: string; digest?: string }[]
       trigger: "prompt_submit" | "skill_load"
       prompt_hash?: string
+      // Set by queue() on insertion; optional at the type level so
+      // call sites do not repeat the timestamp.
+      at?: number
     }
     const pending = new Map<string, PendingEntry[]>()
     // sessionID -> skills already dependency-recommended (parity with the
@@ -803,10 +818,15 @@ export default Plugin.define({
     // sessions, but a session whose context hook never drains would
     // otherwise grow `list` for its whole lifetime (#144 r18).
     const MAX_PENDING_ENTRIES_PER_SESSION = 64
+    // A queued entry older than this never reached a context hook —
+    // the session is gone or the host stopped calling it. Evict with
+    // an emitted:false record instead of holding it forever (#225
+    // C09). The context hook normally drains within seconds.
+    const MAX_PENDING_AGE_MS = 15 * 60 * 1000
     // Dropped queue entries still get a terminal funnel record — a
     // recommendation that never reached the model must not vanish
     // silently (#225 C09).
-    const emitEvicted = (sessionID: string, entries: PendingEntry[]) => {
+    const emitEvicted = (sessionID: string, entries: PendingEntry[], reason = "evicted") => {
       for (const e of entries) {
         if (!e.recs.length) continue
         emit({
@@ -816,12 +836,22 @@ export default Plugin.define({
           prompt_hash: e.prompt_hash,
           recommended: e.recs,
           emitted: false,
-          reason: "evicted",
+          reason,
         })
       }
     }
+    // Expire stale entries in one session's queue; returns survivors.
+    const sweepExpired = (sessionID: string, list: PendingEntry[]) => {
+      const now = Date.now()
+      const fresh = list.filter((e) => now - (e.at ?? now) <= MAX_PENDING_AGE_MS)
+      if (fresh.length < list.length) {
+        emitEvicted(sessionID, list.filter((e) => now - (e.at ?? now) > MAX_PENDING_AGE_MS), "expired")
+      }
+      return fresh
+    }
     const queue = (sessionID: string, entry: PendingEntry) => {
-      if (!STATE_ON || !entry.names.length) return
+      if (!entry.names.length) return
+      entry.at = Date.now()
       if (!pending.has(sessionID) && pending.size >= MAX_PENDING_SESSIONS) {
         // FIFO-evict the oldest session; its queued context is dropped.
         const oldest = pending.keys().next().value
@@ -832,12 +862,22 @@ export default Plugin.define({
         }
       }
       const list = pending.get(sessionID) ?? []
-      list.push(entry)
-      if (list.length > MAX_PENDING_ENTRIES_PER_SESSION) {
-        emitEvicted(sessionID, list.splice(0, list.length - MAX_PENDING_ENTRIES_PER_SESSION))
+      const fresh = sweepExpired(sessionID, list)
+      fresh.push(entry)
+      if (fresh.length > MAX_PENDING_ENTRIES_PER_SESSION) {
+        emitEvicted(sessionID, fresh.splice(0, fresh.length - MAX_PENDING_ENTRIES_PER_SESSION))
       }
-      pending.set(sessionID, list)
+      pending.set(sessionID, fresh)
     }
+    // #225 C09: if the process exits with undrained queues, every
+    // queued recommendation would vanish unrecorded. emit() is
+    // synchronous, so an exit handler can still write the terminal
+    // emitted:false records. Under NOSTATE emit() is a no-op, matching
+    // the Rust hook's nostate contract.
+    process.on("exit", () => {
+      for (const [sid, list] of pending) emitEvicted(sid, list, "process_exit")
+      pending.clear()
+    })
 
     await ctx.session.hook("prompt", async (event) => {
       // prompt.text is host-supplied and unbounded: it feeds sha256
@@ -866,11 +906,13 @@ export default Plugin.define({
       // state — parity with the Rust hook's state_disabled: dedup,
       // recommendation queues, and session continuity are all bypassed
       // so distinct anonymous sessions cannot merge or leak into each
-      // other (#225 re-review).
-      const attributed = STATE_ON && sessionID !== ""
+      // other (#225 re-review). Under NOSTATE dedup is bypassed too,
+      // but the transient queue still delivers injections (#225 C03).
+      const dedup = STATE_ON && sessionID !== ""
+      const injectable = sessionID !== ""
       if (Array.isArray(skills) && skills.length > 0) {
-        let seen = attributed ? promptSkillSeen.get(sessionID) : undefined
-        if (attributed && !seen) {
+        let seen = dedup ? promptSkillSeen.get(sessionID) : undefined
+        if (dedup && !seen) {
           if (promptSkillSeen.size >= MAX_PENDING_SESSIONS) {
             const oldest = promptSkillSeen.keys().next().value
             if (oldest !== undefined) promptSkillSeen.delete(oldest)
@@ -900,19 +942,24 @@ export default Plugin.define({
       // Empty prompts carry no signal — the Rust hook exits before
       // emitting any recommendation event for them.
       if (!text) return
-      // Dedup is per-session state: unattributable sessions bypass it
-      // entirely (the Rust hook's markers are disabled for them), so
-      // identical anonymous prompts are not suppressed across sessions.
-      if (attributed) {
-        const key = sha256(`${sessionID}\n${text}`)
-        if (emitted.has(key)) return
+      // Dedup is per-session RETAINED state: unattributable sessions
+      // and NOSTATE bypass it entirely (parity with the Rust hook's
+      // markers), so identical prompts are not suppressed across
+      // sessions or under nostate.
+      const dedupKey = dedup ? sha256(`${sessionID}\n${text}`) : ""
+      if (dedupKey && emitted.has(dedupKey)) return
+      // #225 C04: null = lookup FAILED — return WITHOUT marking dedup
+      // so the next identical prompt retries instead of being
+      // suppressed by a key marked on a failed attempt.
+      const recs = await recommendNames(text, 3)
+      if (recs === null) return
+      if (dedupKey) {
         if (emitted.size >= MAX_EMITTED) {
           const oldest = emitted.values().next().value
           if (oldest !== undefined) emitted.delete(oldest)
         }
-        emitted.add(key)
+        emitted.add(dedupKey)
       }
-      const recs = await recommendNames(text, 3).catch(() => [])
       // recommended[] must equal the injected set for funnel integrity.
       const names = recs.map((r) => r.name)
       const phash = sha256(text)
@@ -928,11 +975,12 @@ export default Plugin.define({
         })
         return
       }
-      if (attributed) {
+      if (injectable) {
         // #225 C09: the recommendation event is DEFERRED to the
         // context-hook drain — emitted:true is only written when the
         // injection actually reaches the model. A queued entry that
-        // never drains is recorded emitted:false/"evicted" by queue().
+        // never drains is recorded emitted:false ("evicted"/"expired"/
+        // "process_exit") rather than silently lost.
         queue(sessionID, {
           kind: "prompt",
           names,
@@ -964,7 +1012,10 @@ export default Plugin.define({
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
       const sessionID = safeSessionID(rawSessionID(event))
-      const attributed = STATE_ON && sessionID !== ""
+      // Dedup is retained state (bypassed under NOSTATE / anonymous);
+      // injection transport is not — see the prompt hook (#225 C03).
+      const dedup = STATE_ON && sessionID !== ""
+      const injectable = sessionID !== ""
       const detected = await detectLoad(event)
       if (!detected.length) return
       // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call
@@ -983,8 +1034,8 @@ export default Plugin.define({
         // for funnel integrity.
         // Skip skills this session already got a dependency pass for —
         // unattributable sessions share no dedup state (#225 re-review).
-        let done = attributed ? loadDedup.get(sessionID) : undefined
-        if (attributed && !done) {
+        let done = dedup ? loadDedup.get(sessionID) : undefined
+        if (dedup && !done) {
           if (loadDedup.size >= MAX_PENDING_SESSIONS) {
             const oldest = loadDedup.keys().next().value
             if (oldest !== undefined) loadDedup.delete(oldest)
@@ -997,15 +1048,19 @@ export default Plugin.define({
         // was never recommended, so a later payload may still surface it
         // (same ordering as the Rust hook).
         if (recommendBudget <= 0) continue
-        done?.add(skillName)
         recommendBudget -= 1
         // #225 B08: surface only DECLARED dependencies — the same
         // `deps` definition the Rust hook uses — never generic
         // recommendations mislabeled as dependencies.
-        const deps = await declaredDeps(skillName).catch(() => [])
+        // #225 C04: mark done ONLY when the lookup SUCCEEDED (null =
+        // failure) — a failed declaredDeps must not suppress the retry
+        // a later payload deserves.
+        const deps = await declaredDeps(skillName)
+        if (deps === null) continue
+        done?.add(skillName)
         const injected = deps.slice(0, MAX_INJECTED_DEPS)
         const names = injected.map((d) => d.name)
-        if (names.length > 0 && attributed) {
+        if (names.length > 0 && injectable) {
           // #225 C09: same deferred-emission contract as the prompt
           // path — emitted:true is written only at context drain.
           queue(sessionID, {
@@ -1037,26 +1092,36 @@ export default Plugin.define({
       // getter, or any throw must fail open without breaking the
       // host's context assembly.
       try {
-        if (!STATE_ON) return
         const sessionID = safeSessionID(rawSessionID(event))
         // Anonymous sessions never queue (see the prompt hook) — an
         // empty-key lookup must not drain another session's entries.
+        // NOSTATE still drains: the queue is transient transport, not
+        // retained state (#225 C03); emit() inside is a no-op there.
         if (!sessionID) return
         const list = pending.get(sessionID)
         if (!list?.length) return
-        pending.delete(sessionID)
+        const fresh = sweepExpired(sessionID, list)
+        if (!fresh.length) {
+          pending.delete(sessionID)
+          return
+        }
         // The context-hook payload shape is runtime-defined; `system`
-        // may be absent or non-array. Fail open rather than throw
-        // inside the plugin host.
+        // may be absent or non-array. Ensure it BEFORE consuming the
+        // queue: if the assignment fails, the entries are recorded
+        // evicted rather than silently dropped with pending.delete
+        // already done (#225 C10).
         if (!Array.isArray(event.system)) {
           try {
             ;(event as { system?: unknown }).system = []
           } catch {
+            pending.delete(sessionID)
+            emitEvicted(sessionID, fresh, "inject_failed")
             return
           }
         }
+        pending.delete(sessionID)
         const system = event.system as { type: string; text: string }[]
-        for (const entry of list) {
+        for (const entry of fresh) {
           const text =
             entry.kind === "deps"
               ? `skill-graph: a skill declares dependencies — ${entry.names.join(", ")}. Read the matching SKILL.md files if the task needs them.`

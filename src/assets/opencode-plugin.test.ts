@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test"
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs"
+import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
 import { createHash } from "node:crypto"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -24,12 +24,17 @@ writeFileSync(
   // reliable observation point.
   '#!/bin/sh\ninput="$(cat 2>/dev/null || true)"\n' +
     'if [ "$1" = "detect" ]; then printf \'%s\' "$input" > "$0.capture"; fi\n' +
+    // `recommend`/`deps` fail (exit 1) while <fakeBin>.fail exists —
+    // lets tests distinguish lookup FAILURE (null, retryable) from an
+    // empty successful result (#225 C04).
+    'if [ "$1" = "recommend" ] && [ -f "$0.fail" ]; then exit 1; fi\n' +
     'if [ "$1" = "recommend" ]; then ' +
     'printf \'%s\' \'[{"skill":{"name":"alpha","digest":"d1"}},{"skill":{"name":"beta","digest":"d2"}}]\'\n' +
     "fi\n" +
     // `deps` returns declared requires only (#225 B08) — distinct from
     // the generic recommend result so mislabeled recommendations would
     // be observable.
+    'if [ "$1" = "deps" ] && [ -f "$0.fail" ]; then exit 1; fi\n' +
     'if [ "$1" = "deps" ]; then ' +
     'printf \'%s\' \'[{"name":"dep-one","digest":"dd1"},{"name":"dep-two","digest":"dd2"}]\'\n' +
     "fi\n",
@@ -365,6 +370,28 @@ describe("anonymous session state isolation (#225)", () => {
     expect(evicted[0].recommended.length).toBeGreaterThan(0)
   })
 
+  test("a failed recommend does NOT mark dedup — the retry is delivered (#225 C04)", async () => {
+    const handlers = await setupPlugin()
+    const prompt = handlers["session:prompt"]
+    const context = handlers["session:context"]
+    const failFlag = `${fakeBin}.fail`
+
+    // First attempt: the CLI fails (exit 1). Under the old contract the
+    // dedup key was marked BEFORE the lookup, so this failure would
+    // suppress every later identical prompt forever.
+    writeFileSync(failFlag, "")
+    await prompt({ sessionID: "s-retry", prompt: { text: "retry-unique-eee" } })
+    unlinkSync(failFlag)
+
+    // Retry with the same (session, prompt): must run recommend again
+    // and queue the injection — dedup was never marked.
+    await prompt({ sessionID: "s-retry", prompt: { text: "retry-unique-eee" } })
+    const ev = { sessionID: "s-retry", system: [] as { type: string; text: string }[] }
+    await context(ev)
+    expect(ev.system.length).toBe(1)
+    expect(ev.system[0].text).toContain("alpha")
+  })
+
   test("a failed context injection records inject_failed, never emitted:true (#225 C09/C10)", async () => {
     const handlers = await setupPlugin()
     const prompt = handlers["session:prompt"]
@@ -383,6 +410,82 @@ describe("anonymous session state isolation (#225)", () => {
     expect(recs).toHaveLength(1)
     expect(recs[0].emitted).toBe(false)
     expect(recs[0].reason).toBe("inject_failed")
+  })
+})
+
+// NOSTATE contract (#225 C03): SKILL_GRAPH_HOOK_NOSTATE suppresses
+// RETAINED state — dedup sets and event emission — but the pending
+// queue is transient transport, not retained state. Under NOSTATE an
+// attributable session must STILL receive injections (dedup bypassed,
+// so repeats re-inject), while emit() stays a no-op. NOSTATE is read
+// at module load, so this runs in a subprocess with a stubbed
+// @opencode/plugin resolution.
+describe("NOSTATE injection transport (#225 C03)", () => {
+  test("NOSTATE delivers injections, bypasses dedup, records no events", () => {
+    const dir = mkdtempSync(join(tmpdir(), "sg-nostate-"))
+    const plugDir = join(dir, "node_modules", "@opencode", "plugin")
+    mkdirSync(plugDir, { recursive: true })
+    writeFileSync(
+      join(plugDir, "package.json"),
+      JSON.stringify({ name: "@opencode/plugin", version: "0.0.0", type: "module", main: "index.js", exports: { ".": "./index.js" } }),
+    )
+    writeFileSync(
+      join(plugDir, "index.js"),
+      "export const Plugin = { define: (c) => c }\n",
+    )
+    copyFileSync(
+      join(import.meta.dir, "opencode-plugin.ts"),
+      join(dir, "opencode-plugin.ts"),
+    )
+    writeFileSync(
+      join(dir, "driver.ts"),
+      `
+const plugin = (await import("./opencode-plugin.ts")).default
+const handlers = {}
+const ctx = {
+  session: { hook: async (n, f) => { handlers["session:" + n] = f } },
+  tool: { hook: async (n, f) => { handlers["tool:" + n] = f } },
+}
+await plugin.setup(ctx)
+const drain = async (sid) => {
+  const ev = { sessionID: sid, system: [] }
+  await handlers["session:context"](ev)
+  return ev.system.length
+}
+// Two IDENTICAL prompts: with dedup bypassed under NOSTATE, both
+// must queue and both must inject.
+await handlers["session:prompt"]({ sessionID: "s-ns", prompt: { text: "nostate-inject-1" } })
+const first = await drain("s-ns")
+await handlers["session:prompt"]({ sessionID: "s-ns", prompt: { text: "nostate-inject-1" } })
+const second = await drain("s-ns")
+console.log(JSON.stringify({ first, second }))
+`,
+    )
+    const logPath = join(dir, "events.jsonl")
+    const proc = Bun.spawnSync({
+      cmd: [process.execPath, join(dir, "driver.ts")],
+      cwd: dir,
+      env: {
+        ...process.env,
+        SKILL_GRAPH_HOOK_NOSTATE: "1",
+        SKILL_GRAPH_BIN: fakeBin,
+        SKILL_GRAPH_EVENT_LOG: logPath,
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    })
+    expect(proc.exitCode).toBe(0)
+    const lines = proc.stdout.toString().trim().split("\n")
+    const out = JSON.parse(lines[lines.length - 1])
+    // Injection transport works under NOSTATE for attributable
+    // sessions — the old contract disabled queue+context entirely.
+    expect(out.first).toBe(1)
+    // Dedup is bypassed: the identical repeat re-injected.
+    expect(out.second).toBe(1)
+    // emit() is a no-op under NOSTATE: no event log is written.
+    let log = ""
+    try { log = readFileSync(logPath, "utf8") } catch {}
+    expect(log).not.toContain('"recommendation"')
   })
 })
 

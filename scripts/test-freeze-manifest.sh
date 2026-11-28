@@ -30,11 +30,21 @@ expect_reject() { local d="$1"; shift; if verify "$@" >/dev/null 2>&1; then fail
 sha() { sha256sum "$1" 2>/dev/null | awk '{print $1}' || shasum -a 256 "$1" | awk '{print $1}'; }
 
 # --- synthetic manifest + artifact tree -------------------------------
-mkdir -p "$work/arts/frozen-linux-x64" "$work/arts/approved-manifest"
+# The approved set is EXACTLY 10 artifacts (#225 A03): 4 release
+# tarballs, 4 platform npm tgz, 1 metapackage tgz, 1 crate.
+mkdir -p "$work/arts/approved-manifest"
 art="$work/arts"
 export art
-printf 'tarball-bytes\n' > "$art/frozen-linux-x64/skill-graph-x86_64-unknown-linux-gnu.tar.gz"
-printf 'tgz-bytes\n'    > "$art/frozen-linux-x64/rebuildup-skill-graph-linux-x64-0.5.0.tgz"
+RTS="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin"
+NTS="linux-x64 linux-arm64 darwin-x64 darwin-arm64"
+for t in $RTS; do
+  mkdir -p "$art/frozen-$t"
+  printf 'tarball-%s\n' "$t" > "$art/frozen-$t/skill-graph-$t.tar.gz"
+done
+for t in $NTS; do
+  mkdir -p "$art/frozen-$t"
+  printf 'tgz-%s\n' "$t" > "$art/frozen-$t/rebuildup-skill-graph-$t-0.5.0.tgz"
+done
 printf 'meta-tgz\n'    > "$art/approved-manifest/rebuildup-skill-graph-0.5.0.tgz"
 printf 'crate-bytes\n' > "$art/approved-manifest/skill-graph-0.5.0.crate"
 
@@ -46,20 +56,17 @@ import hashlib, json, os, sys
 art, sha_, rid, att = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 def h(p):
     return hashlib.sha256(open(p,'rb').read()).hexdigest()
-arts = {
-  "skill-graph-x86_64-unknown-linux-gnu.tar.gz": ("release","x86_64-unknown-linux-gnu","frozen-linux-x64/"),
-  "rebuildup-skill-graph-linux-x64-0.5.0.tgz": ("npm","linux-x64","frozen-linux-x64/"),
-  "rebuildup-skill-graph-0.5.0.tgz": ("npm-meta",None,"approved-manifest/"),
-  "skill-graph-0.5.0.crate": ("crates",None,"approved-manifest/"),
-}
-out = {}
-for name,(ch,tgt,sub) in arts.items():
-    e = {"sha256": h(os.path.join(art,sub,name)), "channel": ch}
-    if tgt: e["target"] = tgt
-    out[name] = e
+arts = {}
+for t in ["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-apple-darwin"]:
+    n=f"skill-graph-{t}.tar.gz"; arts[n]={"sha256":h(f"{art}/frozen-{t}/{n}"),"channel":"release","target":t}
+for t in ["linux-x64","linux-arm64","darwin-x64","darwin-arm64"]:
+    n=f"rebuildup-skill-graph-{t}-0.5.0.tgz"; arts[n]={"sha256":h(f"{art}/frozen-{t}/{n}"),"channel":"npm","target":t}
+for n,ch,sub in [("rebuildup-skill-graph-0.5.0.tgz","npm-meta","approved-manifest"),
+                 ("skill-graph-0.5.0.crate","crates","approved-manifest")]:
+    arts[n]={"sha256":h(f"{art}/{sub}/{n}"),"channel":ch}
 m = {"schema":"skill-graph/freeze-manifest/1","workflow":"artifact-verify.yml",
      "event":"push","ref":"refs/heads/release-0-5-0","head_sha":sha_,
-     "run_id":rid,"run_attempt":att,"artifacts":out}
+     "run_id":rid,"run_attempt":att,"artifacts":arts}
 open(os.path.join(art,"approved-manifest","freeze-manifest.json"),"w").write(json.dumps(m,indent=2,sort_keys=True)+"\n")
 PY
 
@@ -75,6 +82,37 @@ if python3 "$VERIFY" "$MAN" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --he
 if python3 "$VERIFY" "$MAN" --run-id "$RUN_ID" --run-attempt "$RUN_ATTEMPT" --head-sha "$HEAD_SHA" --event pull_request --artifact-dir "$art" >/dev/null 2>&1; then
   fail "wrong event accepted"; else ok "wrong event rejected"; fi
 expect_reject "absent required channel rejected" --require-channel bogus
+# ref must match the pinned run's ref exactly (#225 A04)
+expect_ok "expected ref accepted" --expect-ref refs/heads/release-0-5-0 --expect-ref refs/tags/v0.5.0
+expect_reject "wrong ref rejected" --expect-ref refs/heads/other
+expect_reject "bare refs/ prefix no longer suffices" --expect-ref refs/heads
+
+# artifact-set strictness (#225 A03): drop one release tarball from the
+# manifest -> count/target checks must reject even though digests match
+python3 - "$MAN" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+del m["artifacts"]["skill-graph-x86_64-apple-darwin.tar.gz"]
+open(sys.argv[1],"w").write(json.dumps(m,indent=2,sort_keys=True)+"\n")
+PY
+expect_reject "9-artifact manifest rejected"
+# restore the full manifest for the remaining cases
+python3 - "$art" "$HEAD_SHA" "$RUN_ID" "$RUN_ATTEMPT" <<'PY'
+import hashlib, json, os, sys
+art, sha_, rid, att = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+def h(p): return hashlib.sha256(open(p,'rb').read()).hexdigest()
+arts = {}
+for t in ["x86_64-unknown-linux-gnu","aarch64-unknown-linux-gnu","aarch64-apple-darwin","x86_64-apple-darwin"]:
+    n=f"skill-graph-{t}.tar.gz"; arts[n]={"sha256":h(f"{art}/frozen-{t}/{n}"),"channel":"release","target":t}
+for t in ["linux-x64","linux-arm64","darwin-x64","darwin-arm64"]:
+    n=f"rebuildup-skill-graph-{t}-0.5.0.tgz"; arts[n]={"sha256":h(f"{art}/frozen-{t}/{n}"),"channel":"npm","target":t}
+for n,ch in [("rebuildup-skill-graph-0.5.0.tgz","npm-meta"),("skill-graph-0.5.0.crate","crates")]:
+    arts[n]={"sha256":h(f"{art}/approved-manifest/{n}"),"channel":ch}
+m = {"schema":"skill-graph/freeze-manifest/1","workflow":"artifact-verify.yml",
+     "event":"push","ref":"refs/heads/release-0-5-0","head_sha":sha_,
+     "run_id":rid,"run_attempt":att,"artifacts":arts}
+open(os.path.join(art,"approved-manifest","freeze-manifest.json"),"w").write(json.dumps(m,indent=2,sort_keys=True)+"\n")
+PY
 
 # corrupt one artifact
 printf 'tampered\n' > "$art/approved-manifest/skill-graph-0.5.0.crate"

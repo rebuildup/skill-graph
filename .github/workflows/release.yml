@@ -1,15 +1,21 @@
 name: Release
+# #225 A01/A02: the ONLY promotion path is an explicit dispatch pinned
+# to ONE approved freeze run AND the approved manifest's sha256. A
+# tag push no longer publishes anything — the tag-triggered
+# artifact-verify run is a fresh freeze whose bytes were never the
+# approval target.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build release assets for"
+        description: "Existing tag to publish release assets for"
         required: true
       freeze_run_id:
-        description: "artifact-verify run ID whose frozen artifacts to promote (required for dispatch; tag push resolves the run triggered by that tag)"
-        required: false
+        description: "artifact-verify run ID whose frozen artifacts to promote (the APPROVED freeze run)"
+        required: true
+      freeze_manifest_sha256:
+        description: "sha256 of the APPROVED freeze-manifest.json (the approval record digest)"
+        required: true
 
 permissions:
   contents: write
@@ -29,7 +35,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Dispatch-only workflow: the tag input names the release
+          # tag; github.ref would be the dispatch branch, not the tag.
+          ref: ${{ github.event.inputs.tag }}
       - name: Bind checkout to the release tag commit
         id: tag
         env:
@@ -82,14 +90,9 @@ jobs:
         run: |
           set -euo pipefail
           # The approval target is pinned to ONE freeze run — never
-          # "whatever succeeded most recently" (#225 r11). Two ways to
-          # name it:
-          #   * workflow_dispatch freeze_run_id — explicit pin; the
-          #     operator picks the verified run after reviewing CI.
-          #   * tag push — the artifact-verify run TRIGGERED BY THIS
-          #     TAG (event=push, head_branch=<tag>). Same commit =>
-          #     same inputs, but the binding is still to a specific
-          #     run id, not a latest-success query.
+          # "whatever succeeded most recently" and never an implicitly
+          # resolved run (#225 A01/A02). workflow_dispatch requires an
+          # explicit freeze_run_id; there is no tag-push fallback.
           validate_run() {
             local id="$1" j
             j="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id")" || return 1
@@ -112,28 +115,10 @@ jobs:
             RUN_EVENT="$(jq -r '.event' <<< "$j")"
             RUN_REF="$(jq -r '.head_branch' <<< "$j")"
           }
-          if [ -n "$FREEZE_RUN_ID_INPUT" ]; then
-            [[ "$FREEZE_RUN_ID_INPUT" =~ ^[0-9]+$ ]] || {
-              echo "invalid freeze_run_id: $FREEZE_RUN_ID_INPUT" >&2; exit 1; }
-            validate_run "$FREEZE_RUN_ID_INPUT"
-            run_id="$FREEZE_RUN_ID_INPUT"
-          else
-            run_id=""
-            for i in $(seq 1 80); do
-              run_id="$(gh api \
-                "repos/$GITHUB_REPOSITORY/actions/workflows/artifact-verify.yml/runs?head_sha=$TAG_SHA&status=success&per_page=50" \
-                --jq "[.workflow_runs[] | select(.event==\"push\" and .head_branch==\"$RELEASE_TAG\")][0].id // empty" \
-                2>/dev/null || true)"
-              [ -n "$run_id" ] && break
-              if [ "$i" = "80" ]; then
-                echo "no artifact-verify run triggered by tag $RELEASE_TAG for $TAG_SHA after 40min" >&2
-                echo "freeze the commit first (push the tag and let artifact-verify finish)," >&2
-                echo "or re-run this workflow with an explicit freeze_run_id." >&2
-                exit 1
-              fi
-              sleep 30
-            done
-          fi
+          [[ "$FREEZE_RUN_ID_INPUT" =~ ^[0-9]+$ ]] || {
+            echo "invalid freeze_run_id: $FREEZE_RUN_ID_INPUT" >&2; exit 1; }
+          validate_run "$FREEZE_RUN_ID_INPUT"
+          run_id="$FREEZE_RUN_ID_INPUT"
           # Re-validate the resolved run through the same promotable
           # definition — the list query is a filter, not a proof.
           validate_run "$run_id"
@@ -141,31 +126,55 @@ jobs:
           {
             echo "FREEZE_RUN_ID=$run_id"
             echo "FREEZE_RUN_ATTEMPT=$RUN_ATTEMPT"
+            echo "FREEZE_RUN_REF=$RUN_REF"
           } >> "$GITHUB_ENV"
       - name: Download frozen artifacts; verify the APPROVED manifest and every digest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_SHA: ${{ needs.verify.outputs.tag_sha }}
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          APPROVED_MANIFEST_SHA256: ${{ github.event.inputs.freeze_manifest_sha256 }}
         run: |
           set -euo pipefail
           mkdir -p dist frozen
           gh run download "$FREEZE_RUN_ID" --dir frozen
           # The approval record is the freeze-manifest.json produced by
           # the pinned run's freeze-manifest job — NOT something this
-          # job regenerates (#225 A02). verify-freeze-manifest.py binds
-          # it to run id + attempt + head_sha + event, then proves
-          # EVERY listed artifact exists exactly once across the
-          # downloaded frozen-* and approved-manifest dirs with its
-          # recorded sha256 (#225 A01/A03/A05).
+          # job regenerates (#225 A02). FIRST bind it to the digest
+          # the approver pinned as a separate dispatch input (#225
+          # A05): a manifest that merely parses is not THE approved
+          # record. THEN verify-freeze-manifest.py binds identity
+          # (run/attempt/sha/event/ref) and proves EVERY listed
+          # artifact exists exactly once across the downloaded
+          # frozen-* and approved-manifest dirs with its recorded
+          # sha256 (#225 A01/A03/A04).
           manifest="frozen/approved-manifest/freeze-manifest.json"
           [ -f "$manifest" ] || {
             echo "approved-manifest artifact missing freeze-manifest.json" >&2; exit 1; }
+          [[ "$APPROVED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "invalid freeze_manifest_sha256 input" >&2; exit 1; }
+          got_manifest_sha="$(sha256sum "$manifest" | awk '{print $1}')"
+          [ "$got_manifest_sha" = "$APPROVED_MANIFEST_SHA256" ] || {
+            echo "freeze-manifest.json digest $got_manifest_sha != approved $APPROVED_MANIFEST_SHA256" >&2
+            echo "this is NOT the approved manifest — refusing to promote." >&2
+            exit 1; }
+          # The manifest's ref must correspond to the PINNED run's
+          # head_branch: refs/heads/<b> for branch pushes, refs/tags/<t>
+          # for tag pushes (#225 A04).
+          expect_refs=()
+          case "$FREEZE_RUN_REF" in
+            "") echo "pinned run head_branch unresolved" >&2; exit 1 ;;
+            *)
+              expect_refs+=(--expect-ref "refs/heads/$FREEZE_RUN_REF")
+              expect_refs+=(--expect-ref "refs/tags/$FREEZE_RUN_REF")
+              ;;
+          esac
           python3 scripts/verify-freeze-manifest.py "$manifest" \
             --run-id "$FREEZE_RUN_ID" \
             --run-attempt "$FREEZE_RUN_ATTEMPT" \
             --head-sha "$TAG_SHA" \
             --event push \
+            "${expect_refs[@]}" \
             --require-channel release \
             --require-channel npm \
             --require-channel npm-meta \

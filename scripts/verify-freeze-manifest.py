@@ -37,6 +37,25 @@ CHANNELS = {"release", "npm", "npm-meta", "crates"}
 NAME_RE = re.compile(r"^[A-Za-z0-9@._/+~-]+$")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# The approved artifact SET is fixed (#225 A03): exactly these
+# channels/counts/targets, with name<->channel<->target correspondence.
+# Anything extra, missing, or mislabeled is rejected — a manifest that
+# merely "contains" the right digests somewhere is not the approval
+# record.
+EXPECTED_COUNTS = {"release": 4, "npm": 4, "npm-meta": 1, "crates": 1}
+RELEASE_TARGETS = {
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+}
+RELEASE_NAME_RE = re.compile(r"^skill-graph-(.+)\.tar\.gz$")
+NPM_NAME_RE = re.compile(
+    r"^rebuildup-skill-graph-(linux-x64|linux-arm64|darwin-x64|darwin-arm64)-[^/]+\.tgz$"
+)
+NPM_META_NAME_RE = re.compile(r"^rebuildup-skill-graph-[0-9][^/]*\.tgz$")
+CRATE_NAME_RE = re.compile(r"^skill-graph-[0-9][^/]*\.crate$")
+
 
 def fail(msg):
     print(f"freeze-manifest: {msg}", file=sys.stderr)
@@ -60,6 +79,11 @@ def main():
     ap.add_argument("--event", required=True)
     ap.add_argument("--artifact-dir", action="append", default=[])
     ap.add_argument("--require-channel", action="append", default=[])
+    # Exact git ref(s) the manifest's `ref` must equal — derived by the
+    # caller from the PINNED run's head_branch (refs/heads/<b> or
+    # refs/tags/<t>). A bare "starts with refs/" check let a manifest
+    # claim any ref (#225 A04).
+    ap.add_argument("--expect-ref", action="append", default=[])
     args = ap.parse_args()
 
     try:
@@ -83,12 +107,19 @@ def main():
         if m.get(key) != want:
             fail(f"{key} {m.get(key)!r} != expected {want!r}")
     ref = m.get("ref")
-    if not isinstance(ref, str) or not ref.startswith("refs/"):
+    if args.expect_ref:
+        if ref not in args.expect_ref:
+            fail(f"ref {ref!r} not in expected {args.expect_ref}")
+    elif not isinstance(ref, str) or not ref.startswith("refs/"):
         fail(f"ref {ref!r} is not a git ref")
 
     arts = m.get("artifacts")
     if not isinstance(arts, dict) or not arts:
         fail("manifest has no artifacts map")
+
+    # ---- strict artifact set (A03): exactly 10 entries, fixed
+    # channel counts, and name<->channel<->target correspondence ----
+    counts = {}
     for name, meta in arts.items():
         if not NAME_RE.match(name):
             fail(f"artifact name {name!r} is not a safe filename")
@@ -100,14 +131,33 @@ def main():
         ch = meta.get("channel")
         if ch not in CHANNELS:
             fail(f"artifact {name}: unknown channel {ch!r}")
-        if ch == "release" and not (
-            name.startswith("skill-graph-") and name.endswith(".tar.gz")
-        ):
-            fail(f"artifact {name}: release channel name mismatch")
-        if "target" in meta and not isinstance(meta["target"], str):
-            fail(f"artifact {name}: target is not a string")
+        counts[ch] = counts.get(ch, 0) + 1
+        target = meta.get("target")
+        if ch == "release":
+            mm = RELEASE_NAME_RE.match(name)
+            if not mm or mm.group(1) not in RELEASE_TARGETS:
+                fail(f"artifact {name}: release name/target mismatch")
+            if target != mm.group(1):
+                fail(f"artifact {name}: target {target!r} != name target {mm.group(1)!r}")
+        elif ch == "npm":
+            mm = NPM_NAME_RE.match(name)
+            if not mm:
+                fail(f"artifact {name}: npm platform name mismatch")
+            if target != mm.group(1):
+                fail(f"artifact {name}: target {target!r} != name target {mm.group(1)!r}")
+        elif ch == "npm-meta":
+            if target is not None or not NPM_META_NAME_RE.match(name):
+                fail(f"artifact {name}: npm-meta name/target mismatch")
+        elif ch == "crates":
+            if target is not None or not CRATE_NAME_RE.match(name):
+                fail(f"artifact {name}: crates name/target mismatch")
+    if len(arts) != sum(EXPECTED_COUNTS.values()):
+        fail(f"artifact count {len(arts)} != {sum(EXPECTED_COUNTS.values())}")
+    for ch, want in EXPECTED_COUNTS.items():
+        if counts.get(ch, 0) != want:
+            fail(f"channel {ch}: {counts.get(ch, 0)} artifacts != {want}")
 
-    channels = {a["channel"] for a in arts.values()}
+    channels = set(counts)
     for req in args.require_channel:
         if req not in channels:
             fail(f"required channel {req!r} absent from manifest")

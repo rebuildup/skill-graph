@@ -39,15 +39,38 @@
 #           (see #225 pending items); the artifact contract is proven
 #           here.
 #
-# Usage: scripts/verify-install-local.sh [artifact-dir]
-#   artifact-dir defaults to cwd; must contain
+# Usage:
+#   verify-install-local.sh [artifact-dir]            (legacy dev mode)
+#   verify-install-local.sh --tarball-only DIR        (frozen leg set:
+#       DIR holds the leg's freeze/ output — tarball + .sha256 +
+#       platform npm tgz + freeze-meta.json; digests are verified
+#       against freeze-meta.json before anything is installed)
+#   verify-install-local.sh --frozen-set ROOT         (the APPROVED
+#       10-artifact set: ROOT contains frozen-*/ dirs and the dir
+#       holding freeze-manifest.json + meta tgz + .crate. Every
+#       consumed file's sha256 is verified against the manifest
+#       BEFORE install — verified bytes == installed bytes ==
+#       promoted bytes (#225 A06/F03). Nothing is re-packed.)
+#
+# artifact-dir (legacy/default) must contain
 #   skill-graph-<host-triple>.tar.gz (package-target.sh output).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 cd "$root"
-artifact_dir="${1:-$PWD}"
+
+frozen_set=""
+tarball_only=""
+artifact_dir=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --frozen-set)   frozen_set="$2"; shift 2 ;;
+    --tarball-only) tarball_only="$2"; shift 2 ;;
+    *)              artifact_dir="$1"; shift ;;
+  esac
+done
+artifact_dir="${artifact_dir:-$PWD}"
 
 host_triple="$(rustc -vV | sed -n 's/^host: //p')"
 [ -n "$host_triple" ] || { echo "cannot determine rustc host triple" >&2; exit 1; }
@@ -61,12 +84,68 @@ case "$host_triple" in
 esac
 
 version="$(grep -m1 '^version' Cargo.toml | sed -E 's/^version = "([^"]+)".*/\1/')"
-tgz="$artifact_dir/skill-graph-${host_triple}.tar.gz"
-[ -f "$tgz" ] || {
-  echo "frozen artifact not found: $tgz" >&2
-  echo "run scripts/package-target.sh $host_triple $npm_target first" >&2
-  exit 1
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}';
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
 }
+
+# ---- frozen-mode resolution (#225 A06/F03) --------------------------
+# The bytes installed below MUST be the bytes the approved manifest
+# digests — never a local re-pack. Three modes:
+#   legacy        — dev convenience: pack from the source tree.
+#   tarball-only  — one freeze leg's output; digests proven against
+#                   freeze-meta.json.
+#   frozen-set    — the whole approved set; digests proven against
+#                   freeze-manifest.json via verify-freeze-manifest.py.
+run_cargo=1 run_npm=1 run_brew=1
+prev_tag="${SKILL_GRAPH_PREV_TAG:-v0.4.1}"
+
+if [ -n "$tarball_only" ]; then
+  run_cargo=0 run_npm=0
+  artifact_dir="$tarball_only"
+  tgz="$artifact_dir/skill-graph-${host_triple}.tar.gz"
+  [ -f "$tgz" ] || { echo "frozen tarball not found: $tgz" >&2; exit 1; }
+  meta="$artifact_dir/freeze-meta.json"
+  [ -f "$meta" ] || { echo "missing freeze-meta.json in $artifact_dir" >&2; exit 1; }
+  # Digest correlation BEFORE any install: tarball bytes must equal
+  # the digest the freeze run recorded for THIS asset.
+  want="$(python3 -c "import json;m=json.load(open('$meta'));assert m['asset']=='skill-graph-${host_triple}.tar.gz';print(m['sha256'])")"
+  got="$(sha256_of "$tgz")"
+  [ "$got" = "$want" ] || { echo "tarball digest != freeze-meta ($got != $want)" >&2; exit 1; }
+  # The platform npm tgz frozen alongside must match its sidecar.
+  plat_tgz="$(find "$artifact_dir" -maxdepth 1 -name 'rebuildup-skill-graph-*.tgz' -print -quit)"
+  [ -n "$plat_tgz" ] || { echo "platform npm tgz missing in $artifact_dir" >&2; exit 1; }
+  psha="$(sha256_of "$plat_tgz")"
+  pside="$(awk '{print $1}' "$plat_tgz.sha256" 2>/dev/null || true)"
+  [ -n "$pside" ] && [ "$psha" = "$pside" ] || {
+    echo "platform npm tgz digest mismatch" >&2; exit 1; }
+elif [ -n "$frozen_set" ]; then
+  # Locate the approval record and prove EVERY artifact it names
+  # exists exactly once under frozen_set with its recorded digest —
+  # the same check release promotion runs (#225 A05/A06).
+  manifest_path="$(find "$frozen_set" -name freeze-manifest.json -type f -print -quit)"
+  [ -n "$manifest_path" ] || { echo "freeze-manifest.json not found under $frozen_set" >&2; exit 1; }
+  [ "$(find "$frozen_set" -name freeze-manifest.json -type f | wc -l)" -eq 1 ] || {
+    echo "multiple freeze-manifest.json under $frozen_set" >&2; exit 1; }
+  m="$manifest_path"
+  python3 "$here/verify-freeze-manifest.py" "$m" \
+    --run-id "$(python3 -c "import json;print(json.load(open('$m'))['run_id'])")" \
+    --run-attempt "$(python3 -c "import json;print(json.load(open('$m'))['run_attempt'])")" \
+    --head-sha "$(python3 -c "import json;print(json.load(open('$m'))['head_sha'])")" \
+    --event "$(python3 -c "import json;print(json.load(open('$m'))['event'])")" \
+    --artifact-dir "$frozen_set" >/dev/null
+  # The host tarball is the release-channel artifact for host_triple.
+  tgz="$(find "$frozen_set" -type f -name "skill-graph-${host_triple}.tar.gz" -print -quit)"
+  [ -n "$tgz" ] || { echo "release artifact for $host_triple missing in frozen set" >&2; exit 1; }
+else
+  tgz="$artifact_dir/skill-graph-${host_triple}.tar.gz"
+  [ -f "$tgz" ] || {
+    echo "frozen artifact not found: $tgz" >&2
+    echo "run scripts/package-target.sh $host_triple $npm_target first" >&2
+    exit 1
+  }
+fi
 
 fails=0
 ok()   { echo "PASS: $1"; }
@@ -268,11 +347,66 @@ out="$("$tmp/skill-graph" --version)"
 # upload; extracting it and `cargo install --path`-ing the extracted
 # sources proves the published artifact compiles, installs, runs,
 # and uninstalls (#225 r10 — path install alone never touched the
-# packaged file set).
+# packaged file set). In --frozen-set mode the .crate is the
+# MANIFEST-DIGESTED artifact itself — no re-pack (#225 A06/F03).
 # ------------------------------------------------------------------
 cargo_root="$tmp/cargo-root"
 crate_dir="$tmp/crate"
-if cargo package --allow-dirty --locked >/dev/null 2>&1; then
+if [ "$run_cargo" -eq 0 ]; then
+  echo "SKIP: cargo channel not in this frozen leg set"
+elif [ -n "$frozen_set" ]; then
+  crate="$(find "$frozen_set" -name 'skill-graph-*.crate' -type f -print -quit)"
+  if [ -n "$crate" ] && mkdir -p "$crate_dir" \
+     && tar -xzf "$crate" -C "$crate_dir"; then
+    pkg_dir="$crate_dir/skill-graph-$version"
+    if [ -d "$pkg_dir" ] \
+       && cargo install --path "$pkg_dir" --root "$cargo_root" --locked >/dev/null 2>&1; then
+      cbin="$cargo_root/bin/skill-graph"
+      cout="$("$cbin" --version)"
+      [ "$cout" = "skill-graph $version" ] \
+        && ok "crate(frozen) install --version ($cout)" \
+        || bad "crate(frozen) install --version got '$cout'"
+      hook_corpus "$cbin" "verify-crate-$$-$RANDOM" \
+        && ok "crate(frozen) install hook corpus (5 prompts)" \
+        || bad "crate(frozen) install hook output"
+      interface_smoke "$cbin" \
+        && ok "crate(frozen) install public interfaces" \
+        || bad "crate(frozen) install interface smoke"
+      # REAL upgrade path (#225 A06/F03): install a PREVIOUS version
+      # first, then the frozen crate over it — same-version reinstall
+      # is not an upgrade test. crates.io has no prior publish of
+      # skill-graph, so the "before" state is the same packaged
+      # sources with the version field rolled back — a genuine
+      # different-version install through cargo's own resolution.
+      prev_dir="$tmp/crate-prev"
+      if mkdir -p "$prev_dir" && cp -r "$pkg_dir/." "$prev_dir/" \
+         && sed -i "s/^version = \"$version\"/version = \"${prev_tag#v}\"/" "$prev_dir/Cargo.toml" \
+         && cargo install --path "$prev_dir" --root "$cargo_root" >/dev/null 2>&1; then
+        prev_out="$("$cbin" --version 2>/dev/null || true)"
+        # Now install the FROZEN crate over the previous version.
+        if cargo install --path "$pkg_dir" --root "$cargo_root" --locked >/dev/null 2>&1 \
+           || cargo install --path "$pkg_dir" --root "$cargo_root" --locked --force >/dev/null 2>&1; then
+          up_out="$("$cbin" --version 2>/dev/null || true)"
+          [ "$up_out" = "skill-graph $version" ] \
+            && ok "crate upgrade ${prev_tag#v} -> $version ($prev_out -> $up_out)" \
+            || bad "crate upgrade left '$up_out', want 'skill-graph $version'"
+        else
+          bad "crate upgrade install over $prev_tag"
+        fi
+      else
+        bad "crate previous-version install ($prev_tag)"
+      fi
+      cargo uninstall --root "$cargo_root" skill-graph >/dev/null 2>&1 \
+        && [ ! -e "$cbin" ] \
+        && ok "crate uninstall lifecycle" \
+        || bad "crate uninstall lifecycle"
+    else
+      bad "cargo install from frozen .crate"
+    fi
+  else
+    bad "frozen .crate extract"
+  fi
+elif cargo package --allow-dirty --locked >/dev/null 2>&1; then
   crate="$(ls -t target/package/skill-graph-*.crate 2>/dev/null | head -1)"
   if [ -n "$crate" ] && mkdir -p "$crate_dir" \
      && tar -xzf "$crate" -C "$crate_dir"; then
@@ -315,38 +449,85 @@ else
 fi
 
 # ------------------------------------------------------------------
-# Channel: npm (real pack + install of BOTH packages; the installed
-# .bin shim must resolve the platform payload and exec the FROZEN
-# tarball bytes — not the build tree).
+# Channel: npm — install the FROZEN .tgz artifacts. In --frozen-set
+# mode these are the manifest-digested files themselves (all 4
+# platform packages + metapackage — the exact set npm-publish.yml
+# publishes); in legacy mode they are packed locally for dev.
+# The installed .bin shim must resolve the platform payload and exec
+# it (#225 A06/F03: no re-pack in the verification path).
 # ------------------------------------------------------------------
-plat_src="npm/skill-graph-${npm_target}"
-meta_src="npm/skill-graph"
-[ -d "$plat_src" ] && [ -d "$meta_src" ] || {
-  echo "npm package dirs missing ($plat_src / $meta_src)" >&2; exit 1; }
-
+if [ "$run_npm" -eq 0 ]; then
+  echo "SKIP: npm channel not in this frozen leg set"
+else
 npm_tmp="$tmp/npm"
-mkdir -p "$npm_tmp/plat/bin" "$npm_tmp/meta"
-cp -r "$plat_src/." "$npm_tmp/plat/"
-# cp -p preserves the tarball's exec bit EXACTLY — no chmod repair:
-# if the frozen payload lacked +x the installed bin would fail to
-# exec and this check would catch it (#225 r10).
-cp -p "$tmp/skill-graph" "$npm_tmp/plat/bin/skill-graph"
-cp -r "$meta_src/." "$npm_tmp/meta/"
-cp -r plugins/skill-graph "$npm_tmp/meta/plugin"
-cp -r contracts "$npm_tmp/meta/contracts"
+mkdir -p "$npm_tmp"
+plat_tgzs=()
+meta_tgz=""
 
-# prepack requires plugin/+contracts/ — already copied above.
-plat_name="$(node -p "require('./$plat_src/package.json').name")"
-meta_name="$(node -p "require('./$meta_src/package.json').name")"
-
-plat_tgz="$(cd "$npm_tmp/plat" && npm pack --silent | tail -1)"
-meta_tgz="$(cd "$npm_tmp/meta" && npm pack --silent | tail -1)"
-[ -f "$npm_tmp/plat/$plat_tgz" ] && [ -f "$npm_tmp/meta/$meta_tgz" ] || {
-  echo "npm pack failed" >&2; exit 1; }
+if [ -n "$frozen_set" ]; then
+  # Locate the manifest artifacts BY NAME under the frozen set —
+  # digests were proven above; nothing is re-packed. Only the HOST
+  # platform package is installed: foreign-platform packages carry
+  # os/cpu constraints and npm refuses to install them on this
+  # host — which is exactly what a real consumer's npm resolves
+  # (meta + host optional dep). Their digests are still proven by
+  # the manifest check above (#225 A06/F03).
+  plat_tgz_path="$(python3 - "$m" "$npm_target" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+hits=[n for n,a in m["artifacts"].items() if a["channel"]=="npm" and a.get("target")==sys.argv[2]]
+assert len(hits)==1, hits
+print(hits[0])
+PY
+)"
+  plat_tgz_host="$(find "$frozen_set" -type f -name "$plat_tgz_path" -print -quit)"
+  [ -n "$plat_tgz_host" ] || { echo "host npm artifact $plat_tgz_path missing" >&2; exit 1; }
+  plat_tgzs=("$plat_tgz_host")
+  meta_name="$(python3 - "$m" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+hits=[n for n,a in m["artifacts"].items() if a["channel"]=="npm-meta"]
+assert len(hits)==1, hits
+print(hits[0])
+PY
+)"
+  meta_tgz="$(find "$frozen_set" -type f -name "$meta_name" -print -quit)"
+  [ -n "$meta_tgz" ] || { echo "manifest npm-meta artifact $meta_name missing" >&2; exit 1; }
+  # Package names for lifecycle checks come from the FROZEN bytes
+  # themselves (package.json inside each tgz), not the source tree.
+  tgz_pkg_name() {
+    tar -xzOf "$1" package/package.json \
+      | python3 -c 'import json,sys;print(json.load(sys.stdin)["name"])'
+  }
+  meta_name_pkg="$(tgz_pkg_name "$meta_tgz")"
+  plat_name="$(tgz_pkg_name "$plat_tgz_host")"
+else
+  plat_src="npm/skill-graph-${npm_target}"
+  meta_src="npm/skill-graph"
+  [ -d "$plat_src" ] && [ -d "$meta_src" ] || {
+    echo "npm package dirs missing ($plat_src / $meta_src)" >&2; exit 1; }
+  mkdir -p "$npm_tmp/plat/bin" "$npm_tmp/meta"
+  cp -r "$plat_src/." "$npm_tmp/plat/"
+  # cp -p preserves the tarball's exec bit EXACTLY — no chmod repair:
+  # if the frozen payload lacked +x the installed bin would fail to
+  # exec and this check would catch it (#225 r10).
+  cp -p "$tmp/skill-graph" "$npm_tmp/plat/bin/skill-graph"
+  cp -r "$meta_src/." "$npm_tmp/meta/"
+  cp -r plugins/skill-graph "$npm_tmp/meta/plugin"
+  cp -r contracts "$npm_tmp/meta/contracts"
+  # prepack requires plugin/+contracts/ — already copied above.
+  plat_name="$(node -p "require('./$plat_src/package.json').name")"
+  meta_name_pkg="$(node -p "require('./$meta_src/package.json').name")"
+  plat_tgz_name="$(cd "$npm_tmp/plat" && npm pack --silent | tail -1)"
+  meta_tgz_name="$(cd "$npm_tmp/meta" && npm pack --silent | tail -1)"
+  [ -f "$npm_tmp/plat/$plat_tgz_name" ] && [ -f "$npm_tmp/meta/$meta_tgz_name" ] || {
+    echo "npm pack failed" >&2; exit 1; }
+  plat_tgzs=("$npm_tmp/plat/$plat_tgz_name")
+  meta_tgz="$npm_tmp/meta/$meta_tgz_name"
+fi
 
 npm_inst="$tmp/npm-inst"
-if npm install --prefix "$npm_inst" \
-     "$npm_tmp/plat/$plat_tgz" "$npm_tmp/meta/$meta_tgz" >/dev/null 2>&1; then
+if npm install --prefix "$npm_inst" "${plat_tgzs[@]}" "$meta_tgz" >/dev/null 2>&1; then
   shim="$npm_inst/node_modules/.bin/skill-graph"
   [ -x "$shim" ] || bad "npm installed bin missing/not executable"
   nout="$("$shim" --version 2>/dev/null || true)"
@@ -359,23 +540,72 @@ if npm install --prefix "$npm_inst" \
   interface_smoke "$shim" \
     && ok "npm install public interfaces" \
     || bad "npm install interface smoke"
-  # Upgrade path: reinstalling the same tgz set over the existing
-  # install must succeed and keep the shim working (#225 F03).
-  if npm install --prefix "$npm_inst" \
-       "$npm_tmp/plat/$plat_tgz" "$npm_tmp/meta/$meta_tgz" >/dev/null 2>&1 \
-     && [ "$("$shim" --version 2>/dev/null)" = "skill-graph $version" ]; then
-    ok "npm reinstall (upgrade path)"
+  # REAL upgrade path (#225 A06/F03): install a PREVIOUS-version
+  # package set first, then the frozen tgz set over it — a
+  # same-version reinstall is not an upgrade test. npm has no prior
+  # publish of these packages, so the "before" state is the same
+  # package contents with versions rolled back — a genuine
+  # different-version transition through npm's own resolver.
+  if [ -n "$frozen_set" ]; then
+    prev_root="$tmp/npm-prev"
+    mkdir -p "$prev_root/src"
+    prev_ok=1
+    # Build prev meta+platform packages: extract each frozen tgz,
+    # roll the version fields back, repack. These are the "before"
+    # install only — the "after" bytes are the frozen artifacts.
+    prev_tgzs=()
+    for f in "${plat_tgzs[@]}" "$meta_tgz"; do
+      b="$(basename "$f" .tgz)"
+      mkdir -p "$prev_root/src/$b" && tar -xzf "$f" -C "$prev_root/src/$b"
+      pkg_dir_prev="$prev_root/src/$b/package"
+      node -e '
+        const fs=require("fs");const p=process.argv[1]+"/package.json";
+        const m=JSON.parse(fs.readFileSync(p,"utf8"));
+        m.version=process.argv[2];
+        for (const k of Object.keys(m.optionalDependencies||{})) m.optionalDependencies[k]=process.argv[2];
+        fs.writeFileSync(p,JSON.stringify(m,null,2)+"\n");
+      ' "$pkg_dir_prev" "${prev_tag#v}" || { prev_ok=0; break; }
+      prev_tgz_name="$(cd "$pkg_dir_prev" && npm pack --silent --pack-destination "$prev_root" 2>/dev/null | tail -1)"
+      [ -n "$prev_tgz_name" ] && [ -f "$prev_root/$prev_tgz_name" ] \
+        || { prev_ok=0; break; }
+      prev_tgzs+=("$prev_root/$prev_tgz_name")
+    done
+    if [ "$prev_ok" -eq 1 ] \
+       && npm install --prefix "$npm_inst" "${prev_tgzs[@]}" >/dev/null 2>&1; then
+      prev_out="$("$shim" --version 2>/dev/null || true)"
+      # Now install the FROZEN tgz set over the previous version.
+      if npm install --prefix "$npm_inst" "${plat_tgzs[@]}" "$meta_tgz" >/dev/null 2>&1; then
+        up_out="$("$shim" --version 2>/dev/null || true)"
+        [ "$up_out" = "skill-graph $version" ] \
+          && ok "npm upgrade ${prev_tag#v} -> $version ($prev_out -> $up_out)" \
+          || bad "npm upgrade left '$up_out', want 'skill-graph $version'"
+      else
+        bad "npm upgrade install over $prev_tag"
+      fi
+    else
+      bad "npm previous-version install ($prev_tag)"
+    fi
   else
-    bad "npm reinstall (upgrade path)"
+    # Legacy mode: reinstalling the same tgz set over the existing
+    # install must succeed and keep the shim working (#225 F03).
+    if npm install --prefix "$npm_inst" "${plat_tgzs[@]}" "$meta_tgz" >/dev/null 2>&1 \
+       && [ "$("$shim" --version 2>/dev/null)" = "skill-graph $version" ]; then
+      ok "npm reinstall (upgrade path)"
+    else
+      bad "npm reinstall (upgrade path)"
+    fi
   fi
-  # Lifecycle: uninstall must remove the shim AND the payload.
-  npm uninstall --prefix "$npm_inst" "$meta_name" "$plat_name" >/dev/null 2>&1 || true
+  # Lifecycle: uninstall must remove the shim AND the payload. Only
+  # the host platform package was installed (foreign tgzs carry
+  # os/cpu constraints — see above).
+  npm uninstall --prefix "$npm_inst" "$meta_name_pkg" "$plat_name" >/dev/null 2>&1 || true
   { [ ! -e "$shim" ] && [ ! -d "$npm_inst/node_modules/$plat_name" ]; } \
     && ok "npm uninstall lifecycle" \
     || bad "npm uninstall lifecycle"
 else
-  bad "npm install $plat_name + $meta_name"
+  bad "npm install $plat_name + ${meta_name_pkg:-meta}"
 fi
+fi # run_npm
 
 # ------------------------------------------------------------------
 # Channel: brew — only when brew exists (CI runners ship it; dev
