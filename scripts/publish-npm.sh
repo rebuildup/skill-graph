@@ -56,14 +56,15 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # ------------------------------------------------------------------
 meta="$(node "$here/pkg-preflight.mjs" "$@")" || exit 1
 
-declare -a pkg_names=() pkg_vers=() pkg_files=() pkg_bins=()
-while IFS=$'\t' read -r n v f b; do
-  [ -n "$n" ] && [ -n "$v" ] && [ -n "$f" ] && [ -n "$b" ] || {
+declare -a pkg_names=() pkg_vers=() pkg_files=() pkg_bins=() pkg_manifests=()
+while IFS=$'\t' read -r n v f b x; do
+  [ -n "$n" ] && [ -n "$v" ] && [ -n "$f" ] && [ -n "$b" ] && [ -n "$x" ] || {
     echo "pkg-preflight emitted malformed record" >&2; exit 1; }
   pkg_names+=("$n")
   pkg_vers+=("$v")
   pkg_files+=("$f")
   pkg_bins+=("$b")
+  pkg_manifests+=("$x")
 done <<< "$meta"
 [ "${#pkg_names[@]}" -eq "$#" ] || {
   echo "pkg-preflight record count mismatch" >&2; exit 1; }
@@ -137,17 +138,28 @@ for pkg in "$@"; do
   # the bytes that get published.
   "$here/verify-npm-archive.sh" --check-bin "$tgz" || exit 1
 
-  # The artifact must BE the package preflight validated: identity of
-  # name/version inside package/package.json, and every declared
-  # files[] payload present as an archive member. npm could otherwise
-  # pack a different directory or silently drop payloads (#225 r7).
+  # The artifact must BE the package preflight validated: the WHOLE
+  # manifest deep-equal, and every declared files[]/bin payload
+  # present as an archive member. npm could otherwise pack a
+  # different directory or silently drop payloads (#225 r7/r9).
   FILES_JSON="${pkg_files[$i]}" BIN_JSON="${pkg_bins[$i]}" \
+    EXPECTED_JSON="${pkg_manifests[$i]}" \
     WANT_NAME="${pkg_names[$i]}" WANT_VER="${pkg_vers[$i]}" TGZ="$tgz" node -e '
       const { execFileSync } = require("node:child_process");
       const tar = execFileSync("tar", ["-xzOf", process.env.TGZ, "package/package.json"], { encoding: "utf8" });
       const m = JSON.parse(tar);
-      if (m.name !== process.env.WANT_NAME || m.version !== process.env.WANT_VER) {
-        console.error(`artifact identity mismatch: packed ${m.name}@${m.version}, expected ${process.env.WANT_NAME}@${process.env.WANT_VER}`);
+      // The artifact manifest must BE the manifest preflight
+      // validated — deep equality over the WHOLE object, not just
+      // name/version: a pack that drifted bin/files/deps/anything
+      // else would otherwise publish a package whose install
+      // contract differs from what was verified (#225 r9).
+      const sortKeys = (v) => Array.isArray(v) ? v.map(sortKeys)
+        : (v && typeof v === "object"
+            ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])]))
+            : v);
+      const expected = JSON.parse(process.env.EXPECTED_JSON);
+      if (JSON.stringify(sortKeys(m)) !== JSON.stringify(sortKeys(expected))) {
+        console.error(`artifact manifest differs from validated manifest for ${process.env.WANT_NAME}@${process.env.WANT_VER}`);
         process.exit(1);
       }
       const members = execFileSync("tar", ["-tzf", process.env.TGZ], { encoding: "utf8" }).split("\n");

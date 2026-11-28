@@ -1,0 +1,57 @@
+name: Artifact verify
+on:
+  push:
+    branches: [main, "release-*"]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: artifact-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-run:
+    # Pre-publish proof that does NOT wait for a release: every
+    # supported target is built, packaged by the SAME
+    # scripts/package-target.sh release.yml uses, and the packaged
+    # tarball is extracted and EXECUTED natively on its own
+    # OS/arch runner — exec bit, executable format, --version, arch
+    # (#225 r9). The bytes this job verifies are the bytes a release
+    # would upload; there is no separate "packaging for verify" path.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm_target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            npm_target: linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            npm_target: darwin-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            npm_target: darwin-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: scripts/package-target.sh "${{ matrix.target }}" "${{ matrix.npm_target }}"
+      - name: Auth-free local install verification
+        # Install lifecycle on the FROZEN artifacts — no repairs:
+        # cargo install --path, real npm pack+install of both
+        # packages (shim -> platform payload exec), and a brew formula
+        # pointed at the local tarball via file://. Exec permission,
+        # --version, hook smoke, and uninstall are asserted per
+        # channel (#225 r9).
+        run: scripts/verify-install-local.sh

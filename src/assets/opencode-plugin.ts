@@ -108,17 +108,17 @@ const ID_HASH_HEX = 32
 const ID_SAFE_CHAR = /[A-Za-z0-9._-]/
 const ID_RESERVED = /-[0-9a-f]{32}$/
 
-// Session-id input boundary: the RAW host id is bounded BEFORE it
+// Session-id transport boundary: the RAW host id is bounded BEFORE it
 // feeds both safeSessionID (state keys, emitted events) and the
-// detect payload, so identity work and the forwarded field are O(cap)
-// regardless of host input size (#225 r8 — sending the unbounded raw
-// id regressed the detect boundary). The SAME slice feeds every
-// consumer, so normalize(rawSlice) === safeSessionID(rawSlice)
-// parity — and therefore plugin↔detect session correlation — stays
-// exact. Ids differing only beyond the cap share identity; that is
-// the documented comparison domain (8 KiB is orders of magnitude
-// beyond any real session id).
-const SESSION_ID_RAW_MAX_BYTES = 8 * 1024
+// detect payload. The slice MUST contain the whole identity domain —
+// normalize compares the first ID_SCAN_CHARS(8192) code points — so
+// 32 KiB is the minimum byte budget that guarantees ≥8192 chars even
+// for 4-byte code points (8192 × 4 = 32768). safeSessionID and
+// SessionId::normalize then agree EXACTLY: both derive head+hash from
+// the same first-8192-char domain whether they see the slice or the
+// full id (#225 r9 — the domain is a normalize contract, not a
+// producer-local truncation).
+const SESSION_ID_RAW_MAX_BYTES = 32 * 1024
 function rawSessionID(event: { sessionID?: unknown } | null | undefined): string {
   const s = event?.sessionID
   return typeof s === "string" ? utf8Slice(s, SESSION_ID_RAW_MAX_BYTES) : ""
@@ -143,17 +143,27 @@ export function safeSessionID(id: unknown): string {
       return whole
     }
   }
-  // Non-canonical: bounded head of valid chars + hash of the ORIGINAL
-  // string. Scan cap keeps pathological all-invalid ids at O(8192).
-  let head = ""
+  // Non-canonical: the identity DOMAIN is the first ID_SCAN_CHARS
+  // code points — head AND hash both derive from it, matching
+  // SessionId::normalize exactly. Work is O(domain) for ANY input
+  // size, and the domain is defined ONCE inside the normalize
+  // contract so every producer shares it (#225 r9: hashing the full
+  // string made work O(input), while a transport-side slice made the
+  // effective domain producer-local).
+  let domain = ""
   let scanned = 0
   for (const ch of s) {
-    if (scanned >= ID_SCAN_CHARS || head.length >= ID_HEAD_CHARS) break
+    if (scanned >= ID_SCAN_CHARS) break
     scanned++
+    domain += ch
+  }
+  let head = ""
+  for (const ch of domain) {
+    if (head.length >= ID_HEAD_CHARS) break
     if (ID_SAFE_CHAR.test(ch)) head += ch
   }
   if (!head) head = "u"
-  return `${head}-${sha256(s).slice(0, ID_HASH_HEX)}`
+  return `${head}-${sha256(domain).slice(0, ID_HASH_HEX)}`
 }
 
 function emit(event: Record<string, unknown>): boolean {
@@ -482,9 +492,12 @@ export function boundJsonValue(v: unknown, depth: number, st: BoundState): unkno
     // fetches each key's descriptor only as iteration reaches it, so
     // the early break bounds per-key work for plain objects AND
     // Proxy traps alike (ownKeys itself is a single call either way).
+    // EVERY yielded key consumes the GLOBAL node budget too —
+    // per-object `n` alone would still allow nodes×keys total work
+    // (#225 r9).
     for (const k in v as Record<string, unknown>) {
+      if (++n > MAX_INPUT_NODES || ++st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
       if (!Object.prototype.hasOwnProperty.call(v, k)) continue
-      if (++n > MAX_INPUT_NODES || st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
       if (k.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
       st.strBytes += utf8Bytes(k)
       if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL

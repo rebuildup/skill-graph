@@ -199,16 +199,17 @@ describe("detect payload contract (#225 r7)", () => {
     expect(body.session_id).not.toBe(safeSessionID(raw))
   })
 
-  test("raw session id is bounded before detect forwarding AND state keys (#225 r8)", async () => {
-    // The raw id is the detect ingest boundary's input — it must be
-    // O(cap) bounded, and the SAME slice must feed safeSessionID so
-    // normalize(slice) === sid correlation holds. A multi-KiB host id
-    // previously flowed unbounded into the detect payload.
+  test("raw session id slice always contains the full identity domain (#225 r9)", async () => {
+    // normalize compares the first 8192 code points; the transport
+    // slice (32 KiB) must contain ALL of them even for 4-byte chars,
+    // so safeSessionID(slice) === safeSessionID(full) and detect's
+    // normalize(raw) lands on the same sid — for ANY host id size.
     const capture = `${fakeBin}.capture`
     const handlers = await setupPlugin()
     const after = handlers["tool:execute.after"]
 
-    const huge = "sess-" + "x".repeat(20 * 1024) // 20 KiB raw id
+    // Worst case for the byte→char ratio: all 4-byte code points.
+    const huge = "sess-" + "\u{1F600}".repeat(20 * 1024)
     await after({
       sessionID: huge,
       tool: "read",
@@ -217,14 +218,29 @@ describe("detect payload contract (#225 r7)", () => {
     })
 
     const body = JSON.parse(readFileSync(capture, "utf8"))
-    const expected = utf8Slice(huge, 8 * 1024)
-    expect(body.session_id).toBe(expected)
-    expect(Buffer.byteLength(body.session_id, "utf8")).toBeLessThanOrEqual(8 * 1024)
-    // The bounded slice — not the full host id — is what safeSessionID
-    // consumed, so detect's normalize(raw) lands on the same sid the
-    // plugin used for its own state keys.
-    expect(safeSessionID(expected)).toBe(safeSessionID(utf8Slice(huge, 8 * 1024)))
     expect(body.session_id).not.toBe(huge)
+    expect(Buffer.byteLength(body.session_id, "utf8")).toBeLessThanOrEqual(32 * 1024)
+    // The forwarded slice must normalize to the SAME sid the plugin
+    // used for state keys — i.e. safeSessionID(slice) equals
+    // safeSessionID(full): the domain is inside the slice.
+    expect(safeSessionID(body.session_id)).toBe(safeSessionID(huge))
+    // And it must actually contain ≥8192 code points (the whole
+    // identity domain), proving the 32 KiB budget is sufficient.
+    expect([...body.session_id].length).toBeGreaterThanOrEqual(8192)
+  })
+
+  test("session ids differing only beyond the 8192-char domain share identity BY CONTRACT", () => {
+    // The domain is a normalize-level contract shared by every
+    // producer — not a plugin-local truncation (#225 r9). Two ids
+    // that agree on the first 8192 chars are the same session
+    // everywhere; this is documented, deterministic behavior.
+    const prefix = "p".repeat(9000)
+    expect(safeSessionID(prefix + "AAA")).toBe(safeSessionID(prefix + "BBB"))
+    // Within the domain, distinctness is preserved.
+    const p2 = "q".repeat(8191)
+    expect(safeSessionID(p2 + "X" + "z".repeat(100))).not.toBe(
+      safeSessionID(p2 + "Y" + "z".repeat(100)),
+    )
   })
 })
 
@@ -440,6 +456,27 @@ describe("input-bounding properties (#225)", () => {
     const st = { nodes: 0, strBytes: 0 }
     const r = boundJsonValue(big, 0, st)
     expect(r).toBe(BOUND_FAIL)
+  })
+
+  test("boundJsonValue bounds INHERITED enumerable keys too (#225 r9)", () => {
+    // for..in yields enumerable props from the prototype chain; the
+    // proto check admits Object.prototype itself, so a polluted
+    // Object.prototype could otherwise force unbounded enumeration —
+    // hasOwnProperty-skipped keys consumed no budget before.
+    const proto = Object.prototype as Record<string, unknown>
+    const saved: Record<string, unknown> = {}
+    for (let i = 0; i < MAX_INPUT_NODES + 10; i++) {
+      const k = `inh${i}`
+      saved[k] = proto[k]
+      Object.defineProperty(proto, k, { value: i, enumerable: true, configurable: true, writable: true })
+    }
+    try {
+      const st = { nodes: 0, strBytes: 0 }
+      const r = boundJsonValue({ own: 1 }, 0, st)
+      expect(r).toBe(BOUND_FAIL)
+    } finally {
+      for (const k of Object.keys(saved)) delete proto[k]
+    }
   })
 
   test("boundJsonValue clones in-budget JSON faithfully", () => {

@@ -83,42 +83,14 @@ jobs:
           toolchain: 1.100.0
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package binary
-        run: |
-          # The default run shell is `bash -e` — NO pipefail (#225):
-          # without this, a tar failure would be masked by a successful
-          # gzip and ship a corrupt asset.
-          set -euo pipefail
-          bin="target/${{ matrix.target }}/release/skill-graph"
-          strip "$bin" 2>/dev/null || true
-          mkdir -p pkg
-          cp "$bin" pkg/skill-graph
-          # Deterministic archive, portable across GNU tar (Linux) and
-          # bsdtar (macOS runners — GNU-only --sort/--mtime/--owner
-          # flags abort there, #221): normalize the single payload's
-          # mtime, archive it, and strip gzip's header timestamp. A
-          # single-file archive needs no sort; uid/gid/uname are stable
-          # per runner image. A rerun on the same commit/toolchain must
-          # reproduce byte-identical checksums — published assets are
-          # immutable and reruns verify instead of overwriting (#130).
-          touch -t 202001010000.00 pkg/skill-graph
-          COPYFILE_DISABLE=1 tar --no-xattrs -cf - -C pkg skill-graph \
-            | gzip -n > "skill-graph-${{ matrix.target }}.tar.gz"
-          rm -rf pkg
-      - name: Verify packaged artifact natively
-        # Every target is built AND executed on its own OS/arch runner —
-        # the packaged tarball (the bytes shipped to npm/mise/brew) is
-        # extracted and run with --version, then arch-verified. This is
-        # the pre-publish native-execution proof for ALL supported
-        # platforms (#225 r8); cross-exec on a foreign runner is not a
-        # substitute for running the artifact where it will run.
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/verify-tmp
-          tar -xzf "skill-graph-${{ matrix.target }}.tar.gz" -C /tmp/verify-tmp
-          chmod +x /tmp/verify-tmp/skill-graph
-          /tmp/verify-tmp/skill-graph --version
-          scripts/verify-npm-arch.sh "${{ matrix.npm_target }}" /tmp/verify-tmp/skill-graph
+      - name: Package binary and verify artifact natively
+        # Single packaging path shared with artifact-verify.yml:
+        # package-target.sh builds the deterministic tarball AND proves
+        # the packaged bytes on this runner — exec bit, executable
+        # format (shared objects rejected), native --version run, arch
+        # match (#225 r9). The uploaded asset is byte-identical to the
+        # verified artifact.
+        run: scripts/package-target.sh "${{ matrix.target }}" "${{ matrix.npm_target }}"
       - uses: actions/upload-artifact@v4
         with:
           name: skill-graph-${{ matrix.target }}

@@ -200,14 +200,19 @@ impl SessionId {
             return SessionId(session_id.to_string());
         }
 
-        // Non-canonical: bounded head of valid chars + hash of the
-        // ORIGINAL bytes. The scan cap keeps pathological all-invalid
-        // megabyte ids at O(SCAN_CHARS); the hash covers the full
-        // input so distinct ids cannot collide through a shared head.
+        // Non-canonical: the identity DOMAIN is the first SCAN_CHARS
+        // chars — head AND hash both derive from it. Work is
+        // O(SCAN_CHARS) for ANY input size, and two raw ids that agree
+        // on the domain are the same session BY CONTRACT across every
+        // producer (hook, plugin, detect, observe). #225 r9: hashing
+        // the full input made work O(input) while the plugin's
+        // transport-side slice made the effective domain plugin-local
+        // — the domain must be defined once, inside normalize.
+        let domain: String = session_id.chars().take(SCAN_CHARS).collect();
         let mut head = String::new();
         let mut head_len = 0usize;
-        for (scanned, c) in session_id.chars().enumerate() {
-            if scanned >= SCAN_CHARS || head_len >= HEAD_CHARS {
+        for c in domain.chars() {
+            if head_len >= HEAD_CHARS {
                 break;
             }
             if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
@@ -220,7 +225,7 @@ impl SessionId {
         }
         SessionId(format!(
             "{head}-{}",
-            &sha256_hex(session_id.as_bytes())[..HASH_HEX]
+            &sha256_hex(domain.as_bytes())[..HASH_HEX]
         ))
     }
 
@@ -1341,6 +1346,33 @@ mod tests {
         // Exactly-128-char ids pass through unsuffixed.
         let exact = "y".repeat(128);
         assert_eq!(SessionId::normalize(&exact).as_str(), exact);
+    }
+
+    #[test]
+    fn sanitize_session_id_identity_domain_is_first_8192_chars() {
+        // #225 r9: the identity domain is defined ONCE inside
+        // normalize — the first SCAN_CHARS(8192) chars feed BOTH head
+        // and hash. Ids agreeing on the domain are the same session
+        // for EVERY producer (hook/plugin/detect/observe); ids
+        // differing inside the domain stay distinct. Work is
+        // O(8192) regardless of input size.
+        let prefix = "p".repeat(9000);
+        assert_eq!(
+            SessionId::normalize(&format!("{prefix}AAA")),
+            SessionId::normalize(&format!("{prefix}BBB")),
+            "ids sharing the domain must share identity by contract"
+        );
+        let p2 = "q".repeat(8191);
+        assert_ne!(
+            SessionId::normalize(&format!("{p2}X{}", "z".repeat(100))),
+            SessionId::normalize(&format!("{p2}Y{}", "z".repeat(100))),
+            "ids differing inside the domain must stay distinct"
+        );
+        // normalize must not scan the tail: a 1 MiB+ id whose tail is
+        // adversarial still produces the domain-bound output quickly.
+        let huge = format!("{}{}", "h".repeat(9000), "!".repeat(1 << 20));
+        let out = SessionId::normalize(&huge);
+        assert_eq!(out.len(), 128);
     }
 
     #[test]

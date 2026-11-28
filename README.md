@@ -18,14 +18,14 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/perf-latency-dark.svg">
-  <img src="assets/readme/perf-latency-light.svg" alt="p95 latency vs corpus size: end-to-end CLI process stays under ~12ms and warm recommend core under ~1.1ms at 500 skills" width="880">
+  <img src="assets/readme/perf-latency-light.svg" alt="p95 latency vs corpus size: end-to-end CLI process stays under ~15ms and warm recommend core under ~1.0ms at 500 skills" width="880">
 </picture>
 
 合成コーパス 50→500 skills で計測（warm は 30 iterations、process は
-30 samples の p95）。推薦コア（warm recommend）は p95 約 1.1ms、
-プロセス起動を含む end-to-end でも 500 skills で p95 約 12ms。コールド
+30 samples の p95）。推薦コア（warm recommend）は p95 約 1.0ms、
+プロセス起動を含む end-to-end でも 500 skills で p95 約 14ms。コールド
 スタートを含む discovery + グラフ構築はほぼ線形で、500 skills でも
-約 8ms に収まる。
+約 9ms に収まる。
 
 ### 推薦品質
 
@@ -47,7 +47,7 @@ forbidden recommendation = 0、ネガティブケース 6/6 で適切に推薦�
   <img src="assets/readme/perf-memory-light.svg" alt="Peak RSS stays around 7MB regardless of corpus size from 24 to 500 skills" width="880">
 </picture>
 
-ピーク RSS はコーパス規模にほぼ依存せず 6.5〜7.3MB（実コーパス 24/88
+ピーク RSS はコーパス規模にほぼ依存せず 6.6〜7.3MB（実コーパス 24/88
 skills、合成 500 skills を各 20 回計測した最大値）。インデックス・
 キャッシュ・常駐プロセスを持たないため、コストは呼び出しごとの
 プロセス起動に限定される。
