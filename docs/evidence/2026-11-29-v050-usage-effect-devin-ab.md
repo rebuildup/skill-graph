@@ -58,7 +58,7 @@ null。157件への拡大でも SWE-2 Flash Medium は flat 列挙から
 推薦側の distractor 混入（task2/3/6/7 の top-3 に非該当 skill）
 と同程度で、相対優位は観測されなかった。
 
-### Phase C / H3（実務 skill は runtime 不可視 root のみ）
+### Phase C / H3（実務 skill は runtime 不可視 root のみ、round 1）
 
 | 群 | 正解 skill load | 備考 |
 |---|---|---|
@@ -71,6 +71,26 @@ null。157件への拡大でも SWE-2 Flash Medium は flat 列挙から
 **正の効果を確認**: runtime が surface しない root に skill が
 ある条件では、注入が唯一の到達経路であり 7/8 vs 0/8 と明確。
 失敗1件は介入方式ではなく推薦 recall（#319）の問題。
+
+## 追補: round 2/3（n=24/群）と #319 修正の end-to-end 検証
+
+Phase C を round 2・3 で反復し、途中で #319（recommend recall）を
+修正した release build を treat 側に適用した。
+
+| round | recommend binary | treat correct | ctrl correct |
+|---|---|---|---|
+| r1 | 修正前 | 7/8（task4 失敗 = #319） | 0/8 |
+| r2 | 修正後 | 8/8 | 0/8 |
+| r3 | 修正後 | 8/8 | 0/8 |
+| **pooled** | — | **23/24 (95.8%)** | **0/24 (0%)** |
+
+- treat の skill load 総数 45、ctrl は 12（全て distractor で
+  正解 skill への到達は 0）
+- r1 task4 の失敗は #319 修正後の r2/r3 で両方正解に転じ、
+  recall 欠陥が製品指標を直撃していた因果が end-to-end で確認
+  できた
+- 23/24 vs 0/24 は二項検定で p < 1e-6 オーダー（Fisher exact
+  相当）。ただし条件付き効果である点は変わらない
 
 ## 解釈
 
