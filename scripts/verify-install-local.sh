@@ -7,14 +7,23 @@
 # (#225 r9).
 #
 # Guarantees exercised per channel:
-#   exec permission — the installed bin actually runs
+#   exec permission — the installed bin actually runs (exec bit comes
+#                     from the artifact itself; nothing is chmod'ed)
 #   version         — --version reports the manifest/Cargo version
-#   basic function  — a real subcommand smoke (hook fail-open path)
+#   basic function  — hook claude-code prompt must emit the
+#                     documented additionalContext injection for a
+#                     deterministic prompt (not merely exit 0)
 #   lifecycle       — install -> verify -> uninstall leaves nothing
+#   artifact bind   — cargo installs the PACKED .crate; npm installs
+#                     real npm-pack tarballs of both packages; brew
+#                     installs the frozen release tarball via a local
+#                     tap. What is verified IS what the channel ships.
 #
 # Channels:
-#   cargo — `cargo install --path .` (the crates.io-equivalent build
-#           path; `cargo publish --dry-run` covers crate packaging).
+#   cargo — `cargo package` -> extract .crate -> `cargo install
+#           --path` on the extracted packaged sources: the crates.io
+#           channel installs exactly these bytes (`cargo publish
+#           --dry-run` in CI covers the publish-side pack).
 #   npm   — real `npm pack` + `npm install <tgz>` of BOTH the platform
 #           package and the metapackage; the installed .bin shim must
 #           resolve the platform payload and exec it.
@@ -61,6 +70,19 @@ fails=0
 ok()   { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1" >&2; fails=$((fails + 1)); }
 
+# hook_smoke <bin> <session-id> — basic FUNCTION proof, not just
+# fail-open exit 0: feed a deterministic prompt and require the
+# documented additionalContext injection contract in stdout
+# (#225 r10 — an empty-JSON smoke proves nothing about whether the
+# binary can actually recommend).
+hook_smoke() {
+  local bin="$1" sess="$2" out
+  out="$(printf '%s' \
+    "{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"please review this pull request carefully\",\"session_id\":\"$sess\"}" \
+    | "$bin" hook claude-code prompt 2>/dev/null)" || return 1
+  printf '%s' "$out" | grep -q '"additionalContext":"skill-graph: skills relevant to this task'
+}
+
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-install-verify.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -78,7 +100,10 @@ done
 # this is the asset mise/brew/release consume.
 # ------------------------------------------------------------------
 tar -xzf "$tgz" -C "$tmp"
-[ -x "$tmp/skill-graph" ] || chmod +x "$tmp/skill-graph"
+# NO repair: the frozen tarball must carry the exec bit itself —
+# tar preserves modes, so a missing +x is a defect to REPORT, not
+# to chmod away (#225 r10).
+[ -x "$tmp/skill-graph" ] || bad "tarball payload missing exec bit"
 "$here/verify-npm-bin.sh" "$tmp/skill-graph" \
   && ok "tarball payload executable format" \
   || bad "tarball payload executable format"
@@ -91,26 +116,44 @@ out="$("$tmp/skill-graph" --version)"
   || bad "tarball --version got '$out', want 'skill-graph $version'"
 
 # ------------------------------------------------------------------
-# Channel: cargo (crates.io-equivalent source install)
+# Channel: cargo — install the PACKAGED CRATE, not the source tree:
+# `cargo package` produces the exact .crate `cargo publish` would
+# upload; extracting it and `cargo install --path`-ing the extracted
+# sources proves the published artifact compiles, installs, runs,
+# and uninstalls (#225 r10 — path install alone never touched the
+# packaged file set).
 # ------------------------------------------------------------------
 cargo_root="$tmp/cargo-root"
-if cargo install --path . --root "$cargo_root" --locked >/dev/null 2>&1; then
-  cbin="$cargo_root/bin/skill-graph"
-  cout="$("$cbin" --version)"
-  if [ "$cout" = "skill-graph $version" ]; then
-    ok "cargo install --version ($cout)"
+crate_dir="$tmp/crate"
+if cargo package --allow-dirty --locked >/dev/null 2>&1; then
+  crate="$(ls -t target/package/skill-graph-*.crate 2>/dev/null | head -1)"
+  if [ -n "$crate" ] && mkdir -p "$crate_dir" \
+     && tar -xzf "$crate" -C "$crate_dir"; then
+    pkg_dir="$crate_dir/skill-graph-$version"
+    if [ -n "$pkg_dir" ] \
+       && cargo install --path "$pkg_dir" --root "$cargo_root" --locked >/dev/null 2>&1; then
+      cbin="$cargo_root/bin/skill-graph"
+      cout="$("$cbin" --version)"
+      if [ "$cout" = "skill-graph $version" ]; then
+        ok "crate install --version ($cout)"
+      else
+        bad "crate install --version got '$cout'"
+      fi
+      hook_smoke "$cbin" "verify-crate-$$-$RANDOM" \
+        && ok "crate install hook output" \
+        || bad "crate install hook output"
+      cargo uninstall --root "$cargo_root" skill-graph >/dev/null 2>&1 \
+        && [ ! -e "$cbin" ] \
+        && ok "crate uninstall lifecycle" \
+        || bad "crate uninstall lifecycle"
+    else
+      bad "cargo install from packaged .crate"
+    fi
   else
-    bad "cargo install --version got '$cout'"
+    bad "cargo package / crate extract"
   fi
-  printf '{}' | "$cbin" hook claude-code prompt >/dev/null 2>&1 \
-    && ok "cargo install hook smoke" \
-    || bad "cargo install hook smoke"
-  cargo uninstall --root "$cargo_root" skill-graph >/dev/null 2>&1 \
-    && [ ! -e "$cbin" ] \
-    && ok "cargo uninstall lifecycle" \
-    || bad "cargo uninstall lifecycle"
 else
-  bad "cargo install --path ."
+  bad "cargo package --allow-dirty"
 fi
 
 # ------------------------------------------------------------------
@@ -126,8 +169,10 @@ meta_src="npm/skill-graph"
 npm_tmp="$tmp/npm"
 mkdir -p "$npm_tmp/plat/bin" "$npm_tmp/meta"
 cp -r "$plat_src/." "$npm_tmp/plat/"
-cp "$tmp/skill-graph" "$npm_tmp/plat/bin/skill-graph"   # frozen bytes
-chmod +x "$npm_tmp/plat/bin/skill-graph"
+# cp -p preserves the tarball's exec bit EXACTLY — no chmod repair:
+# if the frozen payload lacked +x the installed bin would fail to
+# exec and this check would catch it (#225 r10).
+cp -p "$tmp/skill-graph" "$npm_tmp/plat/bin/skill-graph"
 cp -r "$meta_src/." "$npm_tmp/meta/"
 cp -r plugins/skill-graph "$npm_tmp/meta/plugin"
 cp -r contracts "$npm_tmp/meta/contracts"
@@ -150,9 +195,9 @@ if npm install --prefix "$npm_inst" \
   [ "$nout" = "skill-graph $version" ] \
     && ok "npm install --version via shim ($nout)" \
     || bad "npm install --version got '$nout'"
-  printf '{}' | "$shim" hook claude-code prompt >/dev/null 2>&1 \
-    && ok "npm install hook smoke" \
-    || bad "npm install hook smoke"
+  hook_smoke "$shim" "verify-npm-$$-$RANDOM" \
+    && ok "npm install hook output" \
+    || bad "npm install hook output"
   # Lifecycle: uninstall must remove the shim AND the payload.
   npm uninstall --prefix "$npm_inst" "$meta_name" "$plat_name" >/dev/null 2>&1 || true
   { [ ! -e "$shim" ] && [ ! -d "$npm_inst/node_modules/$plat_name" ]; } \
@@ -211,9 +256,9 @@ EOF
       [ "$bout" = "skill-graph $version" ] \
         && ok "brew install --version ($bout)" \
         || bad "brew install --version got '$bout'"
-      printf '{}' | "$bbin" hook claude-code prompt >/dev/null 2>&1 \
-        && ok "brew install hook smoke" \
-        || bad "brew install hook smoke"
+      hook_smoke "$bbin" "verify-brew-$$-$RANDOM" \
+        && ok "brew install hook output" \
+        || bad "brew install hook output"
       HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall "$tap_name/skill-graph" >/dev/null 2>&1 \
         && [ ! -e "$bbin" ] \
         && ok "brew uninstall lifecycle" \

@@ -45,9 +45,17 @@ rm -rf pkg
 verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/sg-pkgverify.XXXXXX")"
 trap 'rm -rf "$verify_dir"' EXIT
 tar -xzf "skill-graph-${triple}.tar.gz" -C "$verify_dir"
-chmod +x "$verify_dir/skill-graph"
+# NO repair: the tarball must carry the exec bit itself. tar
+# preserves modes, so a missing +x fails verify-npm-bin below —
+# exactly the defect we are verifying against (#225 r10).
 "$here/verify-npm-bin.sh" "$verify_dir/skill-graph"
 "$verify_dir/skill-graph" --version
 "$here/verify-npm-arch.sh" "$npm_target" "$verify_dir/skill-graph"
+
+# Freeze record: the digest of the exact verified bytes travels with
+# the artifact so a later promotion step can prove it is promoting
+# THESE bytes, not a rebuild (#225 r10).
+shasum -a 256 "skill-graph-${triple}.tar.gz" > "skill-graph-${triple}.tar.gz.sha256" 2>/dev/null \
+  || sha256sum "skill-graph-${triple}.tar.gz" > "skill-graph-${triple}.tar.gz.sha256"
 
 echo "packaged+verified: skill-graph-${triple}.tar.gz"
