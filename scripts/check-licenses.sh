@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 
 meta_file="$(mktemp "${TMPDIR:-/tmp}/sg-meta.XXXXXX")"
 trap 'rm -f "$meta_file"' EXIT
-cargo metadata --format-version 1 --locked --offline > "$meta_file"
+cargo metadata --format-version 1 --locked > "$meta_file"
 python3 - "$meta_file" <<'PY'
 import json, re, sys
 
