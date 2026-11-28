@@ -519,7 +519,17 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       tool_name: tool,
       tool_input: input,
       tool_response: resultText(event.result),
-      session_id: sid,
+      // RAW session id, not `sid`: `skill-graph detect` is an ingest
+      // boundary that runs SessionId::normalize exactly once. Sending
+      // the already-normalized sid would be transformed a SECOND time
+      // (non-canonical outputs match the reserved shape), splitting
+      // funnel state between plugin-emitted and detect-emitted events
+      // (#225 r7). safeSessionID and SessionId::normalize are parity
+      // implementations, so normalize(raw) === sid — correlation is
+      // preserved. A pathological multi-MB sessionID pushes the body
+      // over MAX_PAYLOAD_BYTES and detection fails open, same as any
+      // oversized input.
+      session_id: typeof event.sessionID === "string" ? event.sessionID : "",
       // Forwarded defensively so the Rust-side error-status guard also
       // applies to plugin-originated payloads (the field name is
       // UNVERIFIED against the OpenCode event API). Rust only reads

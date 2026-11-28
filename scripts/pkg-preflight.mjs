@@ -7,8 +7,11 @@
 //
 // Usage: pkg-preflight.mjs <package-dir> [<package-dir>...]
 //
-// stdout: one "NAME\tVERSION" line per package, in argument order —
-// publish-npm.sh pairs these with the packed artifacts.
+// stdout: one "NAME\tVERSION\tFILES_JSON" line per package, in
+// argument order — publish-npm.sh pairs these with the packed
+// artifacts and verifies the artifact actually contains every
+// declared files[] payload (#225 r7). FILES_JSON is compact JSON so
+// it cannot contain a literal tab.
 // stderr: one violation per line; exit 1 if ANY check fails.
 //
 // Node is a hard requirement by construction: npm itself is a Node
@@ -86,7 +89,7 @@ const pkgs = dirs.map((dir, i) => {
     }
     for (const dep of Object.keys(block)) deps.add(dep);
   }
-  return { dir, name, version, deps };
+  return { dir, name, version, deps, files: m.files ?? [] };
 });
 
 // Order invariant: when two packages in this invocation are related
@@ -106,4 +109,6 @@ for (let i = 0; i < pkgs.length; i++) {
   }
 }
 
-for (const p of pkgs) console.log(`${p.name}\t${p.version}`);
+for (const p of pkgs) {
+  console.log(`${p.name}\t${p.version}\t${JSON.stringify(p.files)}`);
+}

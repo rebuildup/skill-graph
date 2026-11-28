@@ -119,6 +119,69 @@ fn detect_via_transcript_and_db_accepted() {
     }
 }
 
+/// The detect boundary normalizes the RAW payload session id exactly
+/// once: output must equal SessionId::normalize(input) — the same value
+/// the OpenCode plugin's safeSessionID produces for its own state keys
+/// (#225 r7). This is the cross-language contract made executable: the
+/// real binary, not a reimplementation.
+#[test]
+fn detect_normalizes_raw_session_id_once() {
+    let long_id = "z".repeat(200);
+    for raw in [
+        "sess!1",                 // stripped char → transform
+        long_id.as_str(),         // over-length → transform
+        "sess 1\u{1f600}unicode", // non-ASCII → transform
+        "plain-ok_1.2",           // canonical → passthrough
+        "",                       // absent-equivalent
+    ] {
+        let mut payload = skill_read_payload();
+        payload["session_id"] = json!(raw);
+        let (out, rc) = run_detect(
+            &["detect", "--runtime", "claude-code", "--via", "hook"],
+            &payload.to_string(),
+        );
+        assert_eq!(rc, 0, "raw={raw:?}: {out}");
+        let event: Value = serde_json::from_str(out.trim()).expect("event json");
+        let expected = skill_graph::events::SessionId::normalize(raw).to_string();
+        assert_eq!(
+            event["session_id"].as_str().unwrap(),
+            expected,
+            "raw={raw:?}"
+        );
+        // Normalized contract form: bounded length, safe charset.
+        let sid = event["session_id"].as_str().unwrap();
+        assert!(sid.chars().count() <= 128, "sid too long: {sid:?}");
+        assert!(
+            sid.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "sid charset violation: {sid:?}"
+        );
+    }
+}
+
+/// A payload carrying an already-normalized (reserved-shape) id is
+/// still RAW input at this boundary: detect re-transforms it rather
+/// than passing it through — non-idempotency is the documented
+/// contract, and producers must send raw ids (#225 r7).
+#[test]
+fn detect_treats_reserved_shape_input_as_raw() {
+    let reserved = format!("sess-{}", "a".repeat(32)); // matches -<32hex>
+    let mut payload = skill_read_payload();
+    payload["session_id"] = json!(reserved);
+    let (out, rc) = run_detect(
+        &["detect", "--runtime", "claude-code", "--via", "hook"],
+        &payload.to_string(),
+    );
+    assert_eq!(rc, 0, "{out}");
+    let event: Value = serde_json::from_str(out.trim()).expect("event json");
+    let sid = event["session_id"].as_str().unwrap();
+    assert_ne!(sid, reserved, "reserved-shape input must be re-transformed");
+    assert_eq!(
+        sid,
+        skill_graph::events::SessionId::normalize(&reserved).to_string()
+    );
+}
+
 /// A command touching several SKILL.md files must emit one NDJSON event
 /// per file — the OpenCode plugin depends on this line-per-event shape.
 #[test]

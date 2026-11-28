@@ -51,12 +51,13 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # ------------------------------------------------------------------
 meta="$(node "$here/pkg-preflight.mjs" "$@")" || exit 1
 
-declare -a pkg_names=() pkg_vers=()
-while IFS=$'\t' read -r n v; do
-  [ -n "$n" ] && [ -n "$v" ] || {
+declare -a pkg_names=() pkg_vers=() pkg_files=()
+while IFS=$'\t' read -r n v f; do
+  [ -n "$n" ] && [ -n "$v" ] && [ -n "$f" ] || {
     echo "pkg-preflight emitted malformed record: '$n'$'\t''$v'" >&2; exit 1; }
   pkg_names+=("$n")
   pkg_vers+=("$v")
+  pkg_files+=("$f")
 done <<< "$meta"
 [ "${#pkg_names[@]}" -eq "$#" ] || {
   echo "pkg-preflight record count mismatch" >&2; exit 1; }
@@ -88,9 +89,19 @@ trap 'rm -rf "$work"' EXIT
 declare -a tgzs=()
 i=0
 for pkg in "$@"; do
+  # npm pack resolves its argument as a package SPEC, not a path:
+  # a bare "npm/foo" is interpreted as the GitHub repository
+  # github:npm/foo (verified against real npm — it runs
+  # `git ls-remote ssh://git@github.com/npm/foo.git`), so a missing
+  # or renamed directory would silently pack someone else's repo.
+  # An absolute path is unambiguous: it can only be a local folder.
+  pkg_abs="$(cd "$pkg" 2>/dev/null && pwd)" || {
+    echo "package directory does not exist: $pkg" >&2; exit 1; }
+  [ -f "$pkg_abs/package.json" ] || {
+    echo "package directory has no package.json: $pkg" >&2; exit 1; }
   pdir="$work/pack-$i"
   mkdir -p "$pdir" || exit 1
-  npm pack "$pkg" --pack-destination "$pdir" >/dev/null || {
+  npm pack "$pkg_abs" --pack-destination "$pdir" >/dev/null || {
     echo "npm pack failed for $pkg" >&2; exit 1; }
   tgz="$(find "$pdir" -name '*.tgz' -print -quit)"
   [ -n "$tgz" ] || { echo "npm pack produced no tarball for $pkg" >&2; exit 1; }
@@ -103,40 +114,79 @@ for pkg in "$@"; do
   # tarball with executable-format bin payloads — verified bytes are
   # the bytes that get published.
   "$here/verify-npm-archive.sh" --check-bin "$tgz" || exit 1
+
+  # The artifact must BE the package preflight validated: identity of
+  # name/version inside package/package.json, and every declared
+  # files[] payload present as an archive member. npm could otherwise
+  # pack a different directory or silently drop payloads (#225 r7).
+  FILES_JSON="${pkg_files[$i]}" WANT_NAME="${pkg_names[$i]}" \
+    WANT_VER="${pkg_vers[$i]}" TGZ="$tgz" node -e '
+      const { execFileSync } = require("node:child_process");
+      const tar = execFileSync("tar", ["-xzOf", process.env.TGZ, "package/package.json"], { encoding: "utf8" });
+      const m = JSON.parse(tar);
+      if (m.name !== process.env.WANT_NAME || m.version !== process.env.WANT_VER) {
+        console.error(`artifact identity mismatch: packed ${m.name}@${m.version}, expected ${process.env.WANT_NAME}@${process.env.WANT_VER}`);
+        process.exit(1);
+      }
+      const members = execFileSync("tar", ["-tzf", process.env.TGZ], { encoding: "utf8" }).split("\n");
+      const want = JSON.parse(process.env.FILES_JSON);
+      for (const f of want) {
+        const prefix = "package/" + f.replace(/\/+$/, "");
+        const hit = members.some((mem) => mem === prefix || mem === prefix + "/" || mem.startsWith(prefix + "/"));
+        if (!hit) {
+          console.error(`required files[] payload missing from artifact: ${f}`);
+          process.exit(1);
+        }
+      }
+    ' || exit 1
   tgzs+=("$tgz")
   i=$((i + 1))
 done
 
 # ------------------------------------------------------------------
-# Phase E: publish the verified artifacts in argument order (already
-# validated against the dependency graph in Phase A) and prove the
-# registry serves the SAME fixed bytes afterwards.
+# Phase E1: reconcile the registry for EVERY package BEFORE any
+# publish. An already-published version must be proven identical to
+# this build's fixed artifact — discovering a divergent published
+# version for a LATER package after earlier ones shipped would leave
+# a partial, inconsistent release (#225 r7).
+# ------------------------------------------------------------------
+declare -a missing=()
+i=0
+for tgz in "${tgzs[@]}"; do
+  name="${pkg_names[$i]}"
+  ver="${pkg_vers[$i]}"
+  if npm view "$name@$ver" version >/dev/null 2>&1; then
+    echo "$name@$ver already published — verifying content identity"
+    "$here/verify-npm-registry.sh" "$name" "$ver" "$tgz" || {
+      echo "published $name@$ver differs from this build — refusing to publish anything" >&2
+      exit 1
+    }
+  else
+    missing+=("$i")
+  fi
+  i=$((i + 1))
+done
+
+# ------------------------------------------------------------------
+# Phase E2: publish only the missing artifacts, in argument order.
+# ------------------------------------------------------------------
+for i in "${missing[@]}"; do
+  name="${pkg_names[$i]}"
+  ver="${pkg_vers[$i]}"
+  npm publish "${tgzs[$i]}" --access public --provenance || {
+    echo "npm publish failed for $name@$ver" >&2; exit 1; }
+done
+
+# ------------------------------------------------------------------
+# Phase E3: prove the registry now serves THIS build's fixed bytes
+# for EVERY package — freshly published and previously skipped alike.
 # ------------------------------------------------------------------
 i=0
 for tgz in "${tgzs[@]}"; do
   name="${pkg_names[$i]}"
   ver="${pkg_vers[$i]}"
-
-  if npm view "$name@$ver" version >/dev/null 2>&1; then
-    # Version exists: presence is not identity — a rerun must prove
-    # the published tarball carries THIS build's fixed artifact, not
-    # silently skip a divergent artifact (#225).
-    echo "$name@$ver already published — verifying content identity"
-    "$here/verify-npm-registry.sh" "$name" "$ver" "$tgz" || {
-      echo "published $name@$ver differs from this build — refusing to skip" >&2
-      exit 1
-    }
-    i=$((i + 1))
-    continue
-  fi
-
-  # Publish the packed artifact itself: `npm publish <tgz>` ships the
-  # exact bytes Phase D verified — no re-pack gap (#225 r6).
-  npm publish "$tgz" --access public --provenance || {
-    echo "npm publish failed for $name@$ver" >&2; exit 1; }
-  # Post-publish verification: the registry must serve THIS artifact.
   "$here/verify-npm-registry.sh" "$name" "$ver" "$tgz" || {
-    echo "published $name@$ver does not match this build" >&2
+    echo "registry does not serve this build's $name@$ver" >&2
     exit 1
   }
   i=$((i + 1))
