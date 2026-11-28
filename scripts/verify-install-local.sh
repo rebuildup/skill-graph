@@ -169,8 +169,15 @@ fi
 # ------------------------------------------------------------------
 if command -v brew >/dev/null 2>&1; then
   sha="$(shasum -a 256 "$tgz" | awk '{print $1}')"
-  formula="$tmp/skill-graph.rb"
-  cat > "$formula" <<EOF
+  # Homebrew >= 7.0.14 refuses to load formulae from file paths
+  # (forbid_packages_from_paths is unconditional). The supported
+  # local equivalent of `brew install rebuildup/tap/skill-graph` is
+  # a LOCAL TAP: a git repo containing Formula/skill-graph.rb that
+  # `brew tap` clones — the same tap-qualified install path the real
+  # channel uses, against the frozen tarball via file:// (#225 r9).
+  tap_repo="$tmp/homebrew-sg-tap"
+  mkdir -p "$tap_repo/Formula"
+  cat > "$tap_repo/Formula/skill-graph.rb" <<EOF
 class SkillGraph < Formula
   desc "Agent Skills discovery and recommendation CLI"
   homepage "https://github.com/rebuildup/skill-graph"
@@ -188,28 +195,40 @@ class SkillGraph < Formula
   end
 end
 EOF
+  git -C "$tap_repo" init -q
+  git -C "$tap_repo" add -A
+  git -C "$tap_repo" -c user.email=ci@localhost -c user.name=ci commit -qm init
+  tap_name="sg-verify/skill-graph-tap"
   brew_log="$tmp/brew-install.log"
-  # `./` prefix is REQUIRED: brew parses bare `/abs/path.rb` and
-  # `user/repo` args as tap names ("Invalid tap name"), while
-  # `./formula.rb` is recognized as a local formula file.
-  if (cd "$tmp" && brew install ./skill-graph.rb >"$brew_log" 2>&1); then
-    bbin="$(brew --prefix)/bin/skill-graph"
-    bout="$("$bbin" --version 2>/dev/null || true)"
-    [ "$bout" = "skill-graph $version" ] \
-      && ok "brew install --version ($bout)" \
-      || bad "brew install --version got '$bout'"
-    printf '{}' | "$bbin" hook claude-code prompt >/dev/null 2>&1 \
-      && ok "brew install hook smoke" \
-      || bad "brew install hook smoke"
-    brew uninstall skill-graph >/dev/null 2>&1 \
-      && [ ! -e "$bbin" ] \
-      && ok "brew uninstall lifecycle" \
-      || bad "brew uninstall lifecycle"
+  brew_untap=0
+  if brew tap "$tap_name" "$tap_repo" >>"$brew_log" 2>&1; then
+    brew_untap=1
+    # NO_AUTO_UPDATE: the tap's "remote" is a local path; an update
+    # fetch is meaningless and could fail offline.
+    if HOMEBREW_NO_AUTO_UPDATE=1 brew install "$tap_name/skill-graph" >>"$brew_log" 2>&1; then
+      bbin="$(brew --prefix)/bin/skill-graph"
+      bout="$("$bbin" --version 2>/dev/null || true)"
+      [ "$bout" = "skill-graph $version" ] \
+        && ok "brew install --version ($bout)" \
+        || bad "brew install --version got '$bout'"
+      printf '{}' | "$bbin" hook claude-code prompt >/dev/null 2>&1 \
+        && ok "brew install hook smoke" \
+        || bad "brew install hook smoke"
+      HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall "$tap_name/skill-graph" >/dev/null 2>&1 \
+        && [ ! -e "$bbin" ] \
+        && ok "brew uninstall lifecycle" \
+        || bad "brew uninstall lifecycle"
+    else
+      echo "brew install output:" >&2
+      tail -30 "$brew_log" >&2
+      bad "brew install (local tap -> file:// tarball)"
+    fi
   else
-    echo "brew install output:" >&2
+    echo "brew tap output:" >&2
     tail -30 "$brew_log" >&2
-    bad "brew install (formula -> file:// tarball)"
+    bad "brew tap local repo"
   fi
+  [ "$brew_untap" -eq 1 ] && brew untap "$tap_name" >/dev/null 2>&1 || true
 else
   echo "SKIP: brew not installed — brew channel verified in CI artifact-verify"
 fi
