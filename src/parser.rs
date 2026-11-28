@@ -193,17 +193,8 @@ struct Frontmatter {
     allowed_tools: Option<String>,
 }
 
-/// Discovery skips symlinked SKILL.md files at walk time, but the path
-/// can be swapped for a symlink before `open` — O_NOFOLLOW makes the
-/// open fail instead of reading through the link (same defense as the
-/// hook's state files). O_NONBLOCK keeps a swapped-in FIFO from
-/// hanging the read; both are no-ops on regular files.
-#[cfg(unix)]
-fn no_follow(opts: &mut fs::OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-}
-
+/// Kept for the non-unix read path only: unix opens go through
+/// `open_beneath`, which pins every component by fd (#225 D01).
 #[cfg(not(unix))]
 fn no_follow(_opts: &mut fs::OpenOptions) {}
 
@@ -290,11 +281,107 @@ fn yaml_frontmatter_hazard(input: &str) -> Option<&'static str> {
     }
 }
 
+/// Open `path` beneath `root` without ever following a symlink or
+/// racing an ancestor swap (#225 D01). Each component is resolved
+/// relative to the previous component's open fd with O_NOFOLLOW, so a
+/// directory swapped for a symlink — or retargeted — between discovery
+/// and open cannot redirect the read outside `root`. Returns None on
+/// any resolution failure; the caller treats it as a read error.
+#[cfg(unix)]
+fn open_beneath(root: &Path, path: &Path) -> Option<fs::File> {
+    use std::ffi::{CString, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::FromRawFd;
+    fn cstr(s: &OsStr) -> Option<CString> {
+        CString::new(s.as_bytes()).ok()
+    }
+    let rel = path.strip_prefix(root).ok()?;
+    let comps: Vec<std::path::Component> = rel.components().collect();
+    if comps.is_empty()
+        || comps.iter().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let root_c = cstr(root.as_os_str())?;
+    let mut dirfd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return None;
+    }
+    for comp in &comps[..comps.len() - 1] {
+        let Some(name) = cstr(comp.as_os_str()) else {
+            unsafe { libc::close(dirfd) };
+            return None;
+        };
+        let nfd = unsafe {
+            libc::openat(
+                dirfd,
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        unsafe { libc::close(dirfd) };
+        if nfd < 0 {
+            return None;
+        }
+        dirfd = nfd;
+    }
+    let Some(name) = cstr(comps.last()?.as_os_str()) else {
+        unsafe { libc::close(dirfd) };
+        return None;
+    };
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    unsafe { libc::close(dirfd) };
+    if fd < 0 {
+        return None;
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    if file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        Some(file)
+    } else {
+        None
+    }
+}
+
 /// Read at most `MAX_SKILL_BYTES + 1` bytes. The size cap is enforced
 /// on bytes actually read — pre-read metadata can be falsified by a
 /// file that grows between `metadata()` and `read()`, is swapped, or
 /// lives on a filesystem reporting misleading sizes.
-fn read_skill_bytes(path: &Path) -> Result<Vec<u8>, String> {
+#[cfg(unix)]
+fn read_skill_bytes(path: &Path, root: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let file = open_beneath(root, path).ok_or_else(|| {
+        format!(
+            "read {}: not resolvable as a regular file within root",
+            path.display()
+        )
+    })?;
+    let mut buf = Vec::new();
+    file.take(MAX_SKILL_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    Ok(buf)
+}
+
+#[cfg(not(unix))]
+fn read_skill_bytes(path: &Path, _root: &Path) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let mut opts = fs::OpenOptions::new();
     opts.read(true);
@@ -302,6 +389,17 @@ fn read_skill_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let file = opts
         .open(path)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
+    // O_NOFOLLOW pins the final component, but the opened object can
+    // still be a FIFO/device/socket (O_NONBLOCK keeps open() from
+    // blocking on a FIFO). Require a regular file on the OPEN fd —
+    // post-open fstat cannot be raced by a path swap (#225 D02).
+    if !file
+        .metadata()
+        .map_err(|e| format!("read {}: {e}", path.display()))?
+        .is_file()
+    {
+        return Err(format!("read {}: not a regular file", path.display()));
+    }
     let mut buf = Vec::new();
     file.take(MAX_SKILL_BYTES + 1)
         .read_to_end(&mut buf)
@@ -340,7 +438,7 @@ fn oversized_skill(path: &Path, root: &Path) -> Skill {
 }
 
 pub fn parse_skill(path: &Path, root: &Path) -> Result<Skill, String> {
-    let bytes = read_skill_bytes(path)?;
+    let bytes = read_skill_bytes(path, root)?;
     if bytes.len() as u64 > MAX_SKILL_BYTES {
         return Ok(oversized_skill(path, root));
     }

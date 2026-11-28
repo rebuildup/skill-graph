@@ -242,47 +242,16 @@ fn unknown_runtime_and_mode_fail_open() {
 }
 
 #[test]
-fn prompt_mode_records_recommended_names_per_session() {
+fn skill_load_surfaces_declared_dependencies_only() {
+    // #225 B08: alpha-skill declares `requires-skills: beta-skill` — the
+    // injection must name exactly that declared dependency, never a
+    // generic recommendation.
     let dir = tempfile::tempdir().unwrap();
     let envs = fixture_env(&dir);
-    let state = dir.path().join("state");
-    let payload = json!({"session_id":"s1","prompt":"use alpha-skill please"});
-    let (out, rc) = run_hook(
-        &["hook", "claude-code", "prompt"],
-        &payload,
-        &env_pairs(&envs),
-    );
-    assert_eq!(rc, 0);
-    assert!(!out.trim().is_empty());
-    let rec_file = state.join("claude-code-s1.recommended");
-    let names = std::fs::read_to_string(&rec_file).expect("recommended file");
-    let lines: Vec<&str> = names.lines().collect();
-    assert!(!lines.is_empty());
-    // names only: every line is a fixture skill name, no prompt text
-    for line in &lines {
-        assert!(
-            line.ends_with("-skill") || *line == "kappa-skill",
-            "unexpected content: {line}"
-        );
-    }
-    assert!(!names.contains("please"));
-    // other sessions are untouched
-    assert!(!state.join("claude-code-s2.recommended").exists());
-}
-
-#[test]
-fn skill_load_uses_session_recommended_as_context() {
-    let dir = tempfile::tempdir().unwrap();
-    let envs = fixture_env(&dir);
-    let state = dir.path().join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    // Seed session context whose terms hit beta-skill's description
-    // ("tests", "verification harnesses") — admits it via context alone.
-    std::fs::write(state.join("claude-code-s1.recommended"), "tests\nharness\n").unwrap();
     let payload = json!({
-        "session_id":"s1",
+        "session_id":"s2",
         "tool_name":"Skill",
-        "tool_input":{"skill":"kappa-skill"}
+        "tool_input":{"skill":"alpha-skill"}
     });
     let (out, rc) = run_hook(
         &["hook", "claude-code", "skill-load"],
@@ -295,14 +264,29 @@ fn skill_load_uses_session_recommended_as_context() {
         .as_str()
         .unwrap();
     assert!(ctx.contains("beta-skill"), "context was: {ctx}");
+    assert!(ctx.contains("declares dependencies"), "context was: {ctx}");
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    let rec = events
+        .iter()
+        .find(|e| e["kind"] == "recommendation" && e["trigger"] == "skill_load")
+        .expect("skill_load recommendation event");
+    assert_eq!(rec["emitted"], true);
+    assert_eq!(rec["reason"], "recommended");
+    let names: Vec<&str> = rec["recommended"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["beta-skill"]);
 }
 
 #[test]
-fn skill_load_without_session_context_has_no_effect() {
+fn skill_load_without_declared_dependencies_injects_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let envs = fixture_env(&dir);
-    // Same payload, no .recommended file -> kappa-skill has no deps,
-    // so no dependency recommendation is emitted.
+    // kappa-skill has no `requires` declarations — thematic neighbors
+    // must NOT be surfaced as "dependencies".
     let payload = json!({
         "session_id":"s9",
         "tool_name":"Skill",
@@ -321,26 +305,7 @@ fn skill_load_without_session_context_has_no_effect() {
         .find(|e| e["kind"] == "recommendation")
         .expect("recommendation event");
     assert_eq!(rec["emitted"], false);
-}
-
-#[test]
-fn nostate_records_no_session_recommendations() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut envs = fixture_env(&dir);
-    envs.push(("SKILL_GRAPH_HOOK_NOSTATE".to_string(), "1".to_string()));
-    let payload = json!({"session_id":"s1","prompt":"use alpha-skill please"});
-    let (_, rc) = run_hook(
-        &["hook", "claude-code", "prompt"],
-        &payload,
-        &env_pairs(&envs),
-    );
-    assert_eq!(rc, 0);
-    assert!(
-        !dir.path()
-            .join("state")
-            .join("claude-code-s1.recommended")
-            .exists()
-    );
+    assert_eq!(rec["reason"], "no_declared_dependencies");
 }
 
 #[test]
@@ -473,11 +438,16 @@ fn degenerate_session_ids_stay_distinct() {
 /// SKILL_GRAPH_EVENT_LOG/SKILL_GRAPH_HOOK_STATE/TMPDIR would resolve
 /// against the hook's cwd (the project tree) and drop state there.
 #[test]
-fn relative_hook_env_paths_fall_back_to_tmpdir() {
+fn relative_hook_env_paths_fall_back_to_per_user_state() {
     let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
     let envs: Vec<(String, String)> = vec![
         ("SKILL_GRAPH_ROOTS".to_string(), fixture_roots()),
         ("TMPDIR".to_string(), tmp.path().to_string_lossy().into()),
+        ("HOME".to_string(), home.to_string_lossy().into()),
+        // Empty XDG must not win over HOME (env is inherited).
+        ("XDG_STATE_HOME".to_string(), String::new()),
         (
             "SKILL_GRAPH_EVENT_LOG".to_string(),
             "relative-events.jsonl".to_string(),
@@ -494,8 +464,11 @@ fn relative_hook_env_paths_fall_back_to_tmpdir() {
         &env_pairs(&envs),
     );
     assert_eq!(rc, 0);
-    // Relative values are ignored: the log lands under TMPDIR instead.
-    assert!(tmp.path().join("skill-graph-events.jsonl").exists());
+    // Relative values are ignored (#225 D06): the log lands under the
+    // per-user state root — HOME/.local/state/skill-graph — never in
+    // shared TMPDIR and never at the relative path.
+    let expected = home.join(".local/state/skill-graph/events.jsonl");
+    assert!(expected.exists(), "expected log at {expected:?}");
     assert!(!std::path::Path::new("relative-events.jsonl").exists());
 }
 

@@ -2242,17 +2242,20 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
                     if item.get("type").and_then(Value::as_str) != Some("tool") {
                         continue;
                     }
+                    // Same failure contract as live detection
+                    // (`detect_all_from_payload`): a tool part whose
+                    // state reports an error never loaded the skill.
+                    // Check `state` (where opencode records
+                    // status/error) and the part itself for shapes
+                    // that hoist the fields (#225 E06).
+                    let state = item.get("state").cloned().unwrap_or(Value::Null);
+                    if events::tool_result_failed(&state) || events::tool_result_failed(&item) {
+                        continue;
+                    }
                     let tool = item.get("name").and_then(Value::as_str).unwrap_or("");
-                    let input = item
-                        .get("state")
-                        .and_then(|s| s.get("input"))
-                        .cloned()
-                        .unwrap_or(Value::Null);
-                    let output = events::response_text(
-                        item.get("state")
-                            .and_then(|s| s.get("content"))
-                            .unwrap_or(&Value::Null),
-                    );
+                    let input = state.get("input").cloned().unwrap_or(Value::Null);
+                    let output =
+                        events::response_text(state.get("content").unwrap_or(&Value::Null));
                     for c in events::classify_tool_access_all(tool, &input, &output) {
                         record_event(
                             SkillUsageEvent::skill_load(
@@ -2325,8 +2328,15 @@ fn is_meaningful_prompt(text: &str) -> bool {
 /// `observe --summary`.
 pub fn summary(obs: &Observation) -> Value {
     let all: Vec<&crate::events::SkillUsageEvent> = obs.events.iter().collect();
-    let mut funnel_checks = MAX_FUNNEL_PAIR_CHECKS;
-    let mut out = funnel_for(&all, &mut funnel_checks).into_json();
+    // The session-scoped join depends only on each session's own events,
+    // so compute it ONCE over the whole event set and derive the
+    // overall, per-runtime, and per-session funnels from the same
+    // results. Recomputing the join per aggregation level both wasted
+    // the shared pair-check budget (later levels saw less of it and
+    // could disagree with the overall numbers) and was quadratic in
+    // the number of levels (#225 E01).
+    let joins = session_joins(&all);
+    let mut out = funnel_for(&all, &joins, FunnelScope::All).into_json();
     let mut by_runtime = serde_json::Map::new();
     for runtime in ["claude-code", "codex", "opencode"] {
         let subset: Vec<&crate::events::SkillUsageEvent> = all
@@ -2337,7 +2347,7 @@ pub fn summary(obs: &Observation) -> Value {
         if !subset.is_empty() {
             by_runtime.insert(
                 runtime.to_string(),
-                funnel_for(&subset, &mut funnel_checks).into_json(),
+                funnel_for(&subset, &joins, FunnelScope::Runtime(runtime)).into_json(),
             );
         }
     }
@@ -2348,22 +2358,30 @@ pub fn summary(obs: &Observation) -> Value {
     const MAX_SUMMARY_SESSIONS: usize = 500;
     let mut by_session_map = serde_json::Map::new();
     let mut session_events: std::collections::BTreeMap<
-        String,
+        (String, String),
         Vec<&crate::events::SkillUsageEvent>,
     > = std::collections::BTreeMap::new();
     for e in &all {
         if !e.session_id.is_empty() {
             session_events
-                .entry(format!("{}:{}", e.runtime.as_str(), e.session_id))
+                .entry((
+                    e.runtime.as_str().to_string(),
+                    e.session_id.as_str().to_string(),
+                ))
                 .or_default()
                 .push(*e);
         }
     }
     let total_sessions = session_events.len();
-    for (session_id, events) in session_events.into_iter().take(MAX_SUMMARY_SESSIONS) {
+    for ((runtime, session_id), events) in session_events.into_iter().take(MAX_SUMMARY_SESSIONS) {
         by_session_map.insert(
-            session_id,
-            funnel_for(&events, &mut funnel_checks).into_json(),
+            format!("{runtime}:{session_id}"),
+            funnel_for(
+                &events,
+                &joins,
+                FunnelScope::Session(runtime.as_str(), session_id.as_str()),
+            )
+            .into_json(),
         );
     }
     out["by_session"] = Value::Object(by_session_map);
@@ -2512,25 +2530,85 @@ struct Funnel {
     unnecessary_loads: usize,
     deltas_ms: Vec<i64>,
     emitted_per_session: BTreeMap<String, usize>,
+    /// Set when any contributing session join exhausted the pair-check
+    /// budget — `converted`/`deltas_ms` (and the rates derived from
+    /// them) are then lower bounds, not complete values (#225 E02).
+    conversion_partial: bool,
 }
 
-/// Global bound on timestamp-fallback pair examinations across ALL
-/// funnel passes in one summary() — the budget is shared so per-runtime
-/// and per-session recomputation cannot multiply it.
+/// Which slice of the precomputed session joins a funnel level
+/// aggregates. The join itself is level-independent (#225 E01).
+enum FunnelScope<'a> {
+    All,
+    Runtime(&'a str),
+    Session(&'a str, &'a str),
+}
+
+/// Global bound on timestamp-fallback pair examinations across the ONE
+/// session-join pass in `summary()` — the budget is spent once, not
+/// once per aggregation level.
 const MAX_FUNNEL_PAIR_CHECKS: usize = 8_000_000;
 
-/// Compute funnel metrics over a set of events (overall or one runtime).
-fn funnel_for(events: &[&crate::events::SkillUsageEvent], checks_left: &mut usize) -> Funnel {
-    use crate::events::EventKind;
-    let mut f = Funnel::default();
+/// Per-session funnel join result. Computed once per
+/// (runtime, session_id) group and reused by the overall, per-runtime,
+/// and per-session funnels so every level reports the same numbers.
+#[derive(Default)]
+struct SessionJoin {
+    converted: usize,
+    unnecessary_loads: usize,
+    deltas_ms: Vec<i64>,
+    /// False when the pair-check budget ran out during (or before) this
+    /// session's conversion scan — `converted`/`deltas_ms` are lower
+    /// bounds, not exact values.
+    conversion_complete: bool,
+}
+
+/// Compute the session-scoped join (conversion / unnecessary-load /
+/// timeliness) for every (runtime, session_id) group in `events`,
+/// exactly once. Events with an empty session id never join — they
+/// just never merge into one pseudo-session across unrelated files.
+fn session_joins(
+    events: &[&crate::events::SkillUsageEvent],
+) -> std::collections::BTreeMap<(String, String), SessionJoin> {
     // Stable per-session ordering: (timestamp, input order).
     let mut order: Vec<usize> = (0..events.len()).collect();
     order.sort_by_cached_key(|&i| (rfc3339_ms(&events[i].timestamp).unwrap_or(i64::MAX), i));
+    let mut by_session: std::collections::BTreeMap<(String, String), Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for &i in &order {
+        let e = events[i];
+        if e.session_id.is_empty() {
+            continue;
+        }
+        by_session
+            .entry((
+                e.runtime.as_str().to_string(),
+                e.session_id.as_str().to_string(),
+            ))
+            .or_default()
+            .push(i);
+    }
+    let mut checks_left = MAX_FUNNEL_PAIR_CHECKS;
+    let mut out = std::collections::BTreeMap::new();
+    for (key, idxs) in by_session {
+        out.insert(key, session_join(events, &idxs, &mut checks_left));
+    }
+    out
+}
+
+/// Compute funnel counters over a set of events plus the selected
+/// slice of the precomputed session joins.
+fn funnel_for(
+    events: &[&crate::events::SkillUsageEvent],
+    joins: &std::collections::BTreeMap<(String, String), SessionJoin>,
+    scope: FunnelScope<'_>,
+) -> Funnel {
+    use crate::events::EventKind;
+    let mut f = Funnel::default();
 
     // Top-level counters cover every event, including unattributable
     // ones (empty session_id) — they just never join a session funnel.
-    for &i in &order {
-        let e = events[i];
+    for e in events {
         match e.kind {
             EventKind::PromptSubmit => f.prompt_submits += 1,
             EventKind::Recommendation => {
@@ -2557,39 +2635,46 @@ fn funnel_for(events: &[&crate::events::SkillUsageEvent], checks_left: &mut usiz
             }
             _ => {}
         }
+        // `sessions` counts every session that produced ANY event, not
+        // only load-bearing ones — a session with prompts but no loads
+        // is still a session for loads_per_session's denominator.
+        if !e.session_id.is_empty() {
+            f.sessions
+                .insert(format!("{}:{}", e.runtime.as_str(), e.session_id));
+        }
     }
 
-    // Session-scoped joins group by (runtime, session_id): ids are only
-    // unique within a runtime, and events with no session id must not
-    // merge into one pseudo-session across unrelated files.
-    let mut by_session: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
-    for &i in &order {
-        let e = events[i];
-        if e.session_id.is_empty() {
+    for ((runtime, session_id), j) in joins {
+        let include = match scope {
+            FunnelScope::All => true,
+            FunnelScope::Runtime(r) => runtime.as_str() == r,
+            FunnelScope::Session(r, s) => runtime.as_str() == r && session_id.as_str() == s,
+        };
+        if !include {
             continue;
         }
-        f.sessions
-            .insert(format!("{}:{}", e.runtime.as_str(), e.session_id));
-        by_session
-            .entry((e.runtime.as_str(), e.session_id.as_str()))
-            .or_default()
-            .push(i);
-    }
-    for idxs in by_session.values() {
-        session_funnel(&mut f, events, idxs, checks_left);
+        f.converted += j.converted;
+        f.unnecessary_loads += j.unnecessary_loads;
+        f.deltas_ms.extend(j.deltas_ms.iter().copied());
+        if !j.conversion_complete {
+            f.conversion_partial = true;
+        }
     }
     f
 }
 
 /// conversion / unnecessary-load / timeliness for one session's
 /// timestamp-ordered event indexes.
-fn session_funnel(
-    f: &mut Funnel,
+fn session_join(
     events: &[&crate::events::SkillUsageEvent],
     idxs: &[usize],
     checks_left: &mut usize,
-) {
+) -> SessionJoin {
     use crate::events::EventKind;
+    let mut j = SessionJoin {
+        conversion_complete: true,
+        ..SessionJoin::default()
+    };
     let recs: Vec<usize> = idxs
         .iter()
         .copied()
@@ -2604,21 +2689,38 @@ fn session_funnel(
     // timestamp fallback must compare order positions, not raw indices.
     let pos: std::collections::HashMap<usize, usize> =
         idxs.iter().enumerate().map(|(p, &i)| (i, p)).collect();
-    // recommended names from emitted recommendations only — loads of
-    // names we never surfaced count as unnecessary per the pilot def.
-    let mut recommended_names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    // Recommended identities from emitted recommendations only — loads
+    // of names we never surfaced count as unnecessary per the pilot
+    // def. Identity is (name, digest): a recommendation names a specific
+    // revision, and a load carrying a DIFFERENT known digest is not that
+    // revision. `None` digest on either side degrades to name-level
+    // matching — the best identity either side can prove (#225 E05).
+    let mut recommended: std::collections::BTreeMap<
+        &str,
+        std::collections::BTreeSet<Option<&str>>,
+    > = std::collections::BTreeMap::new();
     for &ri in &recs {
         let e = events[ri];
         if e.emitted == Some(true) {
             for r in &e.recommended {
-                recommended_names.insert(r.name.as_str());
+                recommended
+                    .entry(r.name.as_str())
+                    .or_default()
+                    .insert(r.digest.as_deref());
             }
         }
     }
     for &li in &loads {
-        let name = events[li].skill_name.as_deref().unwrap_or("");
-        if !recommended_names.contains(name) {
-            f.unnecessary_loads += 1;
+        let e = events[li];
+        let name = e.skill_name.as_deref().unwrap_or("");
+        let load_digest = e.skill_digest.as_deref();
+        let necessary = recommended.get(name).is_some_and(|digests| {
+            digests
+                .iter()
+                .any(|d| d.is_none() || load_digest.is_none() || *d == load_digest)
+        });
+        if !necessary {
+            j.unnecessary_loads += 1;
         }
     }
 
@@ -2639,19 +2741,22 @@ fn session_funnel(
     // when every recommendation names the same skill — a crafted log
     // could hang `observe --summary`. Instead each name's load list
     // (already in session order) gets a cursor: loads are consumed or
-    // permanently ineligible (timestamp strictly before the current
-    // rec's — rec timestamps are non-decreasing in this loop) only move
-    // the cursor forward, never backward. The first eligible load per
-    // name is found by a short forward scan; the rec converts the
-    // minimum-position winner across its names, which is exactly the
-    // first eligible element of the merged union.
+    // permanently ineligible (strictly before the current rec in the
+    // session's (timestamp, encounter-order) total order — rec positions
+    // are non-decreasing in this loop) only move the cursor forward,
+    // never backward. The first eligible load per name is found by a
+    // short forward scan; the rec converts the minimum-position winner
+    // across its names, which is exactly the first eligible element of
+    // the merged union.
     //
     // Loads failing the timestamp fallback (`li > ri` encounter-order
     // check) are NOT permanently ineligible and are re-examined by
     // later recs, so a hostile all-missing-timestamp log could still
     // force quadratic scans. A global examination budget bounds that:
     // past it, remaining recs simply do not convert (deterministic —
-    // rec order is fixed).
+    // rec order is fixed) and the session is marked conversion-
+    // incomplete so partial results are never reported as exact (#225
+    // E02).
     #[derive(Default)]
     struct NameLoads {
         list: Vec<usize>,
@@ -2681,57 +2786,90 @@ fn session_funnel(
         if rec.emitted != Some(true) {
             continue;
         }
-        let names: std::collections::BTreeSet<&str> =
-            rec.recommended.iter().map(|r| r.name.as_str()).collect();
-        if names.is_empty() {
+        // name -> digests this rec recommended (None = unknown).
+        let mut rec_names: std::collections::BTreeMap<
+            &str,
+            std::collections::BTreeSet<Option<&str>>,
+        > = std::collections::BTreeMap::new();
+        for r in &rec.recommended {
+            rec_names
+                .entry(r.name.as_str())
+                .or_default()
+                .insert(r.digest.as_deref());
+        }
+        if rec_names.is_empty() {
             continue;
         }
         let rec_ts = timestamps[&ri];
+        let rec_pos = pos[&ri];
         // (session position, event index) of the earliest eligible load
         // per name; the winner is the minimum position across names.
         let mut best: Option<(usize, usize)> = None;
-        for name in &names {
+        for (name, digests) in &rec_names {
             let Some(nl) = by_name.get_mut(*name) else {
                 continue;
             };
             // Advance the cursor past loads that are dead for this and
-            // every later rec: consumed, or timestamped strictly before
-            // rec_ts (rec timestamps are non-decreasing). Timestamp
-            // kills are unsafe when the session mixes untimestamped
-            // recs — see `mixed_ts` above.
+            // every later rec: consumed, or strictly before this rec in
+            // the session's (timestamp, encounter-order) total order —
+            // rec positions are non-decreasing so such a load can never
+            // become eligible again. Position kills are only valid when
+            // both endpoints carry timestamps (an untimestamped load
+            // falls back to encounter-order eligibility `li > ri`,
+            // which `pos` does not order); `mixed_ts` disables them
+            // session-wide (#144 r13, #225 E03).
             while nl.cursor < nl.list.len() {
                 let li = nl.list[nl.cursor];
                 let dead = !mixed_ts
-                    && match (rec_ts, timestamps[&li]) {
-                        (Some(a), Some(b)) => b < a,
-                        _ => false,
-                    };
+                    && rec_ts.is_some()
+                    && timestamps[&li].is_some()
+                    && pos[&li] <= rec_pos;
                 if consumed.contains(&li) || dead {
                     nl.cursor += 1;
                 } else {
                     break;
                 }
             }
-            let mut j = nl.cursor;
-            while j < nl.list.len() {
-                let li = nl.list[j];
-                j += 1;
+            let mut k = nl.cursor;
+            while k < nl.list.len() {
+                let li = nl.list[k];
+                k += 1;
                 *checks_left = checks_left.saturating_sub(1);
                 if *checks_left == 0 {
+                    j.conversion_complete = false;
                     break 'recs;
                 }
                 if consumed.contains(&li) {
                     continue;
                 }
+                // Digest identity: the load must be compatible with at
+                // least one revision this rec recommended — equal known
+                // digests, or an unknown digest on either side (#225
+                // E05). A same-name load of a different known revision
+                // neither converts nor counts as necessary.
+                let load_digest = events[li].skill_digest.as_deref();
+                if !digests
+                    .iter()
+                    .any(|d| d.is_none() || load_digest.is_none() || *d == load_digest)
+                {
+                    continue;
+                }
                 let load_ts = timestamps[&li];
-                // When either timestamp is unparseable, fall back to input
-                // (encounter) order — events are collected in transcript/log
-                // order, which is the best available chronology. The
-                // timestamp-sorted position must NOT be used here: missing
-                // timestamps sort to i64::MAX, so a position comparison would
-                // fabricate "missing ts = latest" and invert real ordering.
+                // Eligibility uses the session's strict (timestamp,
+                // encounter-order) total order: for two timestamped
+                // events that is exactly `pos` order, so a load sharing
+                // the rec's timestamp only counts when it was also
+                // encountered later — `b >= a` alone would let a load
+                // that happened BEFORE the recommendation convert it
+                // (#225 E03). When either timestamp is unparseable the
+                // ordering falls back to encounter order (`li > ri`):
+                // events are collected in transcript/log order, the
+                // best available chronology, and the timestamp-sorted
+                // position must NOT be used here because missing
+                // timestamps sort to i64::MAX and would fabricate
+                // "missing ts = latest".
                 let after = match (rec_ts, load_ts) {
-                    (Some(a), Some(b)) => b >= a,
+                    (Some(_), Some(_)) => pos[&li] > rec_pos,
                     _ => li > ri,
                 };
                 if !after {
@@ -2761,12 +2899,13 @@ fn session_funnel(
         }
         if let Some((_, li)) = best {
             consumed.insert(li);
-            f.converted += 1;
+            j.converted += 1;
             if let (Some(a), Some(b)) = (rec_ts, timestamps[&li]) {
-                f.deltas_ms.push(b - a);
+                j.deltas_ms.push(b - a);
             }
         }
     }
+    j
 }
 
 impl Funnel {
@@ -2786,6 +2925,21 @@ impl Funnel {
             }
             let idx = ((deltas.len() - 1) as f64 * p).round() as usize;
             json!(deltas[idx])
+        };
+        // E02: when any contributing session join exhausted the
+        // pair-check budget, conversion and timeliness are lower bounds
+        // — report the status explicitly and withhold the derived rates
+        // rather than presenting partial values as complete.
+        let conversion_complete = !self.conversion_partial;
+        let timeliness = if conversion_complete {
+            json!({
+                "count": deltas.len(),
+                "p50": percentile(0.50),
+                "p95": percentile(0.95),
+                "max": deltas.last().map(|d| json!(d)).unwrap_or(Value::Null),
+            })
+        } else {
+            Value::Null
         };
         let eps: Vec<usize> = self.emitted_per_session.values().copied().collect();
         let (avg, max) = if eps.is_empty() {
@@ -2807,22 +2961,28 @@ impl Funnel {
             "load_grade_loads": self.load_grade_loads,
             "session_attributed_loads": self.session_attributed_loads,
             "sessions_with_loads": self.sessions_with_loads.len(),
+            // Numerator and denominator share the session-attributed
+            // population: anonymous loads (empty session id) are in
+            // `load_grade_loads` but can never join a session, so
+            // dividing them by the session count would mix populations
+            // (#225 E04).
             "loads_per_session": if self.sessions.is_empty() { Value::Null } else {
-                json!((self.load_grade_loads as f64 / self.sessions.len() as f64 * 100.0).round() / 100.0)
+                json!((self.session_attributed_loads as f64 / self.sessions.len() as f64 * 100.0).round() / 100.0)
             },
+            "conversion_status": if conversion_complete { "complete" } else { "partial" },
+            // When partial, `converted_recommendations` is a lower
+            // bound and the rate/timeliness fields are withheld (null).
             "converted_recommendations": self.converted,
-            "conversion_rate_pct": pct(self.converted, self.emitted),
+            "conversion_rate_pct": if conversion_complete { pct(self.converted, self.emitted) } else { Value::Null },
             "unnecessary_loads": self.unnecessary_loads,
             // Session-scoped rate: numerator and denominator both cover
             // only session-attributed loads — unattributable loads are
             // excluded from BOTH sides rather than deflating the rate.
+            // unnecessary_loads is counted before the budget-gated
+            // conversion scan, so it stays exact even when the join is
+            // partial.
             "unnecessary_load_rate_pct": pct(self.unnecessary_loads, self.session_attributed_loads),
-            "timeliness_ms": {
-                "count": deltas.len(),
-                "p50": percentile(0.50),
-                "p95": percentile(0.95),
-                "max": deltas.last().map(|d| json!(d)).unwrap_or(Value::Null),
-            },
+            "timeliness_ms": timeliness,
             "context_consumption": {
                 "emitted_total": self.emitted,
                 "emitted_per_session_avg": avg,

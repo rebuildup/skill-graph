@@ -254,6 +254,42 @@ fn add_mentions(
     skills[index].links.extend(mentions);
 }
 
+/// Declared `requires` dependencies of `skill_name`, resolved against
+/// the graph (#225 B08): the union of resolved requires targets across
+/// every discovered copy of the name — sorted, deduplicated,
+/// self-references excluded. Returns (name, digest) pairs; the digest
+/// is the first discovered copy's, matching by_name representative
+/// semantics. Generic recommendations are NOT dependencies and must
+/// never be surfaced through this path — the skill-load hook and the
+/// OpenCode plugin both consume this single definition so their
+/// "declares dependencies" claims stay truthful.
+pub fn declared_dependencies(graph: &Graph, skill_name: &str) -> Vec<(String, String)> {
+    let mut deps: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for skill in graph.skills.iter().filter(|s| s.name == skill_name) {
+        for link in &skill.links {
+            if link.kind != LinkKind::Requires {
+                continue;
+            }
+            let Some(name) = &link.resolved_name else {
+                continue;
+            };
+            if name == skill_name || !seen.insert(name.clone()) {
+                continue;
+            }
+            let digest = graph
+                .by_name
+                .get(name)
+                .and_then(|idx| idx.first())
+                .map(|&i| graph.skills[i].digest.clone())
+                .unwrap_or_default();
+            deps.push((name.clone(), digest));
+        }
+    }
+    deps.sort();
+    deps
+}
+
 pub fn normalize_path(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {

@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  actions: read      # download the pinned freeze run's artifacts
   id-token: write # required for `npm publish --provenance`
 
 jobs:
@@ -61,7 +62,10 @@ jobs:
           # (#144 r19).
           [ "$(git rev-parse HEAD)" = "$tag_sha" ] || {
             echo "checked-out HEAD is not tag $tag" >&2; exit 1; }
-          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          {
+            echo "RELEASE_TAG=$tag"
+            echo "TAG_SHA=$tag_sha"
+          } >> "$GITHUB_ENV"
       - name: Verify manifest versions match tag
         run: |
           set -euo pipefail
@@ -98,107 +102,114 @@ jobs:
             echo "optionalDependencies not at $want: $stale" >&2
             exit 1
           }
-      - name: Download release binaries
+      - name: Download the APPROVED freeze manifest and frozen npm artifacts
+        # The GitHub Release's freeze-manifest.json IS the approval
+        # record: release.yml publishes it only after binding it to a
+        # pinned, verified artifact-verify run (#225 A02/A11). This
+        # job never re-derives approval — it resolves the run the
+        # manifest names, proves that run is promotable, downloads
+        # ITS artifacts, and requires the downloaded manifest to be
+        # byte-identical to the published one.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # The tag push and release.yml run concurrently; wait for the
-          # release assets to appear.
-          mkdir -p dist
+          mkdir -p release-assets frozen npm-out
+          # The tag push and release.yml run concurrently; wait for
+          # the approved manifest + release assets to appear.
           for i in $(seq 1 60); do
-            if gh release download "$RELEASE_TAG" --pattern 'skill-graph-*.tar.gz' --dir dist --clobber 2>/dev/null \
-              && gh release download "$RELEASE_TAG" --pattern 'sha256sums.txt' --dir dist --clobber 2>/dev/null; then
+            if gh release download "$RELEASE_TAG" \
+                 --pattern 'freeze-manifest.json' --pattern 'sha256sums.txt' \
+                 --pattern 'skill-graph-*.tar.gz' \
+                 --dir release-assets --clobber 2>/dev/null \
+               && [ -f release-assets/freeze-manifest.json ] \
+               && [ -f release-assets/sha256sums.txt ]; then
               break
             fi
             if [ "$i" = "60" ]; then
-              echo "release assets for $RELEASE_TAG not ready after 20min" >&2
+              echo "approved release assets for $RELEASE_TAG not ready after 20min" >&2
               exit 1
             fi
             echo "release assets for $RELEASE_TAG not ready (attempt $i), retrying in 20s"
             sleep 20
           done
-          ls -l dist/
-      - name: Verify checksums
-        run: |
-          set -euo pipefail
-          cd dist
-          # Strict set verification (#225): `sha256sum -c` alone only
-          # checks listed files that exist — an asset missing from the
-          # manifest, or a manifest entry whose file never downloaded,
-          # would pass silently. Require BOTH directions: every manifest
-          # entry present+matching, and the downloaded tarball set
-          # exactly equal to the manifest's file set.
-          sha256sum -c sha256sums.txt
-          awk '{print $NF}' sha256sums.txt | sort > /tmp/expected-assets.txt
-          ls ./*.tar.gz | xargs -n1 basename | sort > /tmp/actual-assets.txt
-          diff /tmp/expected-assets.txt /tmp/actual-assets.txt
-          # And every platform target must have its asset.
-          while IFS=: read -r target triple; do
-            [ -n "$target" ] || continue
-            grep -qx "skill-graph-${triple}.tar.gz" /tmp/expected-assets.txt || {
-              echo "manifest missing asset for $target" >&2; exit 1; }
-          done <<< "$TARGETS"
-      - name: Assemble platform packages
-        run: |
-          set -euo pipefail
-          while IFS=: read -r target triple; do
-            [ -n "$target" ] || continue
-            pkg="npm/skill-graph-${target}"
-            mkdir -p "$pkg/bin" /tmp/sg-pkg
-            tar -xzf "dist/skill-graph-${triple}.tar.gz" -C /tmp/sg-pkg
-            # cp -p carries the frozen tarball's exec bit through
-            # EXACTLY — no chmod repair: if the payload lacked +x the
-            # assert below fails instead of silently fixing it
-            # (#225 r10/r11).
-            cp -p /tmp/sg-pkg/skill-graph "$pkg/bin/skill-graph"
-            [ -x "$pkg/bin/skill-graph" ] || {
-              echo "frozen payload lost exec bit: $pkg/bin/skill-graph" >&2
-              exit 1
-            }
-            rm -rf /tmp/sg-pkg
-            if [ "$target" = "linux-x64" ]; then
-              got="$("$pkg/bin/skill-graph" --version)"
-              want="${RELEASE_TAG#v}"
-              [[ "$got" == *"$want"* ]] || {
-                echo "version mismatch: binary reports '$got', expected $want" >&2
-                exit 1
-              }
-            else
-              # cross-compiled binaries cannot exec on this runner;
-              # the standalone verifier checks object format AND
-              # architecture with explicit rejection paths — covered by
-              # scripts/test-release-verify.sh (#225 re-review).
-              scripts/verify-npm-arch.sh "$target" "$pkg/bin/skill-graph"
-            fi
-          done <<< "$TARGETS"
-      - name: Bundle portable plugin into metapackage
-        run: |
-          set -euo pipefail
-          rm -rf npm/skill-graph/plugin npm/skill-graph/contracts
-          cp -r plugins/skill-graph npm/skill-graph/plugin
-          cp -r contracts npm/skill-graph/contracts
-      - name: Publish packages
+          # The manifest names its freeze run — validate it is a
+          # promotable run (artifact-verify workflow, push event,
+          # success, this tag's commit, matching attempt).
+          run_id="$(python3 -c "import json;print(json.load(open('release-assets/freeze-manifest.json'))['run_id'])")"
+          run_attempt="$(python3 -c "import json;print(json.load(open('release-assets/freeze-manifest.json'))['run_attempt'])")"
+          head_sha="$(python3 -c "import json;print(json.load(open('release-assets/freeze-manifest.json'))['head_sha'])")"
+          [ "$head_sha" = "$TAG_SHA" ] || {
+            echo "manifest head_sha $head_sha != tag commit $TAG_SHA" >&2; exit 1; }
+          j="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")"
+          [ "$(jq -r '.path' <<< "$j")" = ".github/workflows/artifact-verify.yml" ] || {
+            echo "manifest run_id $run_id is not artifact-verify.yml" >&2; exit 1; }
+          [ "$(jq -r '.event' <<< "$j")" = "push" ] || {
+            echo "manifest run event is not push" >&2; exit 1; }
+          [ "$(jq -r '.head_sha' <<< "$j")" = "$TAG_SHA" ] || {
+            echo "manifest run head_sha mismatch" >&2; exit 1; }
+          [ "$(jq -r '.status' <<< "$j")" = "completed" ] || exit 1
+          [ "$(jq -r '.conclusion' <<< "$j")" = "success" ] || exit 1
+          [ "$(jq -r '.run_attempt' <<< "$j")" = "$run_attempt" ] || {
+            echo "freeze run was re-run after approval (attempt $run_attempt -> $(jq -r '.run_attempt' <<< "$j")); frozen bytes may differ — refusing to publish" >&2
+            exit 1; }
+          gh run download "$run_id" --dir frozen
+          # The artifact-carried manifest must be BYTE-IDENTICAL to
+          # the release-published approval record.
+          cmp release-assets/freeze-manifest.json frozen/approved-manifest/freeze-manifest.json || {
+            echo "downloaded manifest differs from published approval record" >&2; exit 1; }
+          # Every artifact the manifest names must exist exactly once
+          # with its recorded digest — including all 5 npm tgz.
+          python3 scripts/verify-freeze-manifest.py \
+            frozen/approved-manifest/freeze-manifest.json \
+            --run-id "$run_id" --run-attempt "$run_attempt" \
+            --head-sha "$TAG_SHA" --event push \
+            --require-channel release --require-channel npm \
+            --require-channel npm-meta --require-channel crates \
+            --artifact-dir frozen
+          # Provenance for the exact bytes about to be published —
+          # bound to the approved workflow and source commit (#225 A04).
+          while IFS= read -r f; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "rebuildup/skill-graph/.github/workflows/artifact-verify.yml" \
+              --signer-repo "rebuildup/skill-graph" \
+              --source-digest "$TAG_SHA"
+          done < <(find frozen -name '*.tgz' -type f)
+          echo "npm artifacts verified against approved manifest (run $run_id attempt $run_attempt)"
+      - name: Publish the FROZEN npm artifacts in dependency order
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
-          # The publish decision path — two-phase preflight (all
-          # packages validated BEFORE any publish), skip-vs-publish,
-          # registry content identity on BOTH paths, bin executability
-          # and format, dependency order — lives in
-          # scripts/publish-npm.sh so it is exercised end-to-end by
-          # scripts/test-npm-publish.sh against a stub npm. This
-          # workflow cannot run without NPM_TOKEN, so the logic must
-          # be verifiable outside it (#225 re-review).
-          # ONE invocation covers platform packages AND the
-          # metapackage: its optionalDependencies are checked against
-          # argument order, so the metapackage cannot precede its
-          # platform packages (#225 r5).
-          pkgs=()
+          # Publish the exact .tgz bytes the approved manifest
+          # digests — never a re-pack (#225 A06/A11/A12). The manifest
+          # is the artifact index: locate each npm-channel artifact by
+          # its recorded channel+target, then hand the files to
+          # publish-npm.sh in dependency order (platform packages
+          # first — the metapackage's optionalDependencies must
+          # resolve — metapackage last).
+          manifest=frozen/approved-manifest/freeze-manifest.json
+          tgzs=()
           while IFS=: read -r target triple; do
             [ -n "$target" ] || continue
-            pkgs+=("npm/skill-graph-${target}")
+            name="$(python3 -c "
+          import json, sys
+          m = json.load(open('$manifest'))
+          hits = [n for n, a in m['artifacts'].items()
+                  if a['channel'] == 'npm' and a.get('target') == '$target']
+          assert len(hits) == 1, hits
+          print(hits[0])")"
+            f="$(find frozen -name "$name" -type f -print -quit)"
+            [ -n "$f" ] || { echo "frozen tgz $name missing for $target" >&2; exit 1; }
+            tgzs+=("$f")
           done <<< "$TARGETS"
-          pkgs+=("npm/skill-graph")
-          scripts/publish-npm.sh "${pkgs[@]}"
+          meta="$(python3 -c "
+          import json
+          m = json.load(open('$manifest'))
+          hits = [n for n, a in m['artifacts'].items() if a['channel'] == 'npm-meta']
+          assert len(hits) == 1, hits
+          print(hits[0])")"
+          f="$(find frozen/approved-manifest -maxdepth 1 -name "$meta" -type f -print -quit)"
+          [ -n "$f" ] || { echo "frozen metapackage $meta missing" >&2; exit 1; }
+          tgzs+=("$f")
+          scripts/publish-npm.sh "${tgzs[@]}"

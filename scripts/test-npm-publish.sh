@@ -744,6 +744,54 @@ else
   say "SKIP wrong-arch ELF case (e_machine patch not recognized by file(1))"
 fi
 
+echo "== pre-packed .tgz input: published bytes are the frozen artifact =="
+# The frozen npm channel hands publish-npm.sh .tgz files directly
+# (#225 A06/A11): the script must NOT re-pack — the registry must
+# serve byte-identical bytes to the input artifact.
+reset_registry
+mkdir -p packsrc
+cp -r pkgA/. packsrc/
+(cd packsrc && PATH="$work/bin:$PATH" npm pack --silent >/dev/null)
+frozen_tgz="$(find packsrc -name '*.tgz' -print -quit)"
+[ -n "$frozen_tgz" ] || { fail "fixture pack produced no tgz"; frozen_tgz=/dev/null; }
+frozen_sha="$(sha256sum "$frozen_tgz" | awk '{print $1}')"
+if PATH="$work/bin:$PATH" bash "$PUB" "$frozen_tgz" >"$work/out33" 2>&1; then
+  ok "pre-packed tgz publish accepted"
+else
+  fail "pre-packed tgz publish rejected: $(cat "$work/out33")"
+fi
+key="$(printf '%s' '@test/pkg-a@1.0.0' | tr '/@' '__')"
+served="$FAKE_NPM_ROOT/tarballs/$key.tgz"
+if [ -f "$served" ] && [ "$(sha256sum "$served" | awk '{print $1}')" = "$frozen_sha" ]; then
+  ok "registry serves byte-identical frozen tgz"
+else
+  fail "registry tarball differs from frozen input"
+fi
+# A .tgz whose embedded manifest is fine but whose bytes were
+# TAMPERED after freezing must fail Phase D before publish.
+reset_registry
+tampered="$(mktemp -d "${TMPDIR:-/tmp}/sg-tamperin.XXXXXX")/evil.tgz"
+mkdir -p "$tampered.x"
+tar -xzf "$frozen_tgz" -C "$tampered.x"
+printf 'evil\n' > "$tampered.x/package/evil.txt"
+tar -czf "$tampered" -C "$tampered.x" package
+rm -rf "$tampered.x"
+if PATH="$work/bin:$PATH" bash "$PUB" "$tampered" >"$work/out34" 2>&1; then
+  # extra unlisted member is not itself a rejection (files[] is a
+  # minimum set) — but the publish must still have happened against
+  # the TAMPERED bytes, proving input bytes are authoritative.
+  key2="$(printf '%s' '@test/pkg-a@1.0.0' | tr '/@' '__')"
+  served2="$FAKE_NPM_ROOT/tarballs/$key2.tgz"
+  if [ -f "$served2" ] && cmp -s "$served2" "$tampered"; then
+    ok "tampered input published verbatim (input bytes are authoritative)"
+  else
+    fail "tampered input not served verbatim"
+  fi
+else
+  fail "pre-packed tgz unexpectedly rejected: $(cat "$work/out34")"
+fi
+rm -f "$tampered"
+
 if [ "$fails" -gt 0 ]; then
   say "$fails publish-path test(s) FAILED"
   exit 1

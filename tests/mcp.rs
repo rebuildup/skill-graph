@@ -14,6 +14,10 @@ struct Mcp {
 
 impl Mcp {
     fn spawn() -> Self {
+        Self::spawn_with_version("2025-11-25")
+    }
+
+    fn spawn_with_version(protocol: &str) -> Self {
         let bin = env!("CARGO_BIN_EXE_skill-graph");
         let mut child = Command::new(bin)
             .arg("mcp")
@@ -33,7 +37,7 @@ impl Mcp {
         mcp.request(
             "initialize",
             json!({
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": protocol,
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "0"},
             }),
@@ -110,7 +114,7 @@ fn recommend_returns_cli_shape() {
     assert_eq!(result["isError"], false, "{result}");
     let text = result["content"][0]["text"].as_str().unwrap();
     let recs: Value = serde_json::from_str(text).unwrap();
-    let names: Vec<&str> = recs
+    let names: Vec<&str> = recs["recommendations"]
         .as_array()
         .unwrap()
         .iter()
@@ -221,7 +225,7 @@ fn filesystem_changes_are_visible_without_restart() {
     assert_eq!(result["isError"], false, "{result}");
     let text = result["content"][0]["text"].as_str().unwrap();
     let recs: Value = serde_json::from_str(text).unwrap();
-    let names: Vec<&str> = recs
+    let names: Vec<&str> = recs["recommendations"]
         .as_array()
         .unwrap()
         .iter()
@@ -271,7 +275,11 @@ fn all_invalid_explicit_roots_do_not_widen_to_defaults() {
     );
     let text = result["content"][0]["text"].as_str().unwrap();
     let recs: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(recs.as_array().unwrap().len(), 0, "{recs}");
+    assert_eq!(
+        recs["recommendations"].as_array().unwrap().len(),
+        0,
+        "{recs}"
+    );
 }
 
 /// #144 round-11: a present `roots` array defines the scope even when it
@@ -302,4 +310,43 @@ fn non_array_roots_is_rejected() {
         json!({"name": "discover", "arguments": {"roots": "/tmp"}}),
     );
     assert!(res.get("error").is_some(), "expected JSON-RPC error: {res}");
+}
+
+/// #225 E08: an inbound line beyond the 4 MiB cap is dropped by the
+/// transport without killing the connection — the next valid request
+/// is still served. Before the cap, rmcp's 16 MiB default (or an
+/// unbounded buffer on older SDKs) let a peer grow memory per line.
+#[test]
+fn oversized_line_is_dropped_and_server_survives() {
+    let mut mcp = Mcp::spawn();
+    // One 5 MiB line — over the 4 MiB inbound cap.
+    let raw = "x".repeat(5 * 1024 * 1024);
+    use std::io::Write as _;
+    writeln!(mcp.stdin, "{raw}").unwrap();
+    mcp.stdin.flush().unwrap();
+    // Server must still answer a normal request afterwards.
+    let res = mcp.request("tools/list", Value::Null);
+    assert!(res["result"]["tools"].is_array(), "{res}");
+}
+
+/// #225 E10: `recommend` wraps its array in an object envelope so
+/// structuredContent is a JSON object — valid on every protocol
+/// version an initialize handshake can negotiate (2026-07-28 has no
+/// initialize path in this SDK, so initialize sessions are always
+/// legacy and would strip a bare array). Verified on the wire: the
+/// legacy peer receives structuredContent AND the same JSON as text.
+#[test]
+fn structured_content_matches_negotiated_protocol() {
+    let mut mcp = Mcp::spawn_with_version("2025-11-25");
+    let result = mcp.call(
+        "recommend",
+        json!({"query": "alpha task", "roots": fixture_roots(), "max": 1}),
+    );
+    // Object envelope survives the legacy-peer strip rule.
+    let sc = &result["structuredContent"];
+    assert!(sc["recommendations"].is_array(), "{result}");
+    // text content carries the identical JSON value.
+    let text = result["content"][0]["text"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(parsed, *sc, "text and structuredContent diverged");
 }

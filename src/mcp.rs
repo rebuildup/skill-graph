@@ -36,6 +36,20 @@ const MAX_TOOL_ROOTS: usize = 32;
 /// the tool into an unbounded filesystem enumeration oracle.
 const MAX_DISCOVER_SKILLS: usize = 512;
 
+/// Inbound JSON-RPC line cap (#225 E08). rmcp's default is 16 MiB; tool
+/// arguments are KB-scale, so MCP gets the same 4 MiB parse bound the
+/// hook/detect stdin path uses. Oversized lines are dropped by the
+/// transport (connection stays open) instead of being buffered.
+const MAX_MCP_LINE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Serialized-size budget for every tool response (#225 E09), applied
+/// uniformly to recommend/discover/resolve: results whose JSON text
+/// exceeds this are rejected with an explicit tool error rather than
+/// emitted as an unbounded payload. 4 MiB is ~5x the largest legitimate
+/// response (discover at MAX_DISCOVER_SKILLS); the structured_content
+/// mirror doubles wire bytes at most, keeping total output bounded.
+const MAX_TOOL_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
 struct SkillGraphMcp {
     /// Serializes tool computations. spawn_blocking has no concurrency
     /// bound of its own, and MCP clients may pipeline calls: without
@@ -114,6 +128,11 @@ fn arg_usize(args: &JsonObject, key: &str, default: usize) -> usize {
 
 fn tool_result(value: &Value) -> CallToolResponse {
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string());
+    if text.len() > MAX_TOOL_RESULT_BYTES {
+        return tool_error(&format!(
+            "tool result exceeds {MAX_TOOL_RESULT_BYTES} bytes; narrow the request (e.g. fewer roots or a smaller max)"
+        ));
+    }
     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = Some(value.clone());
     result.into()
@@ -275,7 +294,12 @@ fn compute_tool(name: &str, args: &JsonObject) -> Result<CallToolResponse, McpEr
                 arg_str(args, "context").unwrap_or(""),
                 arg_usize(args, "max", 3).min(64),
             );
-            tool_result(&json!(recs))
+            // Envelope in an object: pre-2026-07-28 protocol versions
+            // require structuredContent to be a JSON object, so a bare
+            // array would be stripped on every initialize-negotiated
+            // session (#225 E10). The array itself still matches
+            // recommendation.schema.json inside `recommendations`.
+            tool_result(&json!({"recommendations": recs}))
         }
         "discover" => {
             let (roots, diagnostics) =
@@ -352,11 +376,42 @@ pub fn run() -> Result<(), String> {
         .build()
         .map_err(|e| format!("tokio runtime: {e}"))?;
     runtime.block_on(async {
+        // AsyncRwTransport gives the inbound line cap E08 requires —
+        // plain stdio() has no bound below rmcp's 16 MiB default.
+        let transport = rmcp::transport::async_rw::AsyncRwTransport::new_server(
+            tokio::io::stdin(),
+            tokio::io::stdout(),
+        )
+        .with_max_line_length(MAX_MCP_LINE_BYTES);
         let server = SkillGraphMcp::new()
-            .serve(rmcp::transport::stdio())
+            .serve(transport)
             .await
             .map_err(|e| format!("mcp serve: {e}"))?;
         let _ = server.waiting().await;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #225 E09: every tool response path shares the serialized-size
+    /// budget — an oversized result is an explicit tool error, never
+    /// an unbounded payload.
+    #[test]
+    fn tool_result_rejects_oversized_payload() {
+        let huge = json!({"blob": "x".repeat(MAX_TOOL_RESULT_BYTES)});
+        let rmcp::model::CallToolResponse::Complete(result) = tool_result(&huge) else {
+            panic!("expected complete call tool result");
+        };
+        assert_eq!(result.is_error, Some(true));
+        // A normal result still succeeds with structured content.
+        let rmcp::model::CallToolResponse::Complete(result) = tool_result(&json!({"skills": []}))
+        else {
+            panic!("expected complete call tool result");
+        };
+        assert_ne!(result.is_error, Some(true));
+        assert!(result.structured_content.is_some());
+    }
 }

@@ -66,6 +66,16 @@ enum Command {
         #[arg(long, default_value = "json")]
         format: String,
     },
+    /// Declared `requires` dependencies of a skill, resolved against the
+    /// discovered graph — the same definition the skill-load hook and
+    /// OpenCode plugin use (#225 B08). Emits [{name, digest}] sorted.
+    Deps {
+        name: String,
+        #[arg(long)]
+        root: Vec<PathBuf>,
+        #[arg(long, default_value = "json")]
+        format: String,
+    },
     Bench {
         dataset: PathBuf,
         /// Recommendation cutoff scored as the primary metric. Defaults
@@ -191,6 +201,15 @@ pub fn run() -> Result<(), String> {
             let graph = graph_for(roots_or_default(root))?;
             let result = resolve_target(&graph, &target);
             print_result(json!(result), &format)
+        }
+        Command::Deps { name, root, format } => {
+            let graph = graph_for(roots_or_default(root))?;
+            let deps: Vec<serde_json::Value> =
+                crate::resolver::declared_dependencies(&graph, &name)
+                    .into_iter()
+                    .map(|(name, digest)| json!({"name": name, "digest": digest}))
+                    .collect();
+            print_result(json!(deps), &format)
         }
         Command::Bench { dataset, max } => {
             let result = eval::run(&dataset, max)?;

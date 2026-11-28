@@ -95,6 +95,13 @@ jobs:
         # is a contract, so it is regression-tested here (#225
         # re-review).
         run: bash scripts/test-release-verify.sh
+      - name: Freeze manifest tests
+        # The approved-manifest pipeline (freeze-manifest.sh producer,
+        # verify-freeze-manifest.py consumer) is the release approval
+        # record — identity substitution, missing/duplicate/corrupt
+        # artifacts, and foreign freeze-meta bindings must all be
+        # rejected (#225 A01-A06).
+        run: bash scripts/test-freeze-manifest.sh
       - name: Npm publish path tests
         # publish-npm.sh decides skip-vs-publish and proves registry
         # content identity on both paths; test-npm-publish.sh drives it

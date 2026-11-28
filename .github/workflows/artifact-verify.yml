@@ -51,13 +51,31 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: scripts/package-target.sh "${{ matrix.target }}" "${{ matrix.npm_target }}"
+      - name: Pack platform npm artifact around the frozen payload
+        # Every distribution channel's installable bytes are frozen
+        # HERE, not rebuilt at publish time (#225 A06): the .tgz is
+        # packed from the verified tarball's payload and digested
+        # into the approved manifest.
+        id: npmpkg
+        run: |
+          set -euo pipefail
+          mkdir -p freeze
+          scripts/package-npm-platform.sh "${{ matrix.npm_target }}" \
+            "skill-graph-${{ matrix.target }}.tar.gz"
+          npm_tgz="$(find . -maxdepth 1 -name 'rebuildup-skill-graph-${{ matrix.npm_target }}-*.tgz' -print -quit)"
+          [ -n "$npm_tgz" ] || { echo "platform npm tgz not produced" >&2; exit 1; }
+          npm_tgz="${npm_tgz#./}"
+          cp "$npm_tgz" "$npm_tgz.sha256" freeze/
+          echo "tgz=$npm_tgz" >> "$GITHUB_OUTPUT"
       - name: Attest build provenance
         # SLSA provenance for the frozen bytes — the digest attested
         # here is the digest release promotion verifies before
         # publishing (#225 r10).
         uses: actions/attest-build-provenance@v2
         with:
-          subject-path: skill-graph-${{ matrix.target }}.tar.gz
+          subject-path: |
+            skill-graph-${{ matrix.target }}.tar.gz
+            ${{ steps.npmpkg.outputs.tgz }}
       - name: Auth-free local install verification
         # Install lifecycle on the FROZEN artifacts — no repairs:
         # cargo install from the packed .crate, real npm pack+install
@@ -92,5 +110,57 @@ jobs:
           path: freeze/
           # Frozen artifacts must outlive the gap between freeze and
           # release; 90 days covers any realistic release cadence.
+          retention-days: 90
+          if-no-files-found: error
+
+  freeze-manifest:
+    # APPROVAL RECORD (#225 A01-A06): after all four targets freeze,
+    # this job re-verifies every per-target freeze-meta binding,
+    # recomputes every digest, produces the platform-independent
+    # artifacts (metapackage .tgz, .crate) once from this checkout,
+    # and emits freeze-manifest.json — the single manifest release,
+    # npm, and crates promotion must match EXACTLY. The manifest is
+    # created HERE, before any approval/publish step consumes it;
+    # promotion never regenerates it.
+    needs: package-and-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: frozen-*
+          path: frozen
+          merge-multiple: false
+      - name: Aggregate frozen artifacts into the approved manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          scripts/freeze-manifest.sh frozen manifest-out
+          meta_tgz="$(find manifest-out -maxdepth 1 -name 'rebuildup-skill-graph-*.tgz' -print -quit)"
+          crate="$(find manifest-out -maxdepth 1 -name 'skill-graph-*.crate' -print -quit)"
+          [ -n "$meta_tgz" ] && [ -n "$crate" ] || {
+            echo "manifest-out missing meta tgz or crate" >&2; exit 1; }
+          echo "meta_tgz=${meta_tgz#manifest-out/}" >> "$GITHUB_OUTPUT"
+          echo "crate=${crate#manifest-out/}" >> "$GITHUB_OUTPUT"
+      - name: Attest manifest + channel artifacts
+        # Provenance for the approval record itself and the
+        # platform-independent publish bytes (#225 A04).
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            manifest-out/freeze-manifest.json
+            manifest-out/${{ steps.manifest.outputs.meta_tgz }}
+            manifest-out/${{ steps.manifest.outputs.crate }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: approved-manifest
+          path: manifest-out/
           retention-days: 90
           if-no-files-found: error

@@ -91,17 +91,26 @@ jobs:
           #     same inputs, but the binding is still to a specific
           #     run id, not a latest-success query.
           validate_run() {
-            local id="$1" path head status concl
-            path="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" --jq '.path')"
-            [ "$path" = ".github/workflows/artifact-verify.yml" ] || {
-              echo "run $id is '$path', not artifact-verify.yml" >&2; return 1; }
-            head="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" --jq '.head_sha')"
-            [ "$head" = "$TAG_SHA" ] || {
-              echo "run $id head_sha $head != tag commit $TAG_SHA" >&2; return 1; }
-            status="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" --jq '.status')"
-            concl="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id" --jq '.conclusion')"
-            [ "$status" = "completed" ] && [ "$concl" = "success" ] || {
-              echo "run $id is $status/$concl, not completed/success" >&2; return 1; }
+            local id="$1" j
+            j="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id")" || return 1
+            # Promotable run definition (#225 A03): the artifact-verify
+            # workflow, a PUSH event (PR runs are never promotable —
+            # their checkout is a merge/PR head, not the released
+            # commit), completed+success, head_sha == the tag commit,
+            # and we capture run_attempt so the manifest's recorded
+            # attempt can be matched exactly (a re-run's artifacts
+            # supersede earlier attempts').
+            [ "$(jq -r '.path' <<< "$j")" = ".github/workflows/artifact-verify.yml" ] || {
+              echo "run $id is not artifact-verify.yml" >&2; return 1; }
+            [ "$(jq -r '.event' <<< "$j")" = "push" ] || {
+              echo "run $id event is not push" >&2; return 1; }
+            [ "$(jq -r '.head_sha' <<< "$j")" = "$TAG_SHA" ] || {
+              echo "run $id head_sha != tag commit $TAG_SHA" >&2; return 1; }
+            [ "$(jq -r '.status' <<< "$j")" = "completed" ] || return 1
+            [ "$(jq -r '.conclusion' <<< "$j")" = "success" ] || return 1
+            RUN_ATTEMPT="$(jq -r '.run_attempt' <<< "$j")"
+            RUN_EVENT="$(jq -r '.event' <<< "$j")"
+            RUN_REF="$(jq -r '.head_branch' <<< "$j")"
           }
           if [ -n "$FREEZE_RUN_ID_INPUT" ]; then
             [[ "$FREEZE_RUN_ID_INPUT" =~ ^[0-9]+$ ]] || {
@@ -125,9 +134,15 @@ jobs:
               sleep 30
             done
           fi
-          echo "promoting artifacts from PINNED artifact-verify run $run_id"
-          echo "FREEZE_RUN_ID=$run_id" >> "$GITHUB_ENV"
-      - name: Download frozen artifacts; verify digests, freeze meta, and attestations
+          # Re-validate the resolved run through the same promotable
+          # definition — the list query is a filter, not a proof.
+          validate_run "$run_id"
+          echo "promoting artifacts from PINNED artifact-verify run $run_id (attempt $RUN_ATTEMPT)"
+          {
+            echo "FREEZE_RUN_ID=$run_id"
+            echo "FREEZE_RUN_ATTEMPT=$RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
+      - name: Download frozen artifacts; verify the APPROVED manifest and every digest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_SHA: ${{ needs.verify.outputs.tag_sha }}
@@ -136,48 +151,53 @@ jobs:
           set -euo pipefail
           mkdir -p dist frozen
           gh run download "$FREEZE_RUN_ID" --dir frozen
-          # Each frozen-<target> artifact holds the tarball, its
-          # .sha256 sidecar, and freeze-meta.json binding it to THIS
-          # run. Every layer is re-verified here: digest vs bytes,
-          # meta vs pinned run/SHA, then the SLSA provenance
-          # attestation created at freeze time (#225 r11).
+          # The approval record is the freeze-manifest.json produced by
+          # the pinned run's freeze-manifest job — NOT something this
+          # job regenerates (#225 A02). verify-freeze-manifest.py binds
+          # it to run id + attempt + head_sha + event, then proves
+          # EVERY listed artifact exists exactly once across the
+          # downloaded frozen-* and approved-manifest dirs with its
+          # recorded sha256 (#225 A01/A03/A05).
+          manifest="frozen/approved-manifest/freeze-manifest.json"
+          [ -f "$manifest" ] || {
+            echo "approved-manifest artifact missing freeze-manifest.json" >&2; exit 1; }
+          python3 scripts/verify-freeze-manifest.py "$manifest" \
+            --run-id "$FREEZE_RUN_ID" \
+            --run-attempt "$FREEZE_RUN_ATTEMPT" \
+            --head-sha "$TAG_SHA" \
+            --event push \
+            --require-channel release \
+            --require-channel npm \
+            --require-channel npm-meta \
+            --require-channel crates \
+            --artifact-dir frozen
+          # Per-target freeze-meta must still bind this run/SHA —
+          # defense in depth behind the manifest check.
           shopt -s nullglob
           dirs=(frozen/frozen-*/)
           [ "${#dirs[@]}" -eq 4 ] || {
-            echo "expected 4 frozen artifacts, found ${#dirs[@]}" >&2; exit 1; }
-          : > freeze-manifest-assets.txt
+            echo "expected 4 frozen target artifacts, found ${#dirs[@]}" >&2; exit 1; }
           for d in "${dirs[@]}"; do
             meta="$d/freeze-meta.json"
             [ -f "$meta" ] || { echo "missing freeze-meta.json in $d" >&2; exit 1; }
-            python3 - "$meta" "$FREEZE_RUN_ID" "$TAG_SHA" <<'PY'
+            python3 - "$meta" "$FREEZE_RUN_ID" "$FREEZE_RUN_ATTEMPT" "$TAG_SHA" <<'PY'
           import json, sys
-          meta, run_id, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+          meta, run_id, attempt, sha = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
           m = json.load(open(meta))
           assert m["workflow"] == "artifact-verify.yml", m
-          assert m["run_id"] == run_id, f"run_id {m['run_id']} != pinned {run_id}"
-          assert m["head_sha"] == sha, f"head_sha {m['head_sha']} != tag {sha}"
+          assert m["run_id"] == int(run_id), m
+          assert m["run_attempt"] == int(attempt), m
+          assert m["head_sha"] == sha, m
           assert m["asset"].startswith("skill-graph-") and m["asset"].endswith(".tar.gz"), m
           assert len(m["sha256"]) == 64, m
           PY
             tarball="$(python3 -c "import json;print(json.load(open('$meta'))['asset'])")"
             [ -f "$d/$tarball" ] || { echo "missing $tarball in $d" >&2; exit 1; }
-            (cd "$d" && sha256sum -c "$tarball.sha256")
-            got="$(sha256sum "$d/$tarball" | awk '{print $1}')"
-            want="$(awk '{print $1}' "$d/$tarball.sha256")"
-            [ "$got" = "$want" ] || { echo "digest mismatch for $tarball" >&2; exit 1; }
             mv "$d/$tarball" dist/
-            printf '%s  %s\n' "$want" "$tarball" >> freeze-manifest-assets.txt
           done
           shopt -u nullglob
-          sort -o freeze-manifest-assets.txt freeze-manifest-assets.txt
-          # Build-provenance attestation: the freeze run attested each
-          # tarball; verify the downloaded bytes against the repo's
-          # attestation store before they may be published (#225 r11).
-          for f in dist/*.tar.gz; do
-            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY"
-          done
-          # The complete target set must be present — the same four
-          # release assets downstream channels consume.
+          # The manifest verified above already proved every tarball
+          # digest; re-assert the release asset set is complete.
           for asset in \
             skill-graph-x86_64-unknown-linux-gnu.tar.gz \
             skill-graph-aarch64-unknown-linux-gnu.tar.gz \
@@ -185,25 +205,22 @@ jobs:
             skill-graph-x86_64-apple-darwin.tar.gz; do
             [ -f "dist/$asset" ] || { echo "missing frozen asset $asset" >&2; exit 1; }
           done
-          # Approved manifest: the durable record of WHICH run+SHA+
-          # digests this release promotes. Published alongside the
-          # assets so the approval binding survives the run's
-          # artifact retention window (#225 r11).
-          python3 - <<PY
-          import json
-          assets = {}
-          for line in open("freeze-manifest-assets.txt"):
-              digest, name = line.split()
-              assets[name] = digest
-          manifest = {
-              "tag": "$RELEASE_TAG",
-              "tag_sha": "$TAG_SHA",
-              "freeze_run_id": int("$FREEZE_RUN_ID"),
-              "workflow": "artifact-verify.yml",
-              "assets": assets,
-          }
-          open("freeze-manifest.json", "w").write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-          PY
+          # Build-provenance attestation bound to the APPROVED source:
+          # signer workflow + source commit digest + signer repo — a
+          # valid signature from any other workflow/run/SHA is
+          # rejected (#225 A04). The run binding itself comes from the
+          # manifest (run_id+attempt) verified above.
+          cp "$manifest" freeze-manifest.json
+          for f in dist/*.tar.gz; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "rebuildup/skill-graph/.github/workflows/artifact-verify.yml" \
+              --signer-repo "rebuildup/skill-graph" \
+              --source-digest "$TAG_SHA"
+          done
+          gh attestation verify freeze-manifest.json --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "rebuildup/skill-graph/.github/workflows/artifact-verify.yml" \
+            --signer-repo "rebuildup/skill-graph" \
+            --source-digest "$TAG_SHA"
           cat freeze-manifest.json
           ls -l dist/
       - name: Verify tag and version consistency
@@ -265,7 +282,21 @@ jobs:
               echo "cannot verify published bytes — refusing to overwrite." >&2
               exit 1
             fi
-            gh release upload "$tag" dist/*.tar.gz sha256sums.txt freeze-manifest.json
+            # Additive recovery (#225 A10): upload only what is
+            # missing; a pre-existing freeze-manifest.json must be
+            # byte-identical to the approved one, never clobbered.
+            gh release upload "$tag" dist/*.tar.gz sha256sums.txt
+            if grep -qx 'freeze-manifest.json' <<< "$published"; then
+              work0="$(mktemp -d)"
+              gh release download "$tag" --pattern 'freeze-manifest.json' \
+                --dir "$work0" --clobber
+              cmp "$work0/freeze-manifest.json" freeze-manifest.json || {
+                echo "published freeze-manifest.json differs from the" >&2
+                echo "approved manifest — refusing to continue." >&2
+                exit 1; }
+            else
+              gh release upload "$tag" freeze-manifest.json
+            fi
             exit 0
           fi
 
@@ -320,27 +351,21 @@ jobs:
           done
           shopt -u nullglob
 
-          # freeze-manifest.json is the published approval record
-          # (run id + SHA + digests). If a previous release already
-          # published one, its recorded digests MUST equal the
-          # published checksums — a divergent record means the
-          # approval binding is inconsistent and must not pass
-          # silently (#225 r11). If absent, upload ours (additive
-          # metadata; tarballs are already verified above).
+          # freeze-manifest.json is the published APPROVAL RECORD —
+          # produced by the pinned freeze run, never regenerated
+          # here (#225 A02/A09). If a previous release already
+          # published one, it must be BYTE-IDENTICAL to the approved
+          # manifest: same run, attempt, SHA, and every artifact
+          # digest. A divergent record means the approval binding is
+          # inconsistent and must not pass silently. If absent, upload
+          # ours (additive metadata; tarballs already verified).
           if grep -qx 'freeze-manifest.json' <<< "$published"; then
             gh release download "$tag" --pattern 'freeze-manifest.json' \
               --dir "$work" --clobber
-            python3 - "$work/freeze-manifest.json" "$published_sums" <<'PY'
-          import json, sys
-          manifest = json.load(open(sys.argv[1]))
-          published = {}
-          for line in open(sys.argv[2]):
-              digest, name = line.split()
-              published[name] = digest
-          assets = manifest.get("assets", {})
-          assert assets == published, (
-              "freeze-manifest assets differ from published sha256sums.txt")
-          PY
+            cmp "$work/freeze-manifest.json" freeze-manifest.json || {
+              echo "published freeze-manifest.json differs from the" >&2
+              echo "approved manifest — refusing to continue." >&2
+              exit 1; }
           else
             gh release upload "$tag" freeze-manifest.json
           fi
