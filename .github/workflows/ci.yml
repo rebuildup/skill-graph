@@ -69,6 +69,10 @@ jobs:
         run: |
           cargo build --locked
           scripts/check-eval-gate.sh ./target/debug/skill-graph
+      - name: Dependency license audit
+        # #225 F11: every locked dependency must offer a permissive
+        # license option.
+        run: bash scripts/check-licenses.sh
       - name: Crates.io package dry-run
         # The crates.io channel's pre-publish proof that needs no
         # token: `cargo publish --dry-run` packs the crate exactly as
@@ -200,3 +204,21 @@ jobs:
       - run: cargo test --locked
         env:
           RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+
+  audit:
+    # #225 F11: RustSec advisory scan against the committed lockfile.
+    # Unmaintained-crate warnings are informational (cargo audit
+    # exits 0 on warnings); vulnerabilities fail the job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: RustSec advisory scan
+        # Warnings (unmaintained crates with no fix) are informational;
+        # vulnerabilities fail the job.
+        run: cargo audit
