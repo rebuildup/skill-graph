@@ -1,12 +1,16 @@
 name: npm publish
 
+# #225 A01/A02: dispatch-only, pinned to the SAME approved manifest
+# digest as the GitHub Release promotion — a tag push alone never
+# publishes npm bytes.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)publish npm packages for"
+        description: "Existing tag to publish npm packages for"
+        required: true
+      freeze_manifest_sha256:
+        description: "sha256 of the APPROVED freeze-manifest.json (must equal the digest pinned at release promotion)"
         required: true
 
 permissions:
@@ -52,6 +56,10 @@ jobs:
           # Fail fast on malformed or nonexistent tags before the
           # release-asset wait loop.
           [[ "$tag" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "invalid tag: $tag" >&2; exit 1; }
+          # Fetch the tag ref explicitly: a dispatch checkout of the
+          # tag name may not materialize refs/tags/<tag> locally
+          # (#144 r20 pattern, same as release.yml).
+          git fetch --no-tags origin "refs/tags/$tag:refs/tags/$tag" || true
           # Peel annotated tags to the commit: refs/tags/<tag> alone
           # resolves to the tag object for annotated tags, which would
           # never equal HEAD's commit SHA.
@@ -105,34 +113,39 @@ jobs:
       - name: Download the APPROVED freeze manifest and frozen npm artifacts
         # The GitHub Release's freeze-manifest.json IS the approval
         # record: release.yml publishes it only after binding it to a
-        # pinned, verified artifact-verify run (#225 A02/A11). This
-        # job never re-derives approval — it resolves the run the
-        # manifest names, proves that run is promotable, downloads
-        # ITS artifacts, and requires the downloaded manifest to be
+        # pinned, verified artifact-verify run AND the approver-pinned
+        # manifest digest (#225 A02/A05). This job never re-derives
+        # approval — it requires the published manifest's sha256 to
+        # equal the dispatch input, resolves the run the manifest
+        # names, proves that run is promotable, downloads ITS
+        # artifacts, and requires the downloaded manifest to be
         # byte-identical to the published one.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPROVED_MANIFEST_SHA256: ${{ github.event.inputs.freeze_manifest_sha256 }}
         run: |
           set -euo pipefail
           mkdir -p release-assets frozen npm-out
-          # The tag push and release.yml run concurrently; wait for
-          # the approved manifest + release assets to appear.
-          for i in $(seq 1 60); do
-            if gh release download "$RELEASE_TAG" \
-                 --pattern 'freeze-manifest.json' --pattern 'sha256sums.txt' \
-                 --pattern 'skill-graph-*.tar.gz' \
-                 --dir release-assets --clobber 2>/dev/null \
-               && [ -f release-assets/freeze-manifest.json ] \
-               && [ -f release-assets/sha256sums.txt ]; then
-              break
-            fi
-            if [ "$i" = "60" ]; then
-              echo "approved release assets for $RELEASE_TAG not ready after 20min" >&2
-              exit 1
-            fi
-            echo "release assets for $RELEASE_TAG not ready (attempt $i), retrying in 20s"
-            sleep 20
-          done
+          # The release must already exist — promotion is a separate,
+          # explicitly approved step. No waiting loop: npm publish
+          # runs only after the pinned release promotion completed.
+          gh release download "$RELEASE_TAG" \
+            --pattern 'freeze-manifest.json' --pattern 'sha256sums.txt' \
+            --pattern 'skill-graph-*.tar.gz' \
+            --dir release-assets --clobber
+          [ -f release-assets/freeze-manifest.json ] \
+            && [ -f release-assets/sha256sums.txt ] || {
+              echo "approved release assets for $RELEASE_TAG missing — promote the release first" >&2
+              exit 1; }
+          # The published manifest must be THE approved record: its
+          # digest is pinned independently at dispatch time (#225 A05).
+          [[ "$APPROVED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "invalid freeze_manifest_sha256 input" >&2; exit 1; }
+          pub_sha="$(sha256sum release-assets/freeze-manifest.json | awk '{print $1}')"
+          [ "$pub_sha" = "$APPROVED_MANIFEST_SHA256" ] || {
+            echo "published freeze-manifest.json digest $pub_sha != approved $APPROVED_MANIFEST_SHA256" >&2
+            echo "this is NOT the approved manifest — refusing to publish." >&2
+            exit 1; }
           # The manifest names its freeze run — validate it is a
           # promotable run (artifact-verify workflow, push event,
           # success, this tag's commit, matching attempt).
@@ -153,17 +166,22 @@ jobs:
           [ "$(jq -r '.run_attempt' <<< "$j")" = "$run_attempt" ] || {
             echo "freeze run was re-run after approval (attempt $run_attempt -> $(jq -r '.run_attempt' <<< "$j")); frozen bytes may differ — refusing to publish" >&2
             exit 1; }
+          run_ref="$(jq -r '.head_branch' <<< "$j")"
           gh run download "$run_id" --dir frozen
           # The artifact-carried manifest must be BYTE-IDENTICAL to
           # the release-published approval record.
           cmp release-assets/freeze-manifest.json frozen/approved-manifest/freeze-manifest.json || {
             echo "downloaded manifest differs from published approval record" >&2; exit 1; }
           # Every artifact the manifest names must exist exactly once
-          # with its recorded digest — including all 5 npm tgz.
+          # with its recorded digest — including all 5 npm tgz. The
+          # manifest's ref must correspond to the pinned run's
+          # head_branch (#225 A04).
           python3 scripts/verify-freeze-manifest.py \
             frozen/approved-manifest/freeze-manifest.json \
             --run-id "$run_id" --run-attempt "$run_attempt" \
             --head-sha "$TAG_SHA" --event push \
+            --expect-ref "refs/heads/$run_ref" \
+            --expect-ref "refs/tags/$run_ref" \
             --require-channel release --require-channel npm \
             --require-channel npm-meta --require-channel crates \
             --artifact-dir frozen

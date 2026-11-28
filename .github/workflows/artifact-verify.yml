@@ -166,6 +166,19 @@ jobs:
             echo "manifest-out missing meta tgz or crate" >&2; exit 1; }
           echo "meta_tgz=${meta_tgz#manifest-out/}" >> "$GITHUB_OUTPUT"
           echo "crate=${crate#manifest-out/}" >> "$GITHUB_OUTPUT"
+      - name: Install-verify the APPROVED artifact set
+        # The manifest is the approval record — now prove the exact
+        # 10 digested artifacts it names actually install: cargo from
+        # the manifest .crate, npm from the manifest .tgz set (real
+        # upgrade path), brew from the manifest tarball. Every byte
+        # installed is re-hashed against freeze-manifest.json BEFORE
+        # install; nothing is re-packed (#225 A06/F03).
+        run: |
+          set -euo pipefail
+          mkdir -p frozen-set
+          cp -r frozen/frozen-* frozen-set/
+          cp manifest-out/* frozen-set/
+          scripts/verify-install-local.sh --frozen-set frozen-set
       - name: Attest manifest + channel artifacts
         # Provenance for the approval record itself and the
         # platform-independent publish bytes (#225 A04).

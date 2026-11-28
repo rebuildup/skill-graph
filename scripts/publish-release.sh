@@ -66,10 +66,15 @@ if ! grep -qx 'sha256sums.txt' <<< "$published"; then
     echo "cannot verify published bytes — refusing to overwrite." >&2
     exit 1
   fi
-  # Additive recovery (#225 A10): upload only what is missing; a
-  # pre-existing freeze-manifest.json must be byte-identical.
-  gh release upload "$tag" ./*.tar.gz sha256sums.txt
+  # #225 A09: READ-ALL before MUTATE — every refusal check runs before
+  # the first upload. A pre-existing freeze-manifest.json must be
+  # byte-identical to the approved record; if it differs we refuse
+  # WITHOUT having already pushed tarballs/checksums (the old order
+  # uploaded first and refused second — a partial publish on a
+  # refused run).
+  manifest_published=0
   if grep -qx 'freeze-manifest.json' <<< "$published"; then
+    manifest_published=1
     work0="$(mktemp -d)"
     gh release download "$tag" --pattern 'freeze-manifest.json' \
       --dir "$work0" --clobber
@@ -77,7 +82,10 @@ if ! grep -qx 'sha256sums.txt' <<< "$published"; then
       echo "published freeze-manifest.json differs from the" >&2
       echo "approved manifest — refusing to continue." >&2
       exit 1; }
-  else
+  fi
+  # Additive recovery (#225 A10): upload only what is missing.
+  gh release upload "$tag" ./*.tar.gz sha256sums.txt
+  if [ "$manifest_published" -eq 0 ]; then
     gh release upload "$tag" freeze-manifest.json
   fi
   exit 0
@@ -115,8 +123,10 @@ gh release download "$tag" --pattern '*.tar.gz' \
   --dir "$work_assets" --clobber
 shopt -s nullglob
 tarballs_p=("$work_assets"/*.tar.gz)
-[ "${#tarballs_p[@]}" -gt 0 ] || {
-  echo "no published tarballs found to verify"; exit 1; }
+# ZERO published tarballs is a valid partial state (#225 A10): a
+# checksums-only publish has nothing to verify — every manifest entry
+# is "missing" and is uploaded additively below. Refusing here forced
+# manual recovery of a state the machine can complete safely.
 for f in "${tarballs_p[@]}"; do
   name="$(basename "$f")"
   want="$(awk -v n="$name" '$NF==n{print $1}' "$published_sums")"
