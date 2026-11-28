@@ -77,6 +77,52 @@ const pkgs = dirs.map((dir, i) => {
     }
   }
 
+  // bin field: string (single bin named after the package) or an
+  // object mapping bin names to payload paths. Every declared target
+  // is a REQUIRED executable payload — npm packs it whether or not
+  // files[] covers it, and a missing/non-executable target ships a
+  // broken install (#225 r8). Targets must be relative paths inside
+  // the package, exist on disk as regular files, and carry the exec
+  // bit; executable FORMAT is verified by verify-npm-bin.sh in the
+  // publish path (it needs file(1)).
+  const binTargets = [];
+  if (m.bin !== undefined) {
+    const entries =
+      typeof m.bin === "string" ? [[m.name, m.bin]] : Object.entries(m.bin ?? {});
+    if (typeof m.bin !== "string" && (m.bin === null || typeof m.bin !== "object" || Array.isArray(m.bin))) {
+      fail(`${manifestPath}: "bin" is not a string or object`);
+    }
+    for (const [binName, target] of entries) {
+      if (typeof binName !== "string" || binName === "" || typeof target !== "string" || target === "") {
+        fail(`${manifestPath}: invalid bin entry ${JSON.stringify([binName, target])}`);
+      }
+      if (isAbsolute(target) || target.split("/").includes("..")) {
+        fail(`${manifestPath}: bin target escapes package: ${target}`);
+      }
+      // bin/ confinement: verify-npm-archive.sh --check-bin inspects
+      // every package/bin/* member of the artifact — a target outside
+      // bin/ would escape executable-format verification inside the
+      // published bytes (#225 r8).
+      if (!target.startsWith("bin/")) {
+        fail(`${manifestPath}: bin target must live under bin/: ${target}`);
+      }
+      const p = join(dir, target);
+      let st;
+      try {
+        st = statSync(p);
+      } catch {
+        fail(`required bin target missing: ${dir}/${target}`);
+      }
+      if (!st.isFile()) {
+        fail(`bin target is not a regular file: ${dir}/${target}`);
+      }
+      if ((st.mode & 0o111) === 0) {
+        fail(`bin target lacks exec bit: ${dir}/${target}`);
+      }
+      binTargets.push(target);
+    }
+  }
+
   // Publish-order graph: dependencies + optionalDependencies names.
   // dev/peer deps do not constrain publish order — consumers never
   // install them.
@@ -89,7 +135,7 @@ const pkgs = dirs.map((dir, i) => {
     }
     for (const dep of Object.keys(block)) deps.add(dep);
   }
-  return { dir, name, version, deps, files: m.files ?? [] };
+  return { dir, name, version, deps, files: m.files ?? [], binTargets };
 });
 
 // Order invariant: when two packages in this invocation are related
@@ -110,5 +156,8 @@ for (let i = 0; i < pkgs.length; i++) {
 }
 
 for (const p of pkgs) {
-  console.log(`${p.name}\t${p.version}\t${JSON.stringify(p.files)}`);
+  // FILES_JSON and BIN_JSON are compact JSON — no literal tabs.
+  console.log(
+    `${p.name}\t${p.version}\t${JSON.stringify(p.files)}\t${JSON.stringify(p.binTargets)}`,
+  );
 }

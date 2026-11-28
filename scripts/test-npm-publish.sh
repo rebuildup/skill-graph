@@ -75,12 +75,27 @@ case "${1:-}" in
     ver="${spec##*@}"
     name="${spec%@$ver}"
     key="$(key_of "$name@$ver")"
+    # Action log for publish→verify ordering assertions (#225 r8):
+    # a dependent package must not be published before its
+    # dependency's post-publish registry verification.
+    echo "ACT view $name@$ver $want" >> "$root/actions.log"
+    # FAKE_NPM_VIEW_FAIL simulates a registry ERROR (network/5xx) —
+    # distinguishable from a genuine not-found, which real npm
+    # reports with an E404 signature (#225 r8).
+    if [ "${FAKE_NPM_VIEW_FAIL:-0}" = "1" ]; then
+      echo "npm error code ENETWORK" >&2
+      echo "npm error network fetch failed" >&2
+      exit 1
+    fi
     if [ "$want" = "version" ]; then
-      [ -f "$root/published/$key" ] && { echo "$ver"; exit 0; }
+      if [ -f "$root/published/$key" ]; then echo "$ver"; exit 0; fi
+      echo "npm error code E404" >&2
+      echo "npm error 404 Not Found - GET https://registry.npmjs.org/$name" >&2
       exit 1
     fi
     if [ "$want" = "dist.tarball" ]; then
-      [ -f "$root/tarballs/$key.tgz" ] && { echo "file://$root/tarballs/$key.tgz"; exit 0; }
+      if [ -f "$root/tarballs/$key.tgz" ]; then echo "file://$root/tarballs/$key.tgz"; exit 0; fi
+      echo "npm error code E404" >&2
       exit 1
     fi
     exit 1
@@ -119,6 +134,7 @@ case "${1:-}" in
     fi
     echo "$ver" > "$root/published/$key"
     echo "PUBLISH $name@$ver" >> "$root/publish.log"
+    echo "ACT publish $name@$ver" >> "$root/actions.log"
     ;;
   pack)
     # FAKE_NPM_BADPACK fabricates a normalization-colliding member that
@@ -191,7 +207,7 @@ mkpkg() { # $1=dir $2=name $3=payload
 cd "$work"
 export PATH="$work/bin:$PATH"
 reset_registry() {
-  rm -rf "$FAKE_NPM_ROOT/published" "$FAKE_NPM_ROOT/tarballs" "$FAKE_NPM_ROOT/publish.log"
+  rm -rf "$FAKE_NPM_ROOT/published" "$FAKE_NPM_ROOT/tarballs" "$FAKE_NPM_ROOT/publish.log" "$FAKE_NPM_ROOT/actions.log"
   mkdir -p "$FAKE_NPM_ROOT/published" "$FAKE_NPM_ROOT/tarballs"
 }
 
@@ -532,6 +548,201 @@ fi
 [ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
   && ok "member-set failure prevented ALL publishes" \
   || fail "partial publish on member-set failure"
+
+# --- round-8 guarantees: manifest bin payloads, registry-error
+# classification, publish→verify ordering, per-target arch (#225 r8) -
+
+echo "== registry query ERROR is not treated as unpublished =="
+# `npm view` failing for a network/5xx reason must NOT be conflated
+# with "version absent" — publishing on an unverified registry state
+# is unsafe. Only an explicit E404 signature permits Phase E2.
+reset_registry
+if FAKE_NPM_VIEW_FAIL=1 PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out24" 2>&1; then
+  fail "registry error was treated as unpublished and published anyway"
+else
+  ok "registry query error rejected"
+  grep -q "cannot distinguish" "$work/out24" \
+    && ok "rejection names the ambiguity" || fail "unclear rejection: $(cat "$work/out24")"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "registry error prevented ALL publishes" \
+  || fail "partial publish on registry error"
+
+echo "== dependent package publishes only AFTER dependency verified =="
+# E2 must interleave publish→registry-verify per package in
+# dependency-first order: @test/pkg-meta's publish may not appear in
+# the action log before @test/pkg-a's post-publish dist.tarball view.
+reset_registry
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA pkgMeta >"$work/out25" 2>&1; then
+  ok "dep-then-dependent publish accepted"
+else
+  fail "ordered publish rejected: $(cat "$work/out25")"
+fi
+dep_verify_line="$(grep -n 'ACT view @test/pkg-a@1.0.0 dist.tarball' "$FAKE_NPM_ROOT/actions.log" | head -1 | cut -d: -f1)"
+meta_publish_line="$(grep -n 'ACT publish @test/pkg-meta@1.0.0' "$FAKE_NPM_ROOT/actions.log" | head -1 | cut -d: -f1)"
+[ -n "$dep_verify_line" ] && [ -n "$meta_publish_line" ] && [ "$dep_verify_line" -lt "$meta_publish_line" ] \
+  && ok "dependency verified before dependent published" \
+  || fail "ordering violated: $(cat "$FAKE_NPM_ROOT/actions.log")"
+
+echo "== manifest bin target missing on disk rejected =="
+reset_registry
+mkdir -p pkgBinMissing/bin
+cat > pkgBinMissing/package.json <<'JSON'
+{
+  "name": "@test/pkg-bin-missing",
+  "version": "1.0.0",
+  "bin": { "tool": "bin/tool" },
+  "files": ["payload.txt"]
+}
+JSON
+printf 'x\n' > pkgBinMissing/payload.txt
+if PATH="$work/bin:$PATH" bash "$PUB" pkgBinMissing >"$work/out26" 2>&1; then
+  fail "missing bin target was accepted"
+else
+  ok "missing bin target rejected"
+  grep -q "required bin target missing" "$work/out26" \
+    && ok "rejection names the missing target" || fail "unclear rejection"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "bin-target failure prevented publishes" \
+  || fail "publish attempted despite bin failure"
+
+echo "== manifest bin target outside bin/ rejected =="
+reset_registry
+mkdir -p pkgBinEscape/bin pkgBinEscape/sbin
+cat > pkgBinEscape/package.json <<'JSON'
+{
+  "name": "@test/pkg-bin-escape",
+  "version": "1.0.0",
+  "bin": { "tool": "sbin/tool" },
+  "files": ["sbin/tool"]
+}
+JSON
+printf '#!/bin/sh\necho t\n' > pkgBinEscape/sbin/tool
+chmod +x pkgBinEscape/sbin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgBinEscape >"$work/out27" 2>&1; then
+  fail "bin target outside bin/ was accepted"
+else
+  ok "bin target outside bin/ rejected"
+  grep -q "must live under bin/" "$work/out27" \
+    && ok "rejection names the confinement" || fail "unclear rejection"
+fi
+
+echo "== manifest bin target without exec bit rejected =="
+reset_registry
+mkdir -p pkgBinNoX/bin
+cat > pkgBinNoX/package.json <<'JSON'
+{
+  "name": "@test/pkg-bin-nox",
+  "version": "1.0.0",
+  "bin": { "tool": "bin/tool" },
+  "files": ["bin/tool"]
+}
+JSON
+printf '#!/bin/sh\necho t\n' > pkgBinNoX/bin/tool
+chmod -x pkgBinNoX/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgBinNoX >"$work/out28" 2>&1; then
+  fail "non-executable bin target was accepted"
+else
+  ok "non-executable bin target rejected"
+fi
+
+echo "== manifest bin target with valid payload publishes =="
+reset_registry
+mkdir -p pkgBinOk/bin
+cat > pkgBinOk/package.json <<'JSON'
+{
+  "name": "@test/pkg-bin-ok",
+  "version": "1.0.0",
+  "bin": { "tool": "bin/tool" },
+  "files": ["bin/", "payload.txt"]
+}
+JSON
+printf '#!/bin/sh\necho tool\n' > pkgBinOk/bin/tool
+chmod +x pkgBinOk/bin/tool
+printf 'x\n' > pkgBinOk/payload.txt
+if PATH="$work/bin:$PATH" bash "$PUB" pkgBinOk >"$work/out29" 2>&1; then
+  ok "valid manifest bin package published"
+else
+  fail "valid bin package rejected: $(cat "$work/out29")"
+fi
+
+echo "== platform package with script bin rejected (arch) =="
+# A package named skill-graph-<target> must ship a NATIVE binary for
+# that target — a shebang script passes --check-bin yet fails every
+# exec on the target platform.
+reset_registry
+mkdir -p pkgPlatScript/bin
+cat > pkgPlatScript/package.json <<'JSON'
+{
+  "name": "@test/skill-graph-linux-x64",
+  "version": "1.0.0",
+  "files": ["bin/tool", "payload.txt"]
+}
+JSON
+printf '#!/bin/sh\necho not-native\n' > pkgPlatScript/bin/tool
+chmod +x pkgPlatScript/bin/tool
+printf 'x\n' > pkgPlatScript/payload.txt
+if PATH="$work/bin:$PATH" bash "$PUB" pkgPlatScript >"$work/out30" 2>&1; then
+  fail "script bin in platform package was published"
+else
+  ok "wrong-format platform bin rejected"
+  grep -q "arch mismatch" "$work/out30" \
+    && ok "rejection names the arch check" || fail "unclear rejection: $(cat "$work/out30")"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "arch failure prevented publishes" \
+  || fail "publish attempted despite arch failure"
+
+echo "== platform package with native x86-64 ELF accepted =="
+reset_registry
+mkdir -p pkgPlatElf/bin
+cat > pkgPlatElf/package.json <<'JSON'
+{
+  "name": "@test/skill-graph-linux-x64",
+  "version": "1.0.0",
+  "files": ["bin/tool", "payload.txt"]
+}
+JSON
+cp "$(type -P true)" pkgPlatElf/bin/tool
+printf 'x\n' > pkgPlatElf/payload.txt
+if PATH="$work/bin:$PATH" bash "$PUB" pkgPlatElf >"$work/out31" 2>&1; then
+  ok "native ELF platform package published"
+else
+  fail "native ELF platform package rejected: $(cat "$work/out31")"
+fi
+
+echo "== platform package with WRONG-arch ELF rejected =="
+# A REAL wrong-arch ELF: copy the host x86-64 binary and patch only
+# the e_machine field (ELF64 header offset 18) to EM_AARCH64 — file(1)
+# then reports an ARM aarch64 executable, which must fail the
+# linux-x64 arch check even though it is a genuine ELF executable.
+reset_registry
+mkdir -p pkgPlatArm/bin
+cat > pkgPlatArm/package.json <<'JSON'
+{
+  "name": "@test/skill-graph-linux-x64",
+  "version": "1.0.0",
+  "files": ["bin/tool", "payload.txt"]
+}
+JSON
+cp "$(type -P true)" pkgPlatArm/bin/tool
+printf '\267\000' | dd of=pkgPlatArm/bin/tool bs=1 seek=18 conv=notrunc 2>/dev/null
+chmod +x pkgPlatArm/bin/tool
+printf 'x\n' > pkgPlatArm/payload.txt
+# Sanity: file(1) must actually classify this as aarch64, otherwise
+# the case would be vacuous.
+if file pkgPlatArm/bin/tool | grep -qi 'aarch64'; then
+  if PATH="$work/bin:$PATH" bash "$PUB" pkgPlatArm >"$work/out32" 2>&1; then
+    fail "wrong-arch ELF was published"
+  else
+    ok "wrong-arch ELF rejected"
+    grep -q "arch mismatch" "$work/out32" \
+      && ok "rejection names the arch check" || fail "unclear rejection"
+  fi
+else
+  say "SKIP wrong-arch ELF case (e_machine patch not recognized by file(1))"
+fi
 
 if [ "$fails" -gt 0 ]; then
   say "$fails publish-path test(s) FAILED"

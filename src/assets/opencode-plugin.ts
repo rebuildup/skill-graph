@@ -108,6 +108,22 @@ const ID_HASH_HEX = 32
 const ID_SAFE_CHAR = /[A-Za-z0-9._-]/
 const ID_RESERVED = /-[0-9a-f]{32}$/
 
+// Session-id input boundary: the RAW host id is bounded BEFORE it
+// feeds both safeSessionID (state keys, emitted events) and the
+// detect payload, so identity work and the forwarded field are O(cap)
+// regardless of host input size (#225 r8 — sending the unbounded raw
+// id regressed the detect boundary). The SAME slice feeds every
+// consumer, so normalize(rawSlice) === safeSessionID(rawSlice)
+// parity — and therefore plugin↔detect session correlation — stays
+// exact. Ids differing only beyond the cap share identity; that is
+// the documented comparison domain (8 KiB is orders of magnitude
+// beyond any real session id).
+const SESSION_ID_RAW_MAX_BYTES = 8 * 1024
+function rawSessionID(event: { sessionID?: unknown } | null | undefined): string {
+  const s = event?.sessionID
+  return typeof s === "string" ? utf8Slice(s, SESSION_ID_RAW_MAX_BYTES) : ""
+}
+
 export function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
   if (!s) return ""
@@ -511,7 +527,7 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
     if (!isSkillTool && !touches) return []
 
-    const sid = safeSessionID(event.sessionID)
+    const sid = safeSessionID(rawSessionID(event))
     const status = (event as any).status
     const success = (event as any).success
 
@@ -519,17 +535,17 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       tool_name: tool,
       tool_input: input,
       tool_response: resultText(event.result),
-      // RAW session id, not `sid`: `skill-graph detect` is an ingest
-      // boundary that runs SessionId::normalize exactly once. Sending
-      // the already-normalized sid would be transformed a SECOND time
+      // RAW session id (bounded by rawSessionID), not `sid`:
+      // `skill-graph detect` is an ingest boundary that runs
+      // SessionId::normalize exactly once. Sending the already-
+      // normalized sid would be transformed a SECOND time
       // (non-canonical outputs match the reserved shape), splitting
       // funnel state between plugin-emitted and detect-emitted events
       // (#225 r7). safeSessionID and SessionId::normalize are parity
-      // implementations, so normalize(raw) === sid — correlation is
-      // preserved. A pathological multi-MB sessionID pushes the body
-      // over MAX_PAYLOAD_BYTES and detection fails open, same as any
-      // oversized input.
-      session_id: typeof event.sessionID === "string" ? event.sessionID : "",
+      // implementations, so normalize(rawSlice) === sid — correlation
+      // is preserved. The slice is the SAME value sid was computed
+      // from, keeping both sides of the contract identical (#225 r8).
+      session_id: rawSessionID(event),
       // Forwarded defensively so the Rust-side error-status guard also
       // applies to plugin-originated payloads (the field name is
       // UNVERIFIED against the OpenCode event API). Rust only reads
@@ -662,7 +678,7 @@ export default Plugin.define({
       const rawText = (event.prompt as any)?.text
       const text =
         typeof rawText === "string" ? utf8Slice(rawText, MAX_PAYLOAD_BYTES) : ""
-      const sessionID = safeSessionID(event.sessionID)
+      const sessionID = safeSessionID(rawSessionID(event))
       if (text) {
         emit({
           ...base("prompt_submit"),
@@ -758,7 +774,7 @@ export default Plugin.define({
       // never loaded, so it must not emit skill_load or queue dependency
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
-      const sessionID = safeSessionID(event.sessionID)
+      const sessionID = safeSessionID(rawSessionID(event))
       const attributed = sessionID !== ""
       const detected = await detectLoad(event)
       if (!detected.length) return
@@ -818,7 +834,7 @@ export default Plugin.define({
     })
 
     await ctx.session.hook("context", (event) => {
-      const sessionID = safeSessionID(event.sessionID)
+      const sessionID = safeSessionID(rawSessionID(event))
       // Anonymous sessions never queue (see the prompt hook) — an
       // empty-key lookup must not drain another session's entries.
       if (!sessionID) return
