@@ -86,4 +86,30 @@ exec_ok "$file_out" || {
   echo "bin is not an executable object: $f — $file_out" >&2
   exit 1
 }
+
+# Script-classified payloads must carry a REAL shebang the kernel can
+# dispatch: "#!" followed by either `/usr/bin/env <tool>` or an
+# absolute interpreter path. file(1) saying "script" is necessary but
+# not sufficient — a `#!` with an empty or relative interpreter is
+# classified as a script yet fails every exec with ENOEXEC (#225 r8).
+if [[ "$file_out" == *script* ]]; then
+  IFS= read -r shebang < "$f" || {
+    echo "script bin has no readable first line: $f" >&2; exit 1; }
+  [[ "$shebang" == '#!'* && ${#shebang} -gt 2 ]] || {
+    echo "script bin lacks a valid shebang: $f" >&2; exit 1; }
+  interp="${shebang:2}"
+  interp="${interp%%[[:space:]]*}"
+  rest="${shebang:2+${#interp}}"
+  rest="${rest#"${rest%%[![:space:]]*}"}"
+  if [[ "$interp" == */usr/bin/env || "$interp" == /bin/env ]]; then
+    # env dispatch — a tool argument is REQUIRED: bare `#!/usr/bin/env`
+    # execs env itself and never runs the script.
+    [ -n "$rest" ] || {
+      echo "script bin env shebang has no tool argument: $f — $shebang" >&2
+      exit 1; }
+  elif [[ "$interp" != /* ]]; then
+    echo "script bin shebang interpreter is not absolute: $f — $shebang" >&2
+    exit 1
+  fi
+fi
 echo "$f: $file_out"

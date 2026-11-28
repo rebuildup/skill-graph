@@ -198,6 +198,34 @@ describe("detect payload contract (#225 r7)", () => {
     expect(body.session_id).toBe(raw)
     expect(body.session_id).not.toBe(safeSessionID(raw))
   })
+
+  test("raw session id is bounded before detect forwarding AND state keys (#225 r8)", async () => {
+    // The raw id is the detect ingest boundary's input — it must be
+    // O(cap) bounded, and the SAME slice must feed safeSessionID so
+    // normalize(slice) === sid correlation holds. A multi-KiB host id
+    // previously flowed unbounded into the detect payload.
+    const capture = `${fakeBin}.capture`
+    const handlers = await setupPlugin()
+    const after = handlers["tool:execute.after"]
+
+    const huge = "sess-" + "x".repeat(20 * 1024) // 20 KiB raw id
+    await after({
+      sessionID: huge,
+      tool: "read",
+      input: { path: "/tmp/skills/foo/SKILL.md" },
+      result: "ok",
+    })
+
+    const body = JSON.parse(readFileSync(capture, "utf8"))
+    const expected = utf8Slice(huge, 8 * 1024)
+    expect(body.session_id).toBe(expected)
+    expect(Buffer.byteLength(body.session_id, "utf8")).toBeLessThanOrEqual(8 * 1024)
+    // The bounded slice — not the full host id — is what safeSessionID
+    // consumed, so detect's normalize(raw) lands on the same sid the
+    // plugin used for its own state keys.
+    expect(safeSessionID(expected)).toBe(safeSessionID(utf8Slice(huge, 8 * 1024)))
+    expect(body.session_id).not.toBe(huge)
+  })
 })
 
 describe("anonymous session state isolation (#225)", () => {

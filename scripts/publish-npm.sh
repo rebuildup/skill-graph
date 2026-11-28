@@ -17,11 +17,16 @@
 #      integrity, canonical member names (no normalization collisions,
 #      no duplicates, package/ root only), regular/dir types only,
 #      and executable format of bin/* INSIDE the artifact.
-#   E. Only now publish: each verified .tgz is published directly
-#      (`npm publish <tgz>` — the exact bytes that passed D), then
-#      verify-npm-registry.sh proves the registry serves those same
-#      bytes. The skip path compares the registry tarball against
-#      the same fixed artifact.
+#   E1. Reconcile the registry for EVERY package: an
+#       already-published version must be proven identical to this
+#       build's fixed artifact, and `npm view` failures are
+#       classified — only an explicit not-found (E404) permits the
+#       publish path; any other registry error aborts before publish.
+#   E2. Publish each missing artifact in argument order and verify
+#       it against the registry IMMEDIATELY, so a dependent package
+#       is never published while its dependency's registry content
+#       is unverified. The skip path compares the registry tarball
+#       against the same fixed artifact.
 #
 # Any failure in A–D means ZERO publishes; a failure in E leaves only
 # already-verified predecessors published, each proven identical to
@@ -51,13 +56,14 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # ------------------------------------------------------------------
 meta="$(node "$here/pkg-preflight.mjs" "$@")" || exit 1
 
-declare -a pkg_names=() pkg_vers=() pkg_files=()
-while IFS=$'\t' read -r n v f; do
-  [ -n "$n" ] && [ -n "$v" ] && [ -n "$f" ] || {
-    echo "pkg-preflight emitted malformed record: '$n'$'\t''$v'" >&2; exit 1; }
+declare -a pkg_names=() pkg_vers=() pkg_files=() pkg_bins=()
+while IFS=$'\t' read -r n v f b; do
+  [ -n "$n" ] && [ -n "$v" ] && [ -n "$f" ] && [ -n "$b" ] || {
+    echo "pkg-preflight emitted malformed record" >&2; exit 1; }
   pkg_names+=("$n")
   pkg_vers+=("$v")
   pkg_files+=("$f")
+  pkg_bins+=("$b")
 done <<< "$meta"
 [ "${#pkg_names[@]}" -eq "$#" ] || {
   echo "pkg-preflight record count mismatch" >&2; exit 1; }
@@ -75,6 +81,22 @@ for pkg in "$@"; do
       "$here/verify-npm-bin.sh" "$f" || exit 1
     done < <(find "$pkg/bin" -mindepth 1 -print0)
   fi
+done
+
+# Manifest-declared bin targets are REQUIRED payloads — preflight
+# proved they exist under bin/ with the exec bit; the format/shebang
+# check runs here on the exact on-disk bytes (#225 r8). Targets are
+# constrained to bin/ by preflight, so --check-bin covers them inside
+# the artifact too.
+i=0
+for pkg in "$@"; do
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    "$here/verify-npm-bin.sh" "$pkg/$t" || exit 1
+  done < <(BIN_JSON="${pkg_bins[$i]}" node -e '
+    for (const t of JSON.parse(process.env.BIN_JSON)) console.log(t);
+  ')
+  i=$((i + 1))
 done
 
 # ------------------------------------------------------------------
@@ -119,8 +141,8 @@ for pkg in "$@"; do
   # name/version inside package/package.json, and every declared
   # files[] payload present as an archive member. npm could otherwise
   # pack a different directory or silently drop payloads (#225 r7).
-  FILES_JSON="${pkg_files[$i]}" WANT_NAME="${pkg_names[$i]}" \
-    WANT_VER="${pkg_vers[$i]}" TGZ="$tgz" node -e '
+  FILES_JSON="${pkg_files[$i]}" BIN_JSON="${pkg_bins[$i]}" \
+    WANT_NAME="${pkg_names[$i]}" WANT_VER="${pkg_vers[$i]}" TGZ="$tgz" node -e '
       const { execFileSync } = require("node:child_process");
       const tar = execFileSync("tar", ["-xzOf", process.env.TGZ, "package/package.json"], { encoding: "utf8" });
       const m = JSON.parse(tar);
@@ -129,16 +151,37 @@ for pkg in "$@"; do
         process.exit(1);
       }
       const members = execFileSync("tar", ["-tzf", process.env.TGZ], { encoding: "utf8" }).split("\n");
-      const want = JSON.parse(process.env.FILES_JSON);
+      // Required member set = files[] payloads UNION manifest bin
+      // targets. npm does not guarantee bin targets are packed via
+      // files[] — a declared executable missing from the artifact is
+      // a broken install that must fail HERE, before publish (#225 r8).
+      const want = [...JSON.parse(process.env.FILES_JSON), ...JSON.parse(process.env.BIN_JSON)];
       for (const f of want) {
         const prefix = "package/" + f.replace(/\/+$/, "");
         const hit = members.some((mem) => mem === prefix || mem === prefix + "/" || mem.startsWith(prefix + "/"));
         if (!hit) {
-          console.error(`required files[] payload missing from artifact: ${f}`);
+          console.error(`required payload missing from artifact: ${f}`);
           process.exit(1);
         }
       }
     ' || exit 1
+
+  # Platform packages (skill-graph-<os>-<arch>) must ship a NATIVE
+  # binary for their declared target — a wrong-arch or script payload
+  # passes --check-bin yet fails every install on the target platform
+  # (#225 r8). verify-npm-arch.sh owns the target→file-output mapping.
+  base="${pkg_names[$i]##*/}"   # strip npm scope if present
+  case "$base" in
+    skill-graph-linux-x64|skill-graph-linux-arm64|skill-graph-darwin-x64|skill-graph-darwin-arm64)
+      target="${base#skill-graph-}"
+      archdir="$work/arch-$i"
+      mkdir -p "$archdir" || exit 1
+      tar -xzf "$tgz" -C "$archdir" || exit 1
+      while IFS= read -r -d '' b; do
+        "$here/verify-npm-arch.sh" "$target" "$b" || exit 1
+      done < <(find "$archdir/package/bin" -mindepth 1 -type f -print0 2>/dev/null)
+      ;;
+  esac
   tgzs+=("$tgz")
   i=$((i + 1))
 done
@@ -155,39 +198,45 @@ i=0
 for tgz in "${tgzs[@]}"; do
   name="${pkg_names[$i]}"
   ver="${pkg_vers[$i]}"
-  if npm view "$name@$ver" version >/dev/null 2>&1; then
+  # `npm view` fails for TWO different reasons that must not be
+  # conflated (#225 r8): the version genuinely does not exist (E404 /
+  # "No match found" — safe to publish) versus the registry being
+  # unreachable or erroring (network/auth/5xx — publishing on top of
+  # an unverified registry state is unsafe). Only an explicit
+  # not-found signature permits the publish path.
+  view_out="$(npm view "$name@$ver" version 2>&1)" && view_rc=0 || view_rc=$?
+  if [ "$view_rc" -eq 0 ]; then
     echo "$name@$ver already published — verifying content identity"
     "$here/verify-npm-registry.sh" "$name" "$ver" "$tgz" || {
       echo "published $name@$ver differs from this build — refusing to publish anything" >&2
       exit 1
     }
-  else
+  elif printf '%s' "$view_out" | grep -qiE 'E404|No match found|404 Not Found|is not in this registry'; then
     missing+=("$i")
+  else
+    echo "registry query failed for $name@$ver — cannot distinguish unpublished from unreachable; refusing to publish" >&2
+    printf '%s\n' "$view_out" >&2
+    exit 1
   fi
   i=$((i + 1))
 done
 
 # ------------------------------------------------------------------
-# Phase E2: publish only the missing artifacts, in argument order.
+# Phase E2: publish missing artifacts IN ARGUMENT ORDER (dependencies
+# first, enforced in Phase A), and prove EACH published artifact
+# against the registry IMMEDIATELY — a dependent package is never
+# published while its dependency's registry content is still
+# unverified (#225 r8). Skipped packages were already proven
+# identical in E1, so every package is verified exactly once before
+# the script exits.
 # ------------------------------------------------------------------
 for i in "${missing[@]}"; do
   name="${pkg_names[$i]}"
   ver="${pkg_vers[$i]}"
   npm publish "${tgzs[$i]}" --access public --provenance || {
     echo "npm publish failed for $name@$ver" >&2; exit 1; }
-done
-
-# ------------------------------------------------------------------
-# Phase E3: prove the registry now serves THIS build's fixed bytes
-# for EVERY package — freshly published and previously skipped alike.
-# ------------------------------------------------------------------
-i=0
-for tgz in "${tgzs[@]}"; do
-  name="${pkg_names[$i]}"
-  ver="${pkg_vers[$i]}"
-  "$here/verify-npm-registry.sh" "$name" "$ver" "$tgz" || {
-    echo "registry does not serve this build's $name@$ver" >&2
+  "$here/verify-npm-registry.sh" "$name" "$ver" "${tgzs[$i]}" || {
+    echo "registry does not serve this build's $name@$ver after publish" >&2
     exit 1
   }
-  i=$((i + 1))
 done

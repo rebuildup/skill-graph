@@ -9,21 +9,21 @@
     {
       "label": "this repo's skills",
       "skills": 24,
-      "rss_mb": 6.6,
+      "rss_mb": 6.5,
       "kind": "real",
       "command": "discover --root .agents/skills"
     },
     {
       "label": "design-skills repo",
       "skills": 88,
-      "rss_mb": 7.4,
+      "rss_mb": 7.3,
       "kind": "real",
       "command": "discover --root <design-skills>/skills"
     },
     {
       "label": "synthetic corpus",
       "skills": 500,
-      "rss_mb": 7.0,
+      "rss_mb": 7.1,
       "kind": "synthetic",
       "command": "discover --root <corpus500>"
     }

@@ -63,6 +63,13 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Crates.io package dry-run
+        # The crates.io channel's pre-publish proof that needs no
+        # token: `cargo publish --dry-run` packs the crate exactly as
+        # publish would, then compiles the PACKAGED sources standalone
+        # — catching include/-list omissions and unpackagable states
+        # before release (#225 r8).
+        run: cargo publish --dry-run
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v4
         with:

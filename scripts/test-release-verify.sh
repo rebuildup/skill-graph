@@ -266,6 +266,20 @@ printf '#!/bin/sh\necho ok\n' > "$work/scriptbin"
 chmod +x "$work/scriptbin"
 expect_ok "shebang script accepted" \
   bash scripts/verify-npm-bin.sh "$work/scriptbin"
+# Shebang contract (#225 r8): file(1) "script" classification is not
+# sufficient — the kernel needs a dispatchable interpreter.
+printf '#!not-an-absolute/path\necho x\n' > "$work/relbin"
+chmod +x "$work/relbin"
+expect_reject "relative-interpreter shebang rejected" \
+  bash scripts/verify-npm-bin.sh "$work/relbin"
+printf '#!/usr/bin/env\necho x\n' > "$work/envlessbin"
+chmod +x "$work/envlessbin"
+expect_reject "bare env shebang (no tool) rejected" \
+  bash scripts/verify-npm-bin.sh "$work/envlessbin"
+printf '#!/usr/bin/env node\necho x\n' > "$work/envnodebin"
+chmod +x "$work/envnodebin"
+expect_ok "env-tool shebang accepted" \
+  bash scripts/verify-npm-bin.sh "$work/envnodebin"
 ln -s "$work/scriptbin" "$work/linkbin"
 expect_reject "symlink bin rejected" \
   bash scripts/verify-npm-bin.sh "$work/linkbin"
