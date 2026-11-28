@@ -309,17 +309,20 @@ fn opencode_enable_materializes_plugin() {
     let content = std::fs::read_to_string(&plugin).unwrap();
     assert!(content.contains("@opencode/plugin"));
 
-    // disable removes the plugins entry AND reports cleanly
-    let (_, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
-    assert_eq!(rc, 0);
+    // disable removes the plugins entry; the shared payload is RETAINED
+    // (#225 D07: other projects/scopes may reference it — its lifecycle
+    // is separate from any single config's disable).
+    let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
+    assert_eq!(rc, 0, "{out}");
     assert!(f.config("opencode", "--user").is_none());
-    // the materialized plugin dir is removed too
     assert!(
-        !f.home
+        f.home
             .path()
-            .join(".local/share/skill-graph/opencode-plugin")
-            .exists()
+            .join(".local/share/skill-graph/opencode-plugin/index.ts")
+            .is_file(),
+        "shared payload must survive disable"
     );
+    assert!(out.contains("left in place"), "{out}");
 }
 
 #[test]
@@ -568,7 +571,10 @@ fn foreign_empty_hook_group_is_preserved() {
 }
 
 #[test]
-fn opencode_disable_keeps_plugin_dir_while_other_scope_references_it() {
+fn opencode_disable_never_removes_shared_payload() {
+    // #225 D07: the payload is shared across projects/scopes and other
+    // project configs cannot be enumerated — disable must NEVER delete
+    // it, even when every readable config is clean.
     let f = Fixture::new();
     let (_, rc) = f.run(&["adapter", "enable", "opencode", "--user"]);
     assert_eq!(rc, 0);
@@ -579,19 +585,14 @@ fn opencode_disable_keeps_plugin_dir_while_other_scope_references_it() {
         .path()
         .join(".local/share/skill-graph/opencode-plugin/index.ts");
     assert!(plugin.is_file());
-    // Disabling project scope must not remove the payload the user
-    // config still references.
     let (_, rc) = f.run(&["adapter", "disable", "opencode", "--project"]);
     assert_eq!(rc, 0);
-    assert!(
-        plugin.is_file(),
-        "plugin dir removed while user scope active"
-    );
+    assert!(plugin.is_file(), "plugin removed while user scope active");
     let (_, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
     assert_eq!(rc, 0);
     assert!(
-        !plugin.exists(),
-        "plugin dir should be removed after last ref"
+        plugin.is_file(),
+        "shared payload must survive even the last disable"
     );
 }
 
@@ -1192,10 +1193,7 @@ fn disable_keeps_payload_when_project_config_unreadable() {
     let (out, rc) = f.run(&["adapter", "disable", "opencode", "--user"]);
     assert_eq!(rc, 0, "{out}");
     assert!(payload.exists(), "payload must be kept: {out}");
-    assert!(
-        out.contains("keeping the materialized plugin payload"),
-        "{out}"
-    );
+    assert!(out.contains("left in place"), "{out}");
 }
 
 /// #144 r22: the final-component symlink unlink must satisfy the same
@@ -1310,10 +1308,11 @@ fn opencode_status_empty_skill_graph_bin_uses_path() {
     assert!(!out.contains("broken"), "{out}");
 }
 
-/// Round-17: status/disable resolve the payload dir from the config's
-/// own file:// spec, not the current XDG_DATA_HOME — an env change
-/// between enable and status must not report a healthy install as
-/// broken, and disable must remove the spec-referenced payload.
+/// Round-17: status resolves the payload dir from the config's own
+/// file:// spec, not the current XDG_DATA_HOME — an env change between
+/// enable and status must not report a healthy install as broken.
+/// (#225 D07: disable never deletes the shared payload, so there is
+/// no spec-dir deletion path left to verify across env changes.)
 #[test]
 fn opencode_status_and_disable_follow_spec_dir_across_env_change() {
     let f = Fixture::new();
@@ -1336,14 +1335,14 @@ fn opencode_status_and_disable_follow_spec_dir_across_env_change() {
     assert!(out.contains("enabled"), "{out}");
     assert!(!out.contains("broken"), "{out}");
 
-    // Disable under the changed env must remove the spec-referenced
-    // payload, not the (nonexistent) env-resolved dir.
-    let (_, rc) = f.run_env(
+    // Disable under the changed env strips the spec entry; the shared
+    // payload itself is retained by contract (#225 D07).
+    let (out, rc) = f.run_env(
         &["adapter", "disable", "opencode", "--user"],
         &[("XDG_DATA_HOME", alt.to_str().unwrap())],
     );
-    assert_eq!(rc, 0);
-    assert!(!payload.exists(), "spec-referenced payload must be removed");
+    assert_eq!(rc, 0, "{out}");
+    assert!(payload.exists(), "shared payload must be retained");
 }
 
 #[test]
@@ -1428,6 +1427,38 @@ fn clean_legacy_preserves_opencode_plugin_payload() {
         bin_dir.join("skill-graph").symlink_metadata().is_err(),
         "bin symlink into legacy home removed"
     );
+}
+
+/// #225 D11: a classified legacy release dir may contain user-added
+/// files — clean-legacy must delete only installer-owned payload and
+/// KEEP the dir (and the foreign files) when anything else remains.
+#[cfg(unix)]
+#[test]
+fn clean_legacy_keeps_user_files_inside_release_dir() {
+    let f = Fixture::new();
+    let home = f.home.path().join(".local/share/skill-graph");
+    std::fs::create_dir_all(home.join("0.3.1/adapters/opencode/skill-graph")).unwrap();
+    std::fs::write(home.join("0.3.1/skill-graph"), "old-binary").unwrap();
+    std::fs::write(home.join("0.3.1/adapters/install.sh"), "installer").unwrap();
+    // User content mixed into the release dir.
+    std::fs::write(home.join("0.3.1/my-notes.txt"), "mine").unwrap();
+    std::fs::create_dir_all(home.join("0.3.1/adapters/custom")).unwrap();
+    std::fs::write(home.join("0.3.1/adapters/custom/tool.sh"), "mine").unwrap();
+    std::os::unix::fs::symlink("0.3.1", home.join("current")).unwrap();
+
+    let (out, rc) = f.run(&["adapter", "clean-legacy"]);
+    assert_eq!(rc, 0, "{out}");
+    // Installer-owned files are gone; user files survive; the dir
+    // itself is kept because foreign content remains.
+    assert!(!home.join("0.3.1/skill-graph").exists());
+    assert!(!home.join("0.3.1/adapters/install.sh").exists());
+    assert!(home.join("0.3.1/my-notes.txt").is_file(), "{out}");
+    assert!(
+        home.join("0.3.1/adapters/custom/tool.sh").is_file(),
+        "{out}"
+    );
+    assert!(home.join("0.3.1").is_dir(), "dir with foreign files kept");
+    assert!(!home.join("current").exists(), "current symlink removed");
 }
 
 /// #225: a `skill-graph` symlink in the bin dir that does NOT point

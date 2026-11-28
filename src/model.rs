@@ -14,6 +14,13 @@ pub struct Skill {
     pub links: Vec<SkillLink>,
     pub body_text: String,
     pub parse_error: Option<String>,
+    /// Agent Skills spec violations that do NOT make the skill unusable
+    /// (#225 B07): the skill stays discoverable/recommendable under a
+    /// sanitized name, but consumers can distinguish spec-conformant
+    /// skills (`[]`) from compatibility-accepted ones. Hard parse
+    /// failures live in `parse_error` instead — the two are mutually
+    /// exclusive tiers: valid / spec-violation / parse-error.
+    pub spec_violations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -48,6 +55,10 @@ pub struct SkillSummary {
     pub root: PathBuf,
     pub digest: String,
     pub availability: Availability,
+    /// Spec violations recorded at parse time (#225 B07). Present on
+    /// every summary; empty for spec-conformant skills. `parse_error`
+    /// availability implies this list may also be non-empty.
+    pub spec_violations: Vec<String>,
 }
 
 impl Skill {
@@ -63,6 +74,7 @@ impl Skill {
             } else {
                 Availability::Available
             },
+            spec_violations: self.spec_violations.clone(),
         }
     }
 }

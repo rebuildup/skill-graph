@@ -777,15 +777,15 @@ fn read_config(path: &Path) -> Result<Value, String> {
 /// gets a unique name created with O_EXCL so a pre-planted symlink or a
 /// concurrent writer cannot redirect the write.
 fn write_text_atomic(path: &Path, text: &str) -> Result<(), String> {
-    write_text_atomic_mode(path, text, true)
+    write_bytes_atomic_mode(path, text.as_bytes(), true)
 }
 
 /// `resolve_final_symlink` selects dotfiles semantics (write THROUGH a
 /// final symlink to its target) vs managed-payload semantics (rename
 /// REPLACES the symlink itself, never writing through it).
-fn write_text_atomic_mode(
+fn write_bytes_atomic_mode(
     path: &Path,
-    text: &str,
+    bytes: &[u8],
     resolve_final_symlink: bool,
 ) -> Result<(), String> {
     let target = if resolve_final_symlink && path.is_symlink() {
@@ -821,7 +821,7 @@ fn write_text_atomic_mode(
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
                 Err(e) => return Err(format!("{}: {e}", tmp.display())),
             };
-            std::io::Write::write_all(&mut f, text.as_bytes())
+            std::io::Write::write_all(&mut f, bytes)
                 .map_err(|e| format!("{}: {e}", tmp.display()))?;
             if let Some(p) = &perms {
                 let _ = std::fs::set_permissions(&tmp, p.clone());
@@ -889,16 +889,27 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     write_text_atomic(path, &text)
 }
 
-fn write_config(path: &Path, value: &Value) -> Result<(), String> {
+/// `resolve_final_symlink` follows the caller's scope contract: user
+/// configs are dotfiles-managed and write THROUGH a final symlink;
+/// project configs live in an untrusted repo, where a symlink could
+/// aim outside the project — the rename REPLACES the link itself and
+/// never writes through it (#225 D10).
+fn write_config(path: &Path, value: &Value, resolve_final_symlink: bool) -> Result<(), String> {
     if value.as_object().map(|o| o.is_empty()).unwrap_or(false) {
         // A config reduced to {} carries no information; remove it so
         // uninstall fully restores the pre-install state. A symlinked
         // config is user-managed: write {} through to the target instead
         // of deleting the link and orphaning the hooks in the target.
-        if path.is_symlink() {
+        if resolve_final_symlink && path.is_symlink() {
             write_text_atomic(path, "{}\n")?;
         } else {
-            let _ = std::fs::remove_file(path);
+            // #225 D12: a delete that fails for any reason other than
+            // "already gone" is a failed disable, not a silent success.
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
         }
         return Ok(());
     }
@@ -914,7 +925,91 @@ fn write_config(path: &Path, value: &Value) -> Result<(), String> {
             MAX_CONFIG_BYTES
         ));
     }
-    write_text_atomic(path, &text)
+    write_bytes_atomic_mode(path, text.as_bytes(), resolve_final_symlink)
+}
+
+/// Advisory lock serializing skill-graph's read-modify-write of a
+/// config file (#225 D09). The lock lives in a sibling
+/// `.<name>.skill-graph.lock` file — NOT on the config itself, whose
+/// inode is replaced by every atomic rename — so all adapter
+/// invocations for the same config mutually exclude. The lock file is
+/// left in place (deleting it would let a waiter lock a different
+/// inode); it is empty and hidden.
+///
+/// This excludes skill-graph writers only: an editor that does not
+/// flock can still drift the file mid-write. Callers therefore ALSO
+/// re-read and compare the config immediately before writing — a
+/// detected drift aborts with an error instead of silently losing the
+/// external edit. The residual window between that check and the
+/// rename is the documented TOCTOU acceptance (contracts.md).
+#[cfg(unix)]
+struct ConfigLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+fn lock_config(path: &Path) -> Result<ConfigLock, String> {
+    use std::os::unix::io::AsRawFd;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let lock_path = path.with_file_name(format!(".{name}.skill-graph.lock"));
+    // The config's parent may not exist yet on first enable — the
+    // atomic write creates it anyway, so creating it for the lock is
+    // the same side effect, not a new one.
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| format!("{}: {e}", lock_path.display()))?;
+    // Non-blocking with a bounded retry: a wedged holder must not hang
+    // the CLI forever, and the wait stays far below human-perceptible
+    // for the short critical sections involved.
+    let mut tries = 0;
+    loop {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(ConfigLock { _file: file });
+        }
+        tries += 1;
+        if tries > 100 {
+            return Err(format!(
+                "{}: could not acquire config lock (another skill-graph adapter is running?)",
+                lock_path.display()
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(not(unix))]
+struct ConfigLock;
+
+#[cfg(not(unix))]
+fn lock_config(_path: &Path) -> Result<ConfigLock, String> {
+    Ok(ConfigLock)
+}
+
+/// Re-read `path` and require it to still equal `expected` — the
+/// revision check paired with `lock_config` (#225 D09). A drifted
+/// config means an external writer landed between our read and now;
+/// overwriting would silently destroy their edit.
+fn check_config_revision(path: &Path, expected: &Value) -> Result<(), String> {
+    let current = read_config(path)?;
+    if &current != expected {
+        return Err(format!(
+            "{}: config changed while skill-graph was updating it; \
+             re-run the command to apply on the latest content",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 fn hook_group(command: &str, status_message: Option<&str>) -> Value {
@@ -1157,82 +1252,12 @@ fn is_managed_payload_dir(dir: &Path) -> bool {
             .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
 }
 
-/// Absolute bases `adapter enable opencode` could have materialized the
-/// payload under across XDG_DATA_HOME/HOME env states. A spec-decoded
-/// dir must live under one of them: the managed-layout suffix check
-/// alone would let a crafted project config aim `remove_dir_all` at
-/// any `*/skill-graph/opencode-plugin` on the system (#144 r19).
-/// Payloads left under a since-unset custom XDG_DATA_HOME become
-/// orphans — safe residue, documented in contracts.md.
-fn payload_base_dirs() -> Vec<PathBuf> {
-    let mut bases = Vec::new();
-    if let Some(xdg) = env_absolute_dir("XDG_DATA_HOME") {
-        bases.push(xdg);
-    }
-    if let Some(home) = home() {
-        bases.push(home.join(".local/share"));
-    }
-    bases
-}
-
-/// The verified filesystem action for one payload deletion candidate,
-/// or `None` to leave it untouched (documented orphan residue).
-enum PayloadDelete {
-    /// Unlink the final-component symlink itself — never followed.
-    UnlinkSymlink,
-    /// Recursively delete the canonicalized payload directory.
-    RemoveDirAll(PathBuf),
-}
-
-/// Verify-then-act decision for a single payload dir. This is the ONLY
-/// place payload deletion guards live: symlink handling,
-/// canonicalization, managed-layout, and data-home base membership are
-/// all verified here so no call site can bypass a layer (#144
-/// structural — six rounds of guard accretion collapsed into one
-/// predicate). `managed_parents`/`managed_dirs` are the canonicalized
-/// `<base>/skill-graph` / `<base>/skill-graph/opencode-plugin` pairs.
-fn payload_delete_action(
-    dir: &Path,
-    managed_parents: &[PathBuf],
-    managed_dirs: &[PathBuf],
-) -> Option<PayloadDelete> {
-    // A symlink AT the final component is different from intermediate
-    // symlinks: canonicalize() would resolve it and delete the link
-    // target's contents. Unlink the link itself instead — the payload
-    // entry is gone either way. The unlink needs the same
-    // base-membership gate as the recursive delete: spec-decoded dirs
-    // are arbitrary absolute paths, and removing a foreign
-    // `*/skill-graph/opencode-plugin` symlink is still
-    // attacker-directed deletion (#144 r18/r22). Canonicalize the
-    // PARENT — never the final component.
-    if dir
-        .symlink_metadata()
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
-    {
-        let parent_ok = dir
-            .parent()
-            .and_then(|p| p.canonicalize().ok())
-            .is_some_and(|p| managed_parents.contains(&p));
-        return parent_ok.then_some(PayloadDelete::UnlinkSymlink);
-    }
-    // Intermediate components may still be symlinks the lexical guard
-    // cannot see: a spec naming `<any-abs>/skill-graph/opencode-plugin`
-    // where `skill-graph` is a symlink would recurse into the link
-    // target. Canonicalize and re-verify the resolved path against the
-    // managed layout before deleting (#144 r18).
-    let resolved = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    if is_managed_payload_dir(&resolved) && managed_dirs.contains(&resolved) {
-        return Some(PayloadDelete::RemoveDirAll(resolved));
-    }
-    None
-}
-
 /// Payload dirs referenced by v0.4.x `file://` plugin specs in `config`.
-/// Legacy-marker entries point into removed adapter bundles, not the
-/// shared payload dir, and specs that fail to decode — or decode to a
-/// path outside the managed payload layout — are skipped (unverifiable
-/// rather than missing, and never eligible for recursive deletion).
+/// Used by `status` to verify the referenced payload exists. Specs
+/// that fail to decode — or decode outside the managed payload layout —
+/// are skipped (unverifiable rather than missing). Deletion is NOT
+/// derived from these dirs: the payload is shared across projects and
+/// scopes, so `disable` never removes it (#225 D07).
 fn opencode_spec_dirs(config: &Value) -> Vec<PathBuf> {
     config
         .get("plugins")
@@ -1272,7 +1297,7 @@ fn materialize_opencode_plugin() -> Result<PathBuf, String> {
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let file = dir.join("index.ts");
-    write_text_atomic_mode(&file, OPENCODE_PLUGIN_TS, false)?;
+    write_bytes_atomic_mode(&file, OPENCODE_PLUGIN_TS.as_bytes(), false)?;
     Ok(dir)
 }
 
@@ -1352,6 +1377,83 @@ fn is_legacy_current_link(home: &std::path::Path, link: &std::path::Path) -> boo
         .is_some_and(|n| is_semver_dir_name(n) && is_legacy_release_dir(&norm))
 }
 
+/// Every file the v0.3.x installer laid down inside a `<semver>/`
+/// release dir: the `skill-graph` binary plus the `adapters/`,
+/// `contracts/`, and `plugins/` trees extracted from the release
+/// tarballs (verified against the v0.3.1 tag). Anything else found in
+/// the dir is user content and MUST survive cleanup (#225 D11).
+const LEGACY_RELEASE_FILES: &[&str] = &[
+    "skill-graph",
+    "adapters/README.md",
+    "adapters/claude-code/README.md",
+    "adapters/claude-code/skill-graph/.claude-plugin/plugin.json",
+    "adapters/claude-code/skill-graph/bin/skill-graph-recommend-hook",
+    "adapters/claude-code/skill-graph/hooks/hooks.json",
+    "adapters/codex/skill-graph/README.md",
+    "adapters/codex/skill-graph/bin/skill-graph-recommend-hook",
+    "adapters/codex/skill-graph/hooks.json",
+    "adapters/install.sh",
+    "adapters/opencode/skill-graph/README.md",
+    "adapters/opencode/skill-graph/index.ts",
+    "adapters/test-install-roundtrip.sh",
+    "contracts/v1/discovery-output.schema.json",
+    "contracts/v1/recommendation.schema.json",
+    "contracts/v1/resolve-result.schema.json",
+    "contracts/v1/skill-summary.schema.json",
+    "contracts/v1/skill-usage-event.schema.json",
+    "plugins/skill-graph/plugin.json",
+    "plugins/skill-graph/skills/skill-graph/SKILL.md",
+];
+
+/// Delete ONLY the installer-owned files inside a classified legacy
+/// release dir, then remove directories that became empty (deepest
+/// first, non-recursive `remove_dir` — a dir holding foreign files
+/// simply fails and is kept). The version dir itself is removed only
+/// when nothing foreign remains (#225 D11). Removal failures are
+/// reported, not swallowed (#225 D12).
+fn clean_legacy_release_dir(
+    dir: &std::path::Path,
+    removed: &mut Vec<String>,
+    kept: &mut Vec<String>,
+    failed: &mut Vec<String>,
+) {
+    let mut dirs: std::collections::HashSet<std::path::PathBuf> = std::collections::HashSet::new();
+    for rel in LEGACY_RELEASE_FILES {
+        let path = rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
+        // Collect ancestor dirs (excluding the version dir itself)
+        // for the empty-dir sweep below.
+        let mut anc = path.parent();
+        while let Some(a) = anc {
+            if a == dir {
+                break;
+            }
+            dirs.insert(a.to_path_buf());
+            anc = a.parent();
+        }
+        match std::fs::symlink_metadata(&path) {
+            // Regular files only: a symlink or other file type at a
+            // manifest path is user content, never ours to delete.
+            Ok(m) if m.is_file() => match std::fs::remove_file(&path) {
+                Ok(()) => removed.push(path.display().to_string()),
+                Err(e) => failed.push(format!("{} (remove failed: {e})", path.display())),
+            },
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    let mut dirs: Vec<std::path::PathBuf> = dirs.into_iter().collect();
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
+    for d in dirs {
+        // remove_dir (non-recursive) removes only EMPTY dirs: foreign
+        // files keep their parent chain intact by construction.
+        let _ = std::fs::remove_dir(&d);
+    }
+    match std::fs::remove_dir(dir) {
+        Ok(()) => removed.push(dir.display().to_string()),
+        Err(_) => kept.push(format!("{} (contains non-installer files)", dir.display())),
+    }
+}
+
 /// Classify one top-level home entry. Must be evaluated BEFORE any
 /// deletion: `current`'s legitimacy depends on the release dir it
 /// points at still existing (#225 re-review).
@@ -1381,6 +1483,9 @@ pub fn clean_legacy() -> Result<(), String> {
     };
     let mut removed: Vec<String> = Vec::new();
     let mut kept: Vec<String> = Vec::new();
+    // #225 D12: a removal that FAILS is not "kept" — the command must
+    // exit non-zero so callers/scripts see the partial state.
+    let mut failed: Vec<String> = Vec::new();
 
     // The v0.3.x bin symlink resolves through `current/` (or a version
     // dir directly): `~/.local/bin/skill-graph ->
@@ -1454,14 +1559,16 @@ pub fn clean_legacy() -> Result<(), String> {
             }
         }
         for (path, file_type) in classified {
-            let r = if file_type.is_dir() {
-                std::fs::remove_dir_all(&path)
+            if file_type.is_dir() {
+                // #225 D11: delete only installer-owned files inside
+                // the release dir — user-added files survive, and the
+                // dir tree is removed only where it became empty.
+                clean_legacy_release_dir(&path, &mut removed, &mut kept, &mut failed);
             } else {
-                std::fs::remove_file(&path)
-            };
-            match r {
-                Ok(()) => removed.push(path.display().to_string()),
-                Err(e) => kept.push(format!("{} (remove failed: {e})", path.display())),
+                match std::fs::remove_file(&path) {
+                    Ok(()) => removed.push(path.display().to_string()),
+                    Err(e) => failed.push(format!("{} (remove failed: {e})", path.display())),
+                }
             }
         }
     }
@@ -1469,7 +1576,7 @@ pub fn clean_legacy() -> Result<(), String> {
     if let Some(link) = bin_link_remove {
         match std::fs::remove_file(&link) {
             Ok(()) => removed.push(link.display().to_string()),
-            Err(e) => kept.push(format!("{} (remove failed: {e})", link.display())),
+            Err(e) => failed.push(format!("{} (remove failed: {e})", link.display())),
         }
     }
     if let Some(msg) = bin_link_keep {
@@ -1482,8 +1589,17 @@ pub fn clean_legacy() -> Result<(), String> {
     for p in &kept {
         outln!("kept:    {p}");
     }
-    if removed.is_empty() && kept.is_empty() {
+    for p in &failed {
+        outln!("failed:  {p}");
+    }
+    if removed.is_empty() && kept.is_empty() && failed.is_empty() {
         outln!("no legacy artifacts found under {}", home_dir.display());
+    }
+    if !failed.is_empty() {
+        return Err(format!(
+            "clean-legacy: {} removal(s) failed; see output above",
+            failed.len()
+        ));
     }
     Ok(())
 }
@@ -1510,6 +1626,18 @@ fn clean_extra_overlay() {
                 // user-managed file (serde reorders/pretty-prints it).
                 return;
             }
+            // #225 D09: same revision guard as the managed configs —
+            // an external edit since our read must not be overwritten.
+            match read_config(&overlay) {
+                Ok(now) if now == before => {}
+                _ => {
+                    crate::cli::write_stderr_line(&format!(
+                        "warning: overlay {} changed while cleaning; left untouched",
+                        overlay.display()
+                    ));
+                    return;
+                }
+            }
             match write_json(&overlay, &config) {
                 Ok(()) => outln!("cleaned overlay: {}", overlay.display()),
                 Err(e) => crate::cli::write_stderr_line(&format!(
@@ -1531,6 +1659,10 @@ fn clean_extra_overlay() {
 
 fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     check_project_symlink(path, args.scope)?;
+    // Serialize the read-modify-write against other skill-graph adapter
+    // invocations (#225 D09); the revision check below still catches
+    // non-cooperating writers.
+    let _config_lock = lock_config(path)?;
     // Resolve before touching anything: a resolution failure must not leave
     // a half-written install. OpenCode uses a file:// plugin specifier and
     // never embeds the binary path.
@@ -1546,9 +1678,11 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    // (payload dir, payload pre-existed) for rollback when the config
-    // write fails after materialization (#144 r17).
-    let mut materialized: Option<(PathBuf, bool)> = None;
+    // Revision baseline for check_config_revision (#225 D09).
+    let config_original = config.clone();
+    // (payload dir, previous index.ts bytes) for rollback when the
+    // config write fails after materialization (#144 r17, #225 D08).
+    let mut materialized: Option<(PathBuf, Option<Vec<u8>>)> = None;
 
     if args.runtime == Runtime::Opencode {
         if !opencode_bin_resolvable() {
@@ -1577,9 +1711,41 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             "cannot resolve the opencode plugin directory: XDG_DATA_HOME and HOME              are unset or not absolute"
                 .to_string()
         })?;
-        let payload_preexisting = payload_dir.join("index.ts").is_file();
+        let payload_file = payload_dir.join("index.ts");
+        // #225 D08: the payload is SHARED across projects/scopes — a
+        // pre-existing index.ts may be serving another config. Snapshot
+        // it (bounded) so a failed config write restores it
+        // byte-for-byte instead of leaving the new content behind.
+        // A non-regular-file occupant is foreign content: refuse to
+        // clobber it rather than discover it only at rollback time.
+        let prev_payload = match std::fs::symlink_metadata(&payload_file) {
+            Ok(m) if m.is_file() => {
+                let bytes = std::fs::read(&payload_file).map_err(|e| {
+                    format!(
+                        "{}: cannot back up existing plugin payload: {e}",
+                        payload_file.display()
+                    )
+                })?;
+                if bytes.len() as u64 > MAX_CONFIG_BYTES {
+                    return Err(format!(
+                        "{}: existing plugin payload too large to back up (>{} bytes)",
+                        payload_file.display(),
+                        MAX_CONFIG_BYTES
+                    ));
+                }
+                Some(bytes)
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "{}: refusing to replace a non-regular-file plugin payload",
+                    payload_file.display()
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", payload_file.display())),
+        };
         let plugin_dir = materialize_opencode_plugin()?;
-        materialized = Some((plugin_dir.clone(), payload_preexisting));
+        materialized = Some((plugin_dir.clone(), prev_payload));
         arr.push(json!(opencode_plugin_spec(&plugin_dir)));
     } else {
         strip_our_hooks(&mut config);
@@ -1611,14 +1777,28 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     // check at entry can be invalidated while resolve_bin probes ran,
     // and write_text_atomic resolves symlinks at write time.
     check_project_symlink(path, args.scope)?;
-    if let Err(e) = write_config(path, &config) {
+    // #225 D09: abort rather than overwrite a config an external writer
+    // changed since our read — the lock excludes skill-graph writers,
+    // this check catches everyone else.
+    check_config_revision(path, &config_original)?;
+    if let Err(e) = write_config(path, &config, matches!(args.scope, Scope::User)) {
         // Roll back the materialized payload so a failed enable leaves
-        // no orphaned side effect. Only remove what this command
-        // created: a pre-existing payload may serve other scopes, and
-        // remove_dir (non-recursive) keeps any foreign files (#144 r17).
-        if let Some((dir, false)) = materialized {
-            let _ = std::fs::remove_file(dir.join("index.ts"));
-            let _ = std::fs::remove_dir(dir);
+        // the payload exactly as found: restore the snapshotted bytes
+        // when a payload pre-existed (it may serve other projects),
+        // otherwise remove only what this command created — non-
+        // recursive remove_dir keeps any foreign files (#144 r17,
+        // #225 D08).
+        if let Some((dir, prev)) = materialized {
+            let file = dir.join("index.ts");
+            match prev {
+                Some(bytes) => {
+                    let _ = write_bytes_atomic_mode(&file, &bytes, false);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&file);
+                    let _ = std::fs::remove_dir(&dir);
+                }
+            }
         }
         return Err(e);
     }
@@ -1646,14 +1826,12 @@ fn enable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
 
 fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     check_project_symlink(path, args.scope)?;
-    // Payload dirs referenced by the config's own file:// specs,
-    // captured before strip_our_plugins removes them: after an env
-    // change the env-resolved dir is not the dir the spec points at
-    // (#144 r17).
-    let mut payload_dirs: Vec<PathBuf> = Vec::new();
     if !path.exists() {
         outln!("no config file: {}", path.display());
     } else {
+        // Serialize the read-modify-write against other skill-graph
+        // adapter invocations (#225 D09).
+        let _config_lock = lock_config(path)?;
         let mut config = read_config(path)?;
         if !config.is_object() {
             return Err(format!(
@@ -1663,7 +1841,6 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
         }
         let before = config.clone();
         if args.runtime == Runtime::Opencode {
-            payload_dirs = opencode_spec_dirs(&config);
             strip_our_plugins(&mut config);
         } else {
             strip_our_hooks(&mut config);
@@ -1675,7 +1852,10 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
             // Same TOCTOU re-check as enable: strip_our_hooks/read_config
             // took time, and the write resolves symlinks.
             check_project_symlink(path, args.scope)?;
-            write_config(path, &config)?;
+            // #225 D09: refuse to overwrite a config an external writer
+            // changed since our read.
+            check_config_revision(path, &before)?;
+            write_config(path, &config, matches!(args.scope, Scope::User))?;
         }
         outln!(
             "disabled skill-graph ({}, {}) from {}",
@@ -1686,102 +1866,23 @@ fn disable(args: &AdapterArgs, path: &Path) -> Result<(), String> {
     }
 
     if args.runtime == Runtime::Opencode {
-        // Remove the materialized plugin only when no remaining config
-        // references it — user and project scopes share one payload dir.
-        // Project configs in other directories cannot be enumerated, so
-        // absence of references here is best-effort.
-        match opencode_plugin_referenced() {
-            Some(false) => {
-                // Remove every payload dir the readable configs
-                // referenced (spec-decoded) plus the env-resolved dir,
-                // which covers payloads orphaned by env changes or
-                // failed enables. An unresolvable env dir is skipped
-                // rather than fabricated cwd-relative.
-                if let Some(dir) = opencode_plugin_dir()
-                    && is_managed_payload_dir(&dir)
-                {
-                    payload_dirs.push(dir);
-                }
-                payload_dirs.sort();
-                payload_dirs.dedup();
-                // Canonicalized data-home bases: managed payload
-                // locations are exactly `<base>/skill-graph` (parent,
-                // gates symlink unlinks) and `<base>/skill-graph/
-                // opencode-plugin` (full dir, gates recursive deletes).
-                // `starts_with` would also admit a foreign
-                // `other-vendor/skill-graph/opencode-plugin` nested
-                // under the same base, and the managed payload is never
-                // nested deeper than the marker (#144 r19/r20).
-                let base_dirs: Vec<PathBuf> = payload_base_dirs()
-                    .iter()
-                    .filter_map(|b| b.canonicalize().ok())
-                    .collect();
-                let managed_parents: Vec<PathBuf> =
-                    base_dirs.iter().map(|b| b.join("skill-graph")).collect();
-                let managed_dirs: Vec<PathBuf> =
-                    base_dirs.iter().map(|b| b.join(PLUGIN_MARKER)).collect();
-                for dir in &payload_dirs {
-                    match payload_delete_action(dir, &managed_parents, &managed_dirs) {
-                        Some(PayloadDelete::UnlinkSymlink) => {
-                            let _ = std::fs::remove_file(dir);
-                        }
-                        Some(PayloadDelete::RemoveDirAll(resolved)) => {
-                            let _ = std::fs::remove_dir_all(resolved);
-                        }
-                        None => {}
-                    }
-                }
-                outln!(
-                    "note: checked user and current-project opencode configs only; \
-                     project configs in other directories may still reference the plugin"
-                );
-            }
-            Some(true) => {}
-            None => {
-                // A config we could not read might still reference the
-                // shared payload — deleting it would break that scope.
-                outln!(
-                    "warning: could not verify all opencode configs; \
-                     keeping the materialized plugin payload"
-                );
-            }
-        }
+        // #225 D07: the materialized plugin payload is SHARED across
+        // projects and scopes, and project configs in other directories
+        // cannot be enumerated — deleting it here could break another
+        // project's plugin. Normal disable therefore NEVER deletes the
+        // payload; its lifecycle is separate from any single config's
+        // disable (the inert ~50KB index.ts is harmless residue once no
+        // config references it).
+        outln!(
+            "note: the shared opencode plugin payload is left in place \
+             (other projects may reference it); remove it manually if unneeded"
+        );
     }
 
     if args.runtime == Runtime::ClaudeCode && args.scope == Scope::User {
         clean_extra_overlay();
     }
     Ok(())
-}
-
-/// Tri-state reference check for the shared opencode plugin payload: `Some(true)` a readable config references
-/// the plugin, `Some(false)` every checkable config is clean, `None`
-/// when at least one config could not be read or resolved. An
-/// unreadable/oversized config must NOT collapse to "unreferenced" —
-/// the caller would delete the shared payload out from under it.
-fn opencode_plugin_referenced() -> Option<bool> {
-    let mut referenced = false;
-    let mut unknown = false;
-    for scope in [Scope::User, Scope::Project] {
-        let Ok(path) = config_path(Runtime::Opencode, scope) else {
-            unknown = true;
-            continue;
-        };
-        match read_config(&path) {
-            Ok(c) if count_plugin_entries(&c) + count_legacy_plugin_entries(&c) > 0 => {
-                referenced = true;
-            }
-            Ok(_) => {}
-            Err(_) => unknown = true,
-        }
-    }
-    if referenced {
-        Some(true)
-    } else if unknown {
-        None
-    } else {
-        Some(false)
-    }
 }
 
 fn status(args: &AdapterArgs, path: &Path) -> Result<(), String> {

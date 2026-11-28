@@ -26,6 +26,12 @@ writeFileSync(
     'if [ "$1" = "detect" ]; then printf \'%s\' "$input" > "$0.capture"; fi\n' +
     'if [ "$1" = "recommend" ]; then ' +
     'printf \'%s\' \'[{"skill":{"name":"alpha","digest":"d1"}},{"skill":{"name":"beta","digest":"d2"}}]\'\n' +
+    "fi\n" +
+    // `deps` returns declared requires only (#225 B08) — distinct from
+    // the generic recommend result so mislabeled recommendations would
+    // be observable.
+    'if [ "$1" = "deps" ]; then ' +
+    'printf \'%s\' \'[{"name":"dep-one","digest":"dd1"},{"name":"dep-two","digest":"dd2"}]\'\n' +
     "fi\n",
 )
 chmodSync(fakeBin, 0o755)
@@ -127,10 +133,15 @@ describe("safeSessionID — parity with events::sanitize_session_id", () => {
   })
 
   test("hostile multi-MB ids stay bounded", () => {
+    // #225 C01: ids longer than the 8192-code-point identity domain
+    // collapse to the unattributed ("") namespace — they can never
+    // share session state — in O(domain) work for ANY input size.
     const huge = `${"a".repeat(4 * 1024 * 1024)}!${"b".repeat(1024)}`
-    const out = safeSessionID(huge)
-    expect(out.length).toBe(128)
-    expect(safeSessionID(huge)).toBe(out)
+    expect(safeSessionID(huge)).toBe("")
+    // Boundary: exactly 8192 code points still normalizes.
+    const edge = "e".repeat(8192)
+    expect(safeSessionID(edge)).not.toBe("")
+    expect(safeSessionID(edge)).toBe(safeSessionID(edge))
   })
 })
 
@@ -199,11 +210,13 @@ describe("detect payload contract (#225 r7)", () => {
     expect(body.session_id).not.toBe(safeSessionID(raw))
   })
 
-  test("raw session id slice always contains the full identity domain (#225 r9)", async () => {
-    // normalize compares the first 8192 code points; the transport
-    // slice (32 KiB) must contain ALL of them even for 4-byte chars,
-    // so safeSessionID(slice) === safeSessionID(full) and detect's
-    // normalize(raw) lands on the same sid — for ANY host id size.
+  test("raw session id slice preserves the whole overlong-domain decision (#225 r9/C01)", async () => {
+    // normalize maps ids of >8192 code points to "" (unattributed).
+    // The transport slice must therefore (a) contain the whole string
+    // whenever it has <=8192 code points and (b) contain >8192 code
+    // points whenever the original does — so safeSessionID(slice) ===
+    // safeSessionID(full) AND detect's normalize(raw) lands on the
+    // same sid for ANY host id size.
     const capture = `${fakeBin}.capture`
     const handlers = await setupPlugin()
     const after = handlers["tool:execute.after"]
@@ -219,27 +232,30 @@ describe("detect payload contract (#225 r7)", () => {
 
     const body = JSON.parse(readFileSync(capture, "utf8"))
     expect(body.session_id).not.toBe(huge)
-    expect(Buffer.byteLength(body.session_id, "utf8")).toBeLessThanOrEqual(32 * 1024)
+    expect(Buffer.byteLength(body.session_id, "utf8")).toBeLessThanOrEqual(32784)
     // The forwarded slice must normalize to the SAME sid the plugin
     // used for state keys — i.e. safeSessionID(slice) equals
-    // safeSessionID(full): the domain is inside the slice.
+    // safeSessionID(full): the domain decision is inside the slice.
+    // Both sides are overlong here, so both are unattributed.
     expect(safeSessionID(body.session_id)).toBe(safeSessionID(huge))
-    // And it must actually contain ≥8192 code points (the whole
-    // identity domain), proving the 32 KiB budget is sufficient.
-    expect([...body.session_id].length).toBeGreaterThanOrEqual(8192)
+    expect(safeSessionID(body.session_id)).toBe("")
+    // And it must actually contain >8192 code points, proving the
+    // slice budget preserves the overlong decision.
+    expect([...body.session_id].length).toBeGreaterThan(8192)
   })
 
-  test("session ids differing only beyond the 8192-char domain share identity BY CONTRACT", () => {
-    // The domain is a normalize-level contract shared by every
-    // producer — not a plugin-local truncation (#225 r9). Two ids
-    // that agree on the first 8192 chars are the same session
-    // everywhere; this is documented, deterministic behavior.
+  test("ids longer than the 8192-char domain become unattributed — never share state (#225 C01)", () => {
+    // Two distinct overlong ids agreeing on the first 8192 chars must
+    // NOT collapse into one session: both normalize to "" (the
+    // unattributed namespace), which shares no per-session state.
     const prefix = "p".repeat(9000)
-    expect(safeSessionID(prefix + "AAA")).toBe(safeSessionID(prefix + "BBB"))
-    // Within the domain, distinctness is preserved.
-    const p2 = "q".repeat(8191)
-    expect(safeSessionID(p2 + "X" + "z".repeat(100))).not.toBe(
-      safeSessionID(p2 + "Y" + "z".repeat(100)),
+    expect(safeSessionID(prefix + "AAA")).toBe("")
+    expect(safeSessionID(prefix + "BBB")).toBe("")
+    // Within the domain (<=8192 total chars), distinctness is
+    // preserved.
+    const p2 = "q".repeat(8100)
+    expect(safeSessionID(p2 + "X" + "z".repeat(90))).not.toBe(
+      safeSessionID(p2 + "Y" + "z".repeat(90)),
     )
   })
 })
@@ -283,18 +299,26 @@ describe("anonymous session state isolation (#225)", () => {
     // Identical repeat is dedup-suppressed for an attributed session.
     await prompt({ sessionID: "s-attr-1", prompt: { text: "attr-unique-bbb" } })
 
-    const own = recommendationEvents().filter(
-      (e) => e.session_id === "s-attr-1" && e.trigger === "prompt_submit",
-    )
-    expect(own.length).toBe(1)
-    // Attributed sessions DO get the injection queued, so emitted is
-    // truthful here — the anonymous/attributed asymmetry is the point.
-    expect(own[0].emitted).toBe(true)
+    // #225 C09: the recommendation event is deferred to the context
+    // drain — nothing is recorded before the injection actually
+    // happens, so emitted:true can never precede delivery.
+    expect(
+      recommendationEvents().filter(
+        (e) => e.session_id === "s-attr-1" && e.trigger === "prompt_submit",
+      ),
+    ).toHaveLength(0)
 
     const ev = { sessionID: "s-attr-1", system: [] as { type: string; text: string }[] }
     await context(ev)
     expect(ev.system.length).toBe(1)
     expect(ev.system[0].text).toContain("alpha")
+
+    // The drain wrote exactly one emitted:true recommendation event.
+    const own = recommendationEvents().filter(
+      (e) => e.session_id === "s-attr-1" && e.trigger === "prompt_submit",
+    )
+    expect(own.length).toBe(1)
+    expect(own[0].emitted).toBe(true)
 
     // A different session must not see s-attr-1's queued context.
     const other = { sessionID: "s-attr-2", system: [] as unknown[] }
@@ -320,6 +344,45 @@ describe("anonymous session state isolation (#225)", () => {
     const attr = { sessionID: "s-attr-3", system: [] as unknown[] }
     await context(attr)
     expect(attr.system.length).toBe(1)
+  })
+
+  test("queued entries evicted before drain are recorded emitted:false (#225 C09)", async () => {
+    const handlers = await setupPlugin()
+    const prompt = handlers["session:prompt"]
+
+    // MAX_PENDING_ENTRIES_PER_SESSION is 64: the 65th queued entry
+    // evicts the oldest, which must leave a terminal funnel record —
+    // a recommendation that never reached the model cannot vanish.
+    for (let i = 0; i < 65; i++) {
+      await prompt({ sessionID: "s-evict", prompt: { text: `evict-prompt-${i}` } })
+    }
+    const evicted = recommendationEvents().filter(
+      (e) => e.session_id === "s-evict" && e.reason === "evicted",
+    )
+    expect(evicted).toHaveLength(1)
+    expect(evicted[0].emitted).toBe(false)
+    expect(evicted[0].trigger).toBe("prompt_submit")
+    expect(evicted[0].recommended.length).toBeGreaterThan(0)
+  })
+
+  test("a failed context injection records inject_failed, never emitted:true (#225 C09/C10)", async () => {
+    const handlers = await setupPlugin()
+    const prompt = handlers["session:prompt"]
+    const context = handlers["session:context"]
+
+    await prompt({ sessionID: "s-frozen", prompt: { text: "frozen-sys-aaa" } })
+    // A frozen system array makes push() throw — the injection cannot
+    // happen, so the funnel must record emitted:false and the hook
+    // must fail open without throwing into the host.
+    const ev = { sessionID: "s-frozen", system: Object.freeze([]) as unknown[] }
+    await context(ev)
+
+    const recs = recommendationEvents().filter(
+      (e) => e.session_id === "s-frozen" && e.trigger === "prompt_submit",
+    )
+    expect(recs).toHaveLength(1)
+    expect(recs[0].emitted).toBe(false)
+    expect(recs[0].reason).toBe("inject_failed")
   })
 })
 

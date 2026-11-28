@@ -41,12 +41,56 @@
 # Every step is a separate process or an explicit `|| exit`: nothing
 # relies on errexit surviving a caller's `||`/`if` context.
 #
-# Usage: publish-npm.sh <package-dir> [<package-dir>...]
+# Usage: publish-npm.sh <package-dir|file.tgz> [<package-dir|file.tgz>...]
+#
+# Arguments may be package DIRECTORIES (packed here in Phase C) or
+# pre-packed .tgz artifacts — the frozen npm channel artifacts the
+# approved freeze manifest digests (#225 A06/A11). For a .tgz the
+# archive itself is the fixed publish candidate: it is extracted
+# only for manifest/files/bin preflight, never re-packed, so the
+# published bytes are byte-identical to the verified frozen bytes.
 # Auth: npm's normal resolution (NODE_AUTH_TOKEN / .npmrc).
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
-[ "$#" -gt 0 ] || { echo "usage: publish-npm.sh <package-dir>..." >&2; exit 1; }
+[ "$#" -gt 0 ] || { echo "usage: publish-npm.sh <package-dir|file.tgz>..." >&2; exit 1; }
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/sg-publish.XXXXXX")" || exit 1
+trap 'rm -rf "$work"' EXIT
+
+# Normalize arguments: directories pass through; .tgz files are
+# extracted into $work/src-N and the EXTRACTED tree stands in for the
+# package dir in Phases A/B (manifest, files[], bin). The .tgz itself
+# remains the publish candidate — Phase C skips re-packing it.
+declare -a src_dirs=() src_tgzs=()
+i=0
+for arg in "$@"; do
+  case "$arg" in
+    *.tgz)
+      [ -f "$arg" ] || { echo "tarball not found: $arg" >&2; exit 1; }
+      # Archive wellformedness BEFORE extraction: canonical
+      # package/-rooted members, no ".."/absolute paths, regular
+      # files and dirs only — extraction of an unverified archive is
+      # itself an attack surface.
+      "$here/verify-npm-archive.sh" "$arg" || exit 1
+      dest="$work/src-$i"
+      mkdir -p "$dest" || exit 1
+      tar -xzf "$arg" -C "$dest" || {
+        echo "cannot extract $arg for preflight" >&2; exit 1; }
+      [ -f "$dest/package/package.json" ] || {
+        echo "$arg has no package/package.json" >&2; exit 1; }
+      # Preflight/bin checks operate on package/ contents — point
+      # them at the extracted package root.
+      src_dirs+=("$dest/package")
+      src_tgzs+=("$arg")
+      ;;
+    *)
+      src_dirs+=("$arg")
+      src_tgzs+=("")
+      ;;
+  esac
+  i=$((i + 1))
+done
 
 # ------------------------------------------------------------------
 # Phase A: structured manifest preflight for EVERY package. Real
@@ -54,7 +98,7 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # unusually formatted manifests (#225 r6). No pack/publish may happen
 # until all manifests validate.
 # ------------------------------------------------------------------
-meta="$(node "$here/pkg-preflight.mjs" "$@")" || exit 1
+meta="$(node "$here/pkg-preflight.mjs" "${src_dirs[@]}")" || exit 1
 
 declare -a pkg_names=() pkg_vers=() pkg_files=() pkg_bins=() pkg_manifests=()
 while IFS=$'\t' read -r n v f b x; do
@@ -75,7 +119,7 @@ done <<< "$meta"
 # packing; the authoritative check re-runs INSIDE each artifact in
 # Phase D (#225 r5/r6).
 # ------------------------------------------------------------------
-for pkg in "$@"; do
+for pkg in "${src_dirs[@]}"; do
   if [ -d "$pkg/bin" ]; then
     while IFS= read -r -d '' f; do
       [ -f "$f" ] || { echo "bin entry is not a regular file: $f" >&2; exit 1; }
@@ -90,7 +134,7 @@ done
 # constrained to bin/ by preflight, so --check-bin covers them inside
 # the artifact too.
 i=0
-for pkg in "$@"; do
+for pkg in "${src_dirs[@]}"; do
   while IFS= read -r t; do
     [ -n "$t" ] || continue
     "$here/verify-npm-bin.sh" "$pkg/$t" || exit 1
@@ -101,17 +145,23 @@ for pkg in "$@"; do
 done
 
 # ------------------------------------------------------------------
-# Phase C: pack EVERY package into fixed artifacts BEFORE any publish.
-# Phase D: verify each artifact itself. Both complete for ALL packages
-# before Phase E publishes anything — a late artifact failure must
-# not leave a partial release (#225 r5).
+# Phase C: produce the FIXED artifact for EVERY package BEFORE any
+# publish. Directory arguments are packed here; .tgz arguments ARE
+# the fixed artifact already (frozen channel bytes — never re-packed,
+# #225 A06). Phase D verifies each artifact itself. Both complete
+# for ALL packages before Phase E publishes anything — a late
+# artifact failure must not leave a partial release (#225 r5).
 # ------------------------------------------------------------------
-work="$(mktemp -d "${TMPDIR:-/tmp}/sg-publish.XXXXXX")" || exit 1
-trap 'rm -rf "$work"' EXIT
 
 declare -a tgzs=()
 i=0
-for pkg in "$@"; do
+for pkg in "${src_dirs[@]}"; do
+  frozen_tgz="${src_tgzs[$i]}"
+  if [ -n "$frozen_tgz" ]; then
+    # Pre-packed artifact: the bytes are already fixed. Resolve to
+    # an absolute path — publish must not depend on cwd.
+    tgz="$(cd "$(dirname "$frozen_tgz")" && pwd)/$(basename "$frozen_tgz")"
+  else
   # npm pack resolves its argument as a package SPEC, not a path:
   # a bare "npm/foo" is interpreted as the GitHub repository
   # github:npm/foo (verified against real npm — it runs
@@ -132,6 +182,7 @@ for pkg in "$@"; do
   # publish target ambiguous.
   [ "$(find "$pdir" -name '*.tgz' | wc -l)" -eq 1 ] || {
     echo "npm pack produced multiple tarballs for $pkg" >&2; exit 1; }
+  fi
 
   # Phase D: the FIXED artifact must itself be a well-formed npm
   # tarball with executable-format bin payloads — verified bytes are

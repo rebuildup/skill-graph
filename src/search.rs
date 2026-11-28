@@ -634,21 +634,36 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // Recommendation identity is the skill name, but same-name copies are not
     // silently conflated: the highest-scoring copy represents the name, and a
     // name shared by distinct digests is reported as a collision in reasons.
+    // #225 B05: aggregate each name's distinct digests ONCE — rescanning
+    // the same-name index set per recommendation made k colliding copies
+    // cost O(k²).
+    let mut distinct_by_name: HashMap<String, usize> = HashMap::new();
+    for rec in &out {
+        let name = rec.skill.name.clone();
+        if distinct_by_name.contains_key(&name) {
+            continue;
+        }
+        let distinct: HashSet<&str> = graph
+            .by_name
+            .get(&rec.skill.name)
+            .map(|indexes| {
+                indexes
+                    .iter()
+                    .filter(|&&i| graph.skills[i].parse_error.is_none())
+                    .map(|&i| graph.skills[i].digest.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        distinct_by_name.insert(name, distinct.len());
+    }
     for rec in &mut out {
-        if let Some(indexes) = graph.by_name.get(&rec.skill.name) {
-            let distinct: HashSet<&str> = indexes
-                .iter()
-                .filter(|&&i| graph.skills[i].parse_error.is_none())
-                .map(|&i| graph.skills[i].digest.as_str())
-                .collect();
-            if distinct.len() > 1 {
-                rec.reasons.push(format!(
-                    "name collision: {} distinct versions installed",
-                    distinct.len()
-                ));
-                rec.reasons.sort();
-                rec.reasons.dedup();
-            }
+        let distinct = distinct_by_name.get(&rec.skill.name).copied().unwrap_or(0);
+        if distinct > 1 {
+            rec.reasons.push(format!(
+                "name collision: {distinct} distinct versions installed"
+            ));
+            rec.reasons.sort();
+            rec.reasons.dedup();
         }
     }
     let mut seen_names = HashSet::new();

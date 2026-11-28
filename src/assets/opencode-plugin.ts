@@ -31,9 +31,19 @@ const absPath = (v: string | undefined): string | undefined =>
   v !== undefined && v !== "" && !v.includes("\uFFFD") && isAbsolute(v)
     ? v
     : undefined
+// Per-user state root — parity with the Rust hook's per_user_state_root
+// (#225 D06): shared TMPDIR defaults let two accounts collide on the
+// event log. XDG_STATE_HOME > HOME/.local/state > TMPDIR.
+const stateRoot = (() => {
+  const xdg = absPath(process.env.XDG_STATE_HOME)
+  if (xdg) return join(xdg, "skill-graph")
+  const home = absPath(process.env.HOME)
+  if (home) return join(home, ".local", "state", "skill-graph")
+  return join(absPath(tmpdir()) ?? "/tmp", "skill-graph")
+})()
 const EVENT_LOG =
   absPath(process.env.SKILL_GRAPH_EVENT_LOG) ??
-  join(absPath(tmpdir()) ?? "/tmp", "skill-graph-events.jsonl")
+  join(stateRoot, "events.jsonl")
 // Parity with the Rust hook: SKILL_GRAPH_HOOK_NOSTATE=1 suppresses all
 // event writes; SKILL_GRAPH_EVENT_LOG_MAX bounds the log (rotate to .1).
 const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
@@ -64,8 +74,6 @@ const MAX_PENDING_SESSIONS = 200
 // names retained per session for dedup (#144 r14).
 const MAX_PROMPT_SKILLS = 1_024
 const MAX_SEEN_SKILLS = 4_096
-const MAX_SESSION_CTX = 200
-const MAX_SESSION_NAMES = 32
 // detectLoad spawns one `skill-graph detect` subprocess per
 // SKILL.md-touching tool call; bound the count per session so a
 // pathological session cannot churn unbounded subprocesses. Legit
@@ -73,7 +81,6 @@ const MAX_SESSION_NAMES = 32
 // events) rather than hanging the event loop.
 const MAX_DETECT_PER_SESSION = 512
 const emitted = new Set<string>()
-const sessionCtx = new Map<string, string[]>()
 const detectCounts = new Map<string, number>()
 
 function sha256(text: string): string {
@@ -110,15 +117,18 @@ const ID_RESERVED = /-[0-9a-f]{32}$/
 
 // Session-id transport boundary: the RAW host id is bounded BEFORE it
 // feeds both safeSessionID (state keys, emitted events) and the
-// detect payload. The slice MUST contain the whole identity domain —
-// normalize compares the first ID_SCAN_CHARS(8192) code points — so
-// 32 KiB is the minimum byte budget that guarantees ≥8192 chars even
-// for 4-byte code points (8192 × 4 = 32768). safeSessionID and
-// SessionId::normalize then agree EXACTLY: both derive head+hash from
-// the same first-8192-char domain whether they see the slice or the
-// full id (#225 r9 — the domain is a normalize contract, not a
-// producer-local truncation).
-const SESSION_ID_RAW_MAX_BYTES = 32 * 1024
+// detect payload. The slice MUST preserve the whole identity domain
+// decision: normalize maps ids of >ID_SCAN_CHARS(8192) code points to
+// the unattributed ("") namespace (#225 C01), so the slice must
+// (a) contain the ENTIRE string whenever it has <=8192 code points —
+// 8192 x 4-byte chars = 32768 bytes — and (b) contain >8192 code
+// points whenever the original does — a maximal prefix of B bytes
+// holds at least floor((B-3)/4) code points, so B >= 32772 guarantees
+// >=8193. 32784 satisfies both with margin. safeSessionID and
+// SessionId::normalize then agree EXACTLY on every input (#225 r9 —
+// the domain is a normalize contract, not a producer-local
+// truncation).
+const SESSION_ID_RAW_MAX_BYTES = 32784
 function rawSessionID(event: { sessionID?: unknown } | null | undefined): string {
   const s = event?.sessionID
   return typeof s === "string" ? utf8Slice(s, SESSION_ID_RAW_MAX_BYTES) : ""
@@ -143,18 +153,17 @@ export function safeSessionID(id: unknown): string {
       return whole
     }
   }
-  // Non-canonical: the identity DOMAIN is the first ID_SCAN_CHARS
-  // code points — head AND hash both derive from it, matching
-  // SessionId::normalize exactly. Work is O(domain) for ANY input
-  // size, and the domain is defined ONCE inside the normalize
-  // contract so every producer shares it (#225 r9: hashing the full
-  // string made work O(input), while a transport-side slice made the
-  // effective domain producer-local).
+  // Non-canonical: ids LONGER than the identity domain cannot be
+  // represented injectively within the bounded work budget — two
+  // distinct overlong ids agreeing on the first ID_SCAN_CHARS code
+  // points would collapse into ONE session and share its state.
+  // Collapse them into the unattributed ("") namespace instead,
+  // matching SessionId::normalize (#225 C01).
   let domain = ""
   let scanned = 0
   for (const ch of s) {
-    if (scanned >= ID_SCAN_CHARS) break
     scanned++
+    if (scanned > ID_SCAN_CHARS) return ""
     domain += ch
   }
   let head = ""
@@ -175,8 +184,14 @@ function emit(event: Record<string, unknown>): boolean {
       // below refuses it anyway via O_NOFOLLOW).
       const st = lstatSync(EVENT_LOG)
       // isFile parity with the Rust hook: a directory must not be
-      // renamed away as if it were an oversized log.
-      if (!st.isSymbolicLink() && st.isFile() && st.size > EVENT_LOG_MAX) {
+      // renamed away as if it were an oversized log. #225 D03: the
+      // same trust contract as the append path applies BEFORE the
+      // rename — a foreign-owned or multiply-linked log is never
+      // rotated aside.
+      const trusted =
+        (typeof process.getuid !== "function" || st.uid === process.getuid()) &&
+        st.nlink === 1
+      if (!st.isSymbolicLink() && st.isFile() && st.size > EVENT_LOG_MAX && trusted) {
         renameSync(EVENT_LOG, EVENT_LOG + ".1")
       }
     } catch {}
@@ -243,12 +258,56 @@ const MAX_LOAD_RECOMMENDS = 8
 // Cap collected stdout: a runaway child must not buffer unbounded
 // output into plugin memory before the timeout fires.
 const MAX_PROC_OUTPUT_BYTES = 4 * 1024 * 1024
+// #225 C12: bound plugin-wide child concurrency — every hook path
+// shares this long-lived process, so unbounded spawns (detect +
+// recommend + deps across concurrent events) could exhaust the host.
+// Waiters are also bounded: a saturated queue fails open instead of
+// growing memory without limit.
+const MAX_CONCURRENT_PROCS = 4
+const MAX_PROC_WAITERS = 64
+let runningProcs = 0
+const procWaiters: (() => void)[] = []
 
-async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
+/// Resolve once a child slot is free; null when the waiter queue is
+/// saturated (caller fails open). The returned release MUST run in a
+/// finally block.
+async function acquireProc(): Promise<(() => void) | null> {
+  if (runningProcs >= MAX_CONCURRENT_PROCS) {
+    if (procWaiters.length >= MAX_PROC_WAITERS) return null
+    await new Promise<void>((resolve) => procWaiters.push(resolve))
+  }
+  runningProcs++
+  return () => {
+    runningProcs--
+    const next = procWaiters.shift()
+    if (next) next()
+  }
+}
+
+// #225 C11: callers must distinguish a clean exit-0 run from timeout,
+// signal kill, non-zero exit, or truncated stdout — a partial or
+// killed child's output is not a valid detect/recommend/deps result.
+type ProcResult = {
+  text: string
+  exitCode: number | null
+  timedOut: boolean
+  truncated: boolean
+  ok: boolean
+}
+
+async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<ProcResult> {
+  let truncated = false
   // Attach a catch immediately: a stream error before the read resolves
   // would otherwise be an unhandled rejection.
   const readAll = (async () => {
-    const reader = proc.stdout.getReader()
+    // Every spawn site uses stdout:"pipe", but Bun.spawn's return type
+    // admits `number | undefined` — narrow defensively (#225 F05).
+    const stream = proc.stdout
+    if (!stream || typeof stream === "number") {
+      try { proc.kill() } catch {}
+      return ""
+    }
+    const reader = stream.getReader()
     const chunks: Uint8Array[] = []
     let total = 0
     try {
@@ -257,10 +316,16 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
         if (done) break
         if (!value) continue
         const remaining = MAX_PROC_OUTPUT_BYTES - total
-        if (remaining <= 0) break
+        if (remaining <= 0) {
+          truncated = true
+          break
+        }
         chunks.push(value.length > remaining ? value.subarray(0, remaining) : value)
         total += Math.min(value.length, remaining)
-        if (total >= MAX_PROC_OUTPUT_BYTES) break
+        if (total >= MAX_PROC_OUTPUT_BYTES) {
+          truncated = true
+          break
+        }
       }
     } catch {}
     try { proc.kill() } catch {}
@@ -275,18 +340,21 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
     return new TextDecoder().decode(merged)
   })().catch(() => "")
   let timer: ReturnType<typeof setTimeout> | undefined
+  let timedOut = false
+  let exitCode: number | null = null
   try {
-    await Promise.race([
+    exitCode = await Promise.race([
       proc.exited,
-      new Promise<never>((_, reject) => {
+      new Promise<null>((resolve) => {
         timer = setTimeout(() => {
+          timedOut = true
           try { proc.kill() } catch {}
-          reject(new Error("skill-graph timed out"))
+          resolve(null)
         }, PROC_TIMEOUT_MS)
       }),
     ])
   } catch {
-    // timed out and killed; fall through to collect partial output
+    timedOut = true
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -301,7 +369,10 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
       }, PROC_DRAIN_MS),
     ),
   ])
-  return drained
+  // ok requires a clean exit-0 within the timeout with complete
+  // (untruncated) stdout — anything else is a failed child, not data.
+  const ok = !timedOut && exitCode === 0 && !truncated
+  return { text: drained, exitCode, timedOut, truncated, ok }
 }
 
 async function recommendNames(
@@ -319,16 +390,28 @@ async function recommendNames(
     "--max", String(max), "--format", "json",
   ]
   if (context) args.push("--context", context)
-  const proc = Bun.spawn(args, {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  })
-  proc.stdin.write(query)
-  proc.stdin.end()
-  const out = await collectProc(proc).catch(() => "")
+  const release = await acquireProc()
+  if (!release) return []
+  let res: ProcResult
   try {
-    const recs = JSON.parse(out) as { skill: { name: string; digest?: string } }[]
+    const proc = Bun.spawn(args, {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+    proc.stdin.write(query)
+    proc.stdin.end()
+    res = await collectProc(proc).catch(
+      (): ProcResult => ({ text: "", exitCode: null, timedOut: true, truncated: false, ok: false }),
+    )
+  } finally {
+    release()
+  }
+  // A timed-out, killed, non-zero, or truncated child produced no
+  // trustworthy result — do not parse partial output (#225 C11).
+  if (!res.ok) return []
+  try {
+    const recs = JSON.parse(res.text) as { skill: { name: string; digest?: string } }[]
     // `recommend` output is operator-trusted but still normalized like
     // every other plugin path: names must satisfy the skill-name
     // contract and the list is bounded before it can reach context.
@@ -336,6 +419,46 @@ async function recommendNames(
       .filter((r) => validSkillName(r.skill.name))
       .slice(0, 64)
       .map((r) => ({ name: r.skill.name, digest: r.skill.digest }))
+  } catch {
+    return []
+  }
+}
+
+// Declared-dependency lookup for the skill-load path (#225 B08):
+// `skill-graph deps` applies the SAME resolved-requires definition as
+// the Rust hook — generic recommendations are never mislabeled as
+// dependencies. Output is [{name, digest}] sorted by the CLI.
+const MAX_INJECTED_DEPS = 8
+async function declaredDeps(
+  skillName: string,
+): Promise<{ name: string; digest?: string }[]> {
+  const name = utf8Slice(skillName, 1024)
+  if (!validSkillName(name)) return []
+  const release = await acquireProc()
+  if (!release) return []
+  let res: ProcResult
+  try {
+    const proc = Bun.spawn(
+      [SKILL_GRAPH_BIN, "deps", name, "--format", "json"],
+      { stdin: "ignore", stdout: "pipe", stderr: "ignore" },
+    )
+    res = await collectProc(proc).catch(
+      (): ProcResult => ({ text: "", exitCode: null, timedOut: true, truncated: false, ok: false }),
+    )
+  } finally {
+    release()
+  }
+  if (!res.ok) return []
+  try {
+    const deps = JSON.parse(res.text) as { name?: unknown; digest?: unknown }[]
+    if (!Array.isArray(deps)) return []
+    return deps
+      .filter((d) => typeof d?.name === "string" && validSkillName(d.name))
+      .slice(0, 64)
+      .map((d) => ({
+        name: d.name as string,
+        digest: typeof d.digest === "string" ? d.digest : undefined,
+      }))
   } catch {
     return []
   }
@@ -490,11 +613,15 @@ export function boundJsonValue(v: unknown, depth: number, st: BoundState): unkno
     let n = 0
     // for..in + hasOwnProperty keeps enumeration lazy: the runtime
     // fetches each key's descriptor only as iteration reaches it, so
-    // the early break bounds per-key work for plain objects AND
-    // Proxy traps alike (ownKeys itself is a single call either way).
-    // EVERY yielded key consumes the GLOBAL node budget too —
-    // per-object `n` alone would still allow nodes×keys total work
-    // (#225 r9).
+    // the early break bounds per-key work. EVERY yielded key —
+    // inherited enumerable included — consumes the GLOBAL node budget
+    // before its value is read (#225 r9, C02). Residual boundary,
+    // stated honestly: ownKeys/getOwnPropertyDescriptor are each a
+    // single host-side call whose RESULT may be large (a Proxy trap
+    // could enumerate a million keys); JS offers no cheaper key-count
+    // primitive, so that one materialization is the trusted-host
+    // boundary. Everything the plugin itself iterates or reads is
+    // capped at MAX_INPUT_NODES keys / MAX_INPUT_JSON_BYTES strings.
     for (const k in v as Record<string, unknown>) {
       if (++n > MAX_INPUT_NODES || ++st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
       if (!Object.prototype.hasOwnProperty.call(v, k)) continue
@@ -594,14 +721,26 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       if (oldest !== undefined) detectCounts.delete(oldest)
     }
     detectCounts.set(sid, detects + 1)
-    const proc = Bun.spawn(
-      [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
-      { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
-    )
-    proc.stdin.write(body)
-    proc.stdin.end()
-    const out = await collectProc(proc).catch(() => "")
-    const trimmed = out.trim()
+    const release = await acquireProc()
+    if (!release) return []
+    let res: ProcResult
+    try {
+      const proc = Bun.spawn(
+        [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
+        { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
+      )
+      proc.stdin.write(body)
+      proc.stdin.end()
+      res = await collectProc(proc).catch(
+        (): ProcResult => ({ text: "", exitCode: null, timedOut: true, truncated: false, ok: false }),
+      )
+    } finally {
+      release()
+    }
+    // Timeout / kill / non-zero / truncated output is a failed detect,
+    // not partial detection data (#225 C11).
+    if (!res.ok) return []
+    const trimmed = res.text.trim()
     if (!trimmed) return []
     // `detect` emits one JSON object per line (a payload may touch
     // several SKILL.md files); parse each line independently. Cap at
@@ -632,8 +771,26 @@ export default Plugin.define({
   id: "skill-graph",
   async setup(ctx) {
     dbg("setup called")
-    // sessionID -> queued injections for the next context hook
-    const pending = new Map<string, { kind: "prompt" | "deps"; names: string[] }[]>()
+    // #225 C03: NOSTATE means NO mutable session state at all — every
+    // dedup/queue map below is bypassed, matching the Rust hook's
+    // state_disabled contract. detectCounts stays unconditional: it is
+    // a subprocess resource bound, not user-visible state, and removing
+    // it under NOSTATE would let a hostile event flood spawn children.
+    const STATE_ON = !NOSTATE
+    // sessionID -> queued injections for the next context hook. Each
+    // entry carries everything needed to emit its recommendation event
+    // at DRAIN time (#225 C09): emitted:true is only written when the
+    // injection actually reaches the model's context, and an entry
+    // evicted before drain is recorded emitted:false/"evicted" rather
+    // than silently lost or falsely delivered.
+    type PendingEntry = {
+      kind: "prompt" | "deps"
+      names: string[]
+      recs: { name: string; digest?: string }[]
+      trigger: "prompt_submit" | "skill_load"
+      prompt_hash?: string
+    }
+    const pending = new Map<string, PendingEntry[]>()
     // sessionID -> skills already dependency-recommended (parity with the
     // Rust hook's `skill:<name>` dedup markers).
     const loadDedup = new Map<string, Set<string>>()
@@ -646,39 +803,40 @@ export default Plugin.define({
     // sessions, but a session whose context hook never drains would
     // otherwise grow `list` for its whole lifetime (#144 r18).
     const MAX_PENDING_ENTRIES_PER_SESSION = 64
-    const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
-      if (!names.length) return
+    // Dropped queue entries still get a terminal funnel record — a
+    // recommendation that never reached the model must not vanish
+    // silently (#225 C09).
+    const emitEvicted = (sessionID: string, entries: PendingEntry[]) => {
+      for (const e of entries) {
+        if (!e.recs.length) continue
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: e.trigger,
+          prompt_hash: e.prompt_hash,
+          recommended: e.recs,
+          emitted: false,
+          reason: "evicted",
+        })
+      }
+    }
+    const queue = (sessionID: string, entry: PendingEntry) => {
+      if (!STATE_ON || !entry.names.length) return
       if (!pending.has(sessionID) && pending.size >= MAX_PENDING_SESSIONS) {
         // FIFO-evict the oldest session; its queued context is dropped.
         const oldest = pending.keys().next().value
-        if (oldest !== undefined) pending.delete(oldest)
+        if (oldest !== undefined) {
+          const dropped = pending.get(oldest)
+          pending.delete(oldest)
+          if (dropped) emitEvicted(oldest, dropped)
+        }
       }
       const list = pending.get(sessionID) ?? []
-      list.push({ kind, names })
+      list.push(entry)
       if (list.length > MAX_PENDING_ENTRIES_PER_SESSION) {
-        list.splice(0, list.length - MAX_PENDING_ENTRIES_PER_SESSION)
+        emitEvicted(sessionID, list.splice(0, list.length - MAX_PENDING_ENTRIES_PER_SESSION))
       }
       pending.set(sessionID, list)
-    }
-
-    // Session continuity parity with the Rust hook (issue #128): names a
-    // session's prompt mode surfaced become context for later skill-load
-    // dependency lookups. Bounded like `pending`.
-    const rememberSession = (sessionID: string, names: string[]) => {
-      if (!names.length) return
-      // Accumulate like the Rust hook's .recommended file: dedup, keep
-      // the most recent MAX_SESSION_NAMES names per session.
-      const merged = [...(sessionCtx.get(sessionID) ?? [])]
-      for (const n of names) {
-        if (validSkillName(n) && !merged.includes(n)) merged.push(n)
-      }
-      const capped = merged.slice(-MAX_SESSION_NAMES)
-      if (!capped.length) return
-      if (!sessionCtx.has(sessionID) && sessionCtx.size >= MAX_SESSION_CTX) {
-        const oldest = sessionCtx.keys().next().value
-        if (oldest !== undefined) sessionCtx.delete(oldest)
-      }
-      sessionCtx.set(sessionID, capped)
     }
 
     await ctx.session.hook("prompt", async (event) => {
@@ -709,7 +867,7 @@ export default Plugin.define({
       // recommendation queues, and session continuity are all bypassed
       // so distinct anonymous sessions cannot merge or leak into each
       // other (#225 re-review).
-      const attributed = sessionID !== ""
+      const attributed = STATE_ON && sessionID !== ""
       if (Array.isArray(skills) && skills.length > 0) {
         let seen = attributed ? promptSkillSeen.get(sessionID) : undefined
         if (attributed && !seen) {
@@ -757,28 +915,46 @@ export default Plugin.define({
       const recs = await recommendNames(text, 3).catch(() => [])
       // recommended[] must equal the injected set for funnel integrity.
       const names = recs.map((r) => r.name)
-      if (attributed) rememberSession(sessionID, names)
-      emit({
-        ...base("recommendation"),
-        session_id: sessionID,
-        trigger: "prompt_submit",
-        prompt_hash: text ? sha256(text) : undefined,
-        recommended: recs,
-        // `emitted` means "injected where the model can see it". An
-        // unattributed session queues nothing (no session id to
-        // correlate the context hook), so recording emitted:true would
-        // falsify the funnel — the Rust hook injects anonymously via
-        // its synchronous response, this plugin cannot (#225
-        // re-review).
-        emitted: attributed && names.length > 0,
-        reason: names.length > 0 ? "recommended" : "no_recommendations",
-      })
-      if (names.length > 0 && attributed) {
+      const phash = sha256(text)
+      if (names.length === 0) {
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: "prompt_submit",
+          prompt_hash: phash,
+          recommended: [],
+          emitted: false,
+          reason: "no_recommendations",
+        })
+        return
+      }
+      if (attributed) {
+        // #225 C09: the recommendation event is DEFERRED to the
+        // context-hook drain — emitted:true is only written when the
+        // injection actually reaches the model. A queued entry that
+        // never drains is recorded emitted:false/"evicted" by queue().
+        queue(sessionID, {
+          kind: "prompt",
+          names,
+          recs,
+          trigger: "prompt_submit",
+          prompt_hash: phash,
+        })
+        console.log(`[skill-graph] recommended: ${names.join(", ")}`)
+      } else {
         // Anonymous sessions cannot be correlated with a later context
         // hook — queueing under "" would leak one session's
-        // recommendations into another's (#225 re-review).
-        queue(sessionID, "prompt", names)
-        console.log(`[skill-graph] recommended: ${names.join(", ")}`)
+        // recommendations into another's (#225 re-review), so the event
+        // is emitted immediately with emitted:false.
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: "prompt_submit",
+          prompt_hash: phash,
+          recommended: recs,
+          emitted: false,
+          reason: "recommended",
+        })
       }
     })
 
@@ -788,7 +964,7 @@ export default Plugin.define({
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
       const sessionID = safeSessionID(rawSessionID(event))
-      const attributed = sessionID !== ""
+      const attributed = STATE_ON && sessionID !== ""
       const detected = await detectLoad(event)
       if (!detected.length) return
       // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call
@@ -802,8 +978,8 @@ export default Plugin.define({
         if (!skillName || !DEP_TRIGGER.has(detection ?? "")) continue
 
         // Dependency lookup for the just-loaded skill (same contract as
-        // the shell adapters' skill-load mode, including session-context
-        // continuity). recommended[] records exactly the injected set
+        // the shell adapters' skill-load mode: declared requires only,
+        // #225 B08). recommended[] records exactly the injected set
         // for funnel integrity.
         // Skip skills this session already got a dependency pass for —
         // unattributable sessions share no dedup state (#225 re-review).
@@ -823,55 +999,98 @@ export default Plugin.define({
         if (recommendBudget <= 0) continue
         done?.add(skillName)
         recommendBudget -= 1
-        const sessionNames = attributed ? (sessionCtx.get(sessionID) ?? []) : []
-        const deps = await recommendNames(
-          skillName,
-          5,
-          sessionNames.join(" "),
-        ).catch(() => [])
-        const injected = deps.filter((d) => d.name !== skillName).slice(0, 3)
-        const names = injected.map((r) => r.name)
-        emit({
-          ...base("recommendation"),
-          session_id: sessionID,
-          trigger: "skill_load",
-          recommended: injected,
-          // Same funnel rule as the prompt path — unattributed sessions
-          // cannot receive the queued injection, so emitted stays
-          // false even when names were recommended (#225 re-review).
-          emitted: attributed && names.length > 0,
-          reason: names.length > 0 ? "recommended" : "no_recommendations",
-        })
-        if (names.length > 0 && attributed) queue(sessionID, "deps", names)
+        // #225 B08: surface only DECLARED dependencies — the same
+        // `deps` definition the Rust hook uses — never generic
+        // recommendations mislabeled as dependencies.
+        const deps = await declaredDeps(skillName).catch(() => [])
+        const injected = deps.slice(0, MAX_INJECTED_DEPS)
+        const names = injected.map((d) => d.name)
+        if (names.length > 0 && attributed) {
+          // #225 C09: same deferred-emission contract as the prompt
+          // path — emitted:true is written only at context drain.
+          queue(sessionID, {
+            kind: "deps",
+            names,
+            recs: injected,
+            trigger: "skill_load",
+          })
+        } else {
+          emit({
+            ...base("recommendation"),
+            session_id: sessionID,
+            trigger: "skill_load",
+            recommended: injected,
+            // Unattributed sessions cannot receive the queued
+            // injection, so emitted stays false even when names were
+            // recommended (#225 re-review). Under NOSTATE emit()
+            // itself is a no-op.
+            emitted: false,
+            reason: names.length > 0 ? "recommended" : "no_declared_dependencies",
+          })
+        }
       }
     })
 
     await ctx.session.hook("context", (event) => {
-      const sessionID = safeSessionID(rawSessionID(event))
-      // Anonymous sessions never queue (see the prompt hook) — an
-      // empty-key lookup must not drain another session's entries.
-      if (!sessionID) return
-      const list = pending.get(sessionID)
-      if (!list?.length) return
-      pending.delete(sessionID)
-      // The context-hook payload shape is runtime-defined; `system` may
-      // be absent or non-array. Fail open rather than throw inside the
-      // plugin host — this is the only unguarded path left.
-      if (!Array.isArray(event.system)) {
-        try {
-          ;(event as { system?: unknown }).system = []
-        } catch {
-          return
+      // #225 C10: this is the plugin's only synchronous context-
+      // mutation path — a frozen/non-writable `system`, a hostile
+      // getter, or any throw must fail open without breaking the
+      // host's context assembly.
+      try {
+        if (!STATE_ON) return
+        const sessionID = safeSessionID(rawSessionID(event))
+        // Anonymous sessions never queue (see the prompt hook) — an
+        // empty-key lookup must not drain another session's entries.
+        if (!sessionID) return
+        const list = pending.get(sessionID)
+        if (!list?.length) return
+        pending.delete(sessionID)
+        // The context-hook payload shape is runtime-defined; `system`
+        // may be absent or non-array. Fail open rather than throw
+        // inside the plugin host.
+        if (!Array.isArray(event.system)) {
+          try {
+            ;(event as { system?: unknown }).system = []
+          } catch {
+            return
+          }
         }
-      }
-      const system = event.system as { type: string; text: string }[]
-      for (const entry of list) {
-        const text =
-          entry.kind === "deps"
-            ? `skill-graph: a skill declares dependencies — ${entry.names.join(", ")}. Read the matching SKILL.md files if the task needs them.`
-            : `skill-graph: skills relevant to this task — ${entry.names.join(", ")}. Read the matching SKILL.md before relying on it.`
-        system.push({ type: "text", text })
-      }
+        const system = event.system as { type: string; text: string }[]
+        for (const entry of list) {
+          const text =
+            entry.kind === "deps"
+              ? `skill-graph: a skill declares dependencies — ${entry.names.join(", ")}. Read the matching SKILL.md files if the task needs them.`
+              : `skill-graph: skills relevant to this task — ${entry.names.join(", ")}. Read the matching SKILL.md before relying on it.`
+          try {
+            system.push({ type: "text", text })
+          } catch {
+            // Push failed: the injection did NOT reach the model, so
+            // no emitted:true record may be written (#225 C09/C10).
+            emit({
+              ...base("recommendation"),
+              session_id: sessionID,
+              trigger: entry.trigger,
+              prompt_hash: entry.prompt_hash,
+              recommended: entry.recs,
+              emitted: false,
+              reason: "inject_failed",
+            })
+            continue
+          }
+          // #225 C09: emitted:true is written only AFTER the injection
+          // succeeded — the funnel's delivery metric now means "the
+          // model's context actually received this recommendation".
+          emit({
+            ...base("recommendation"),
+            session_id: sessionID,
+            trigger: entry.trigger,
+            prompt_hash: entry.prompt_hash,
+            recommended: entry.recs,
+            emitted: true,
+            reason: "recommended",
+          })
+        }
+      } catch {}
     })
   },
 })

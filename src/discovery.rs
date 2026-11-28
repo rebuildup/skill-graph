@@ -93,6 +93,30 @@ pub fn resolve_roots(
 /// pass arbitrary roots (e.g. `/`); without a cap a single call walks
 /// the whole filesystem before output truncation applies.
 const MAX_DISCOVER_ENTRIES: usize = 100_000;
+/// Global entry budget across ALL roots (#225 B03): per-root caps
+/// alone let N roots multiply total work, `seen_files` growth, and
+/// wall-clock time without bound. Once exhausted, remaining roots are
+/// skipped with an explicit truncation notice.
+const MAX_TOTAL_DISCOVER_ENTRIES: usize = 500_000;
+/// Upper bound on directory depth (#225 B02). walkdir keeps one open
+/// fd per directory on the current path; `max_open(usize::MAX)` alone
+/// makes fd count ≈ tree depth, so an adversarial deep tree could
+/// exhaust the process fd limit. Depth ≤64 bounds open fds to ~65.
+/// The alternative — a small `max_open` — is WORSE: walkdir's
+/// `DirList::close()` drains the closed directory's remaining entries
+/// into a Vec, so a wide dir above a deep chain would be fully
+/// buffered in memory. With max_depth the stack never exceeds the
+/// depth bound, `close()` is never reached, per-directory iteration
+/// stays lazy (fs::ReadDir yields one entry at a time), and BOTH the
+/// fd and memory bounds hold simultaneously. SKILL.md files deeper
+/// than the limit are reported as an explicit truncation, never
+/// silently skipped.
+const MAX_DISCOVER_DEPTH: usize = 64;
+/// SKILL.md candidates collected across ALL roots before parsing
+/// (#225 B03). Parse consumes at most MAX_SKILLS successes plus
+/// MAX_SKILLS errors globally (pigeonhole), so collecting more is
+/// wasted traversal — the budget is shared, not per-root.
+const MAX_SKILL_CANDIDATES: usize = 2 * MAX_SKILLS;
 
 /// Upper bounds on accepted skills and their cumulative bytes. Each
 /// SKILL.md may be up to 1 MiB and `Skill` retains the full body text;
@@ -103,13 +127,6 @@ const MAX_SKILL_BYTES: u64 = 512 * 1024 * 1024;
 /// consume neither the skill nor the byte budget, so an unreadable
 /// corpus would otherwise grow `errors` without limit.
 const MAX_DISCOVER_ERRORS: usize = 1024;
-/// SKILL.md candidates collected per root before parsing. Parse
-/// consumes at most MAX_SKILLS successes plus MAX_SKILLS errors
-/// (pigeonhole: candidate 2*MAX_SKILLS+1 can never be reached), so
-/// collecting more is wasted traversal — and stopping here restores
-/// the early exit the pre-collect implementation had once caps bind
-/// (#144 r19 CR).
-const MAX_SKILL_CANDIDATES: usize = 2 * MAX_SKILLS;
 
 /// Every diagnostic shares one bound — root errors, walk errors,
 /// parse errors, and truncation notices alike — so no input shape can
@@ -131,14 +148,34 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
     let mut skills = Vec::new();
     let mut errors = Vec::new();
     let mut seen_roots = HashSet::new();
-    let mut seen_files = HashSet::new();
+    // Dedup key is a 64-bit hash of the canonical path, not the PathBuf
+    // itself: `seen_files` grows once per encountered SKILL.md across
+    // ALL roots, and storing full paths would let a hostile corpus
+    // multiply retained memory by path length (#225 B03). A 64-bit
+    // collision merely merges two files' dedup slot — the parse loop
+    // still bounds total work; it cannot admit extra skills.
+    let mut seen_files: HashSet<u64> = HashSet::new();
     let mut total_bytes = 0u64;
     let mut capacity_truncated = false;
     let mut errored = 0usize;
     let mut errors_noted = false;
+    // Global budgets shared across every root (#225 B03): total entries
+    // scanned and total SKILL.md candidates. Per-root caps alone let
+    // the env-supplied root list multiply work and retained state
+    // without bound.
+    let mut entries_left = MAX_TOTAL_DISCOVER_ENTRIES;
+    let mut candidates_left = MAX_SKILL_CANDIDATES;
 
     for requested in roots {
-        if capacity_truncated {
+        if capacity_truncated || entries_left == 0 || candidates_left == 0 {
+            if !capacity_truncated {
+                capacity_truncated = true;
+                push_discovery_error(
+                    &mut errors,
+                    "discovery truncated: global entry or candidate budget exhausted".to_string(),
+                    &mut errors_noted,
+                );
+            }
             break;
         }
         let Ok(root) = std::fs::canonicalize(requested) else {
@@ -173,23 +210,25 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
         // order dependent (accepted residual: corpora beyond the cap
         // are already reported truncated).
         //
-        // max_open(usize::MAX): walkdir's default (10) CLOSES the
-        // oldest open dir stream when deeper levels accumulate, and
-        // close() drains that directory's remaining entries into a
-        // Vec — before the entry cap counts them. A wide directory
-        // above a >10-deep chain would still be fully buffered
-        // (#144 r19 CR). Never closing keeps every stream lazy; the
-        // bound becomes open-fd count ≈ tree depth (fd limit errors
-        // surface as ordinary walk errors).
+        // max_depth bounds open fds to ~MAX_DISCOVER_DEPTH+1 (#225 B02)
+        // — see the const's comment for why a small max_open is the
+        // wrong trade (its close() drains whole directories into
+        // memory). max_open stays usize::MAX: with the stack bounded
+        // by depth it can never trigger, so no directory is ever
+        // close()-drained.
         let mut entries = WalkDir::new(&root)
             .follow_links(false)
+            .max_depth(MAX_DISCOVER_DEPTH)
             .max_open(usize::MAX)
             .into_iter();
         let mut consumed = 0usize;
         let mut walk_errors = 0usize;
+        let mut depth_limited = false;
         let mut candidates: Vec<PathBuf> = Vec::new();
-        for entry in entries.by_ref().take(MAX_DISCOVER_ENTRIES) {
+        let root_budget = MAX_DISCOVER_ENTRIES.min(entries_left);
+        for entry in entries.by_ref().take(root_budget) {
             consumed += 1;
+            entries_left -= 1;
             // Surface IO errors (permission-denied dirs etc.) instead of
             // silently reporting a partial scan as clean.
             let entry = match entry {
@@ -213,6 +252,12 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 }
             };
             if entry.file_type().is_symlink() || entry.file_name() != "SKILL.md" {
+                // A directory AT the depth bound is yielded but never
+                // descended — any SKILL.md below it is unreachable.
+                // Record it once so the truncation is explicit (#225 B02).
+                if entry.depth() >= MAX_DISCOVER_DEPTH && entry.file_type().is_dir() {
+                    depth_limited = true;
+                }
                 continue;
             }
             let path = entry.path();
@@ -220,19 +265,34 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 continue;
             }
             // Contained/overlapping roots can surface the same SKILL.md
-            // twice; count each file once.
+            // twice; count each file once. The canonical path must
+            // still resolve INSIDE the canonical root: an ancestor
+            // swapped for a symlink between walk and canonicalize
+            // would otherwise admit an out-of-scope file into the
+            // corpus (#225 D01 — the fd-pinned open in parser.rs is
+            // the second layer).
             let Ok(canonical) = std::fs::canonicalize(path) else {
                 continue;
             };
-            if !seen_files.insert(canonical) {
+            if !canonical.starts_with(&root) {
+                continue;
+            }
+            let key = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                canonical.hash(&mut h);
+                h.finish()
+            };
+            if !seen_files.insert(key) {
                 continue;
             }
             candidates.push(path.to_path_buf());
-            if candidates.len() >= MAX_SKILL_CANDIDATES {
+            candidates_left -= 1;
+            if candidates_left == 0 {
                 // Parse can consume at most 2*MAX_SKILLS candidates
-                // (skill + error caps), so further SKILL.md files are
-                // unreachable — stop the traversal instead of scanning
-                // to the entry cap (#144 r19 CR).
+                // GLOBALLY (skill + error caps), so further SKILL.md
+                // files are unreachable — stop the traversal instead
+                // of scanning to the entry cap (#144 r19 CR, #225 B03).
                 push_discovery_error(
                     &mut errors,
                     format!(
@@ -244,6 +304,17 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                 );
                 break;
             }
+        }
+        if depth_limited {
+            push_discovery_error(
+                &mut errors,
+                format!(
+                    "{}: directory depth limit {} reached; deeper entries not scanned",
+                    root.display(),
+                    MAX_DISCOVER_DEPTH
+                ),
+                &mut errors_noted,
+            );
         }
         // Component-wise compare reproduces per-directory name sort +
         // DFS descent: "a" < "a-b" puts a/'s whole subtree first,
@@ -299,7 +370,19 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
                         + skill.keywords.capacity() * 32
                         + skill.links.capacity() * 112
                         + 256) as u64;
-                    total_bytes = total_bytes.saturating_add(retained.max(file_bytes));
+                    let charge = retained.max(file_bytes);
+                    // #225 B01: enforce the retention budget BEFORE
+                    // push — the pre-parse check used file_bytes, but
+                    // retained (UTF-8 expansion, struct overhead) can
+                    // exceed it, so the LAST accepted skill could push
+                    // total_bytes past MAX_SKILL_BYTES. A skill that
+                    // parses but does not fit is dropped with the same
+                    // explicit truncation notice.
+                    if total_bytes.saturating_add(charge) > MAX_SKILL_BYTES {
+                        capacity_truncated = true;
+                        break;
+                    }
+                    total_bytes = total_bytes.saturating_add(charge);
                     skills.push(skill);
                 }
                 Err(err) => {
@@ -317,14 +400,17 @@ pub fn discover(roots: &[PathBuf]) -> Discovery {
             }
         }
         // `consumed` counts every iterator item including walk errors;
-        // truncation is about consumed budget, not successfully read entries.
-        if consumed >= MAX_DISCOVER_ENTRIES && entries.next().is_some() {
+        // truncation is about consumed budget, not successfully read
+        // entries. The budget is min(per-root, remaining global), so a
+        // global-budget stop is reported here too — otherwise the last
+        // root could exhaust it silently (#225 B03).
+        if consumed >= root_budget && entries.next().is_some() {
             push_discovery_error(
                 &mut errors,
                 format!(
                     "{}: entry scan truncated at {} entries",
                     root.display(),
-                    MAX_DISCOVER_ENTRIES
+                    root_budget
                 ),
                 &mut errors_noted,
             );

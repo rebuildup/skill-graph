@@ -18,14 +18,14 @@ Markdown リンク、frontmatter、作業コンテキストから必要なスキ
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/perf-latency-dark.svg">
-  <img src="assets/readme/perf-latency-light.svg" alt="p95 latency vs corpus size: end-to-end CLI process stays under ~15ms and warm recommend core under ~1.0ms at 500 skills" width="880">
+  <img src="assets/readme/perf-latency-light.svg" alt="p95 latency vs corpus size: end-to-end CLI process stays under ~17ms and warm recommend core under ~1.2ms at 500 skills" width="880">
 </picture>
 
 合成コーパス 50→500 skills で計測（warm は 30 iterations、process は
-30 samples の p95）。推薦コア（warm recommend）は p95 約 1.0ms、
-プロセス起動を含む end-to-end でも 500 skills で p95 約 14ms。コールド
+30 samples の p95）。推薦コア（warm recommend）は p95 約 1.1ms、
+プロセス起動を含む end-to-end でも 500 skills で p95 約 16.6ms。コールド
 スタートを含む discovery + グラフ構築はほぼ線形で、500 skills でも
-約 9ms に収まる。
+約 12.5ms に収まる。
 
 ### 推薦品質
 
@@ -44,13 +44,14 @@ forbidden recommendation = 0、ネガティブケース 6/6 で適切に推薦�
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/readme/perf-memory-dark.svg">
-  <img src="assets/readme/perf-memory-light.svg" alt="Peak RSS stays around 7MB regardless of corpus size from 24 to 500 skills" width="880">
+  <img src="assets/readme/perf-memory-light.svg" alt="Peak RSS stays under about 7.5MB across tested corpus sizes from 24 to 500 skills" width="880">
 </picture>
 
-ピーク RSS はコーパス規模にほぼ依存せず 6.6〜7.3MB（実コーパス 24/88
-skills、合成 500 skills を各 20 回計測した最大値）。インデックス・
-キャッシュ・常駐プロセスを持たないため、コストは呼び出しごとの
-プロセス起動に限定される。
+ピーク RSS は 6.3〜7.4MB（実コーパス 24/88 skills、本文量を揃えた
+合成コーパス 50/100/200/500 skills を各 20 回計測した最大値）。
+規模増加に対する増加は緩やかで、インデックス・キャッシュ・常駐
+プロセスを持たないため、コストは呼び出しごとのプロセス起動に
+限定される。
 
 ### アーキテクチャ
 
@@ -115,6 +116,20 @@ cargo build --release   # -> target/release/skill-graph
 
 Linux x86_64/ARM64 (glibc, WSL2 含む)、macOS x86_64/ARM64。
 Windows は WSL2 経由。musl・Windows native は対象外。
+
+最低バージョン（#225 F10 — 全て CI の実ビルド環境に一致）:
+
+- **Linux**: Ubuntu 24.04 系でビルドした glibc 動的バイナリのため
+  **glibc 2.39 以上**を要求する（それより古い distro では
+  `cargo install` によるソースビルドを使う）。
+- **macOS**: macOS 15 以降（CI は macos-15 runner でビルド・
+  ネイティブ実行検証）。
+- **Node.js**（npm shim のみ — バイナリ自体は Node 不要）:
+  `engines: >=14.18` を宣言。CI の実測は Node 22 であり、それ未満
+  の floor は未検証。
+- **Rust**（cargo install / crates.io のソースビルド）: MSRV
+  **1.88**（`Cargo.toml` の `rust-version`、CI の msrv job が
+  同一 toolchain で check+test を実施）。
 
 Windows native で `npm install @rebuildup/skill-graph` を実行すると、
 win32 向け optional package が存在しないため os/cpu gating により

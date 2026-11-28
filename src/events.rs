@@ -200,6 +200,17 @@ impl SessionId {
             return SessionId(session_id.to_string());
         }
 
+        // #225 C01: an id longer than the identity domain cannot be
+        // represented injectively within the bounded work budget —
+        // two distinct overlong ids agreeing on the first SCAN_CHARS
+        // chars would collapse into ONE session and share its state.
+        // Collapse them into the unattributed (empty) namespace
+        // instead: they share no session state, and work stays
+        // O(SCAN_CHARS) for any input size.
+        if session_id.chars().take(SCAN_CHARS + 1).count() > SCAN_CHARS {
+            return SessionId(String::new());
+        }
+
         // Non-canonical: the identity DOMAIN is the first SCAN_CHARS
         // chars — head AND hash both derive from it. Work is
         // O(SCAN_CHARS) for ANY input size, and two raw ids that agree
@@ -570,8 +581,14 @@ fn skill_md_paths_counting(text: &str) -> (Vec<String>, usize) {
 
 fn skill_md_paths_impl(text: &str, mut validated: Option<&mut usize>) -> Vec<String> {
     const NEEDLE: &[u8] = b"SKILL.md";
+    /// Unquoted path bytes: the ASCII filename-ish set plus every
+    /// non-ASCII byte. UTF-8 multibyte sequences are entirely >= 0x80,
+    /// so non-ASCII (e.g. Japanese) path components stay inside the run
+    /// and are UTF-8 validated at the end — the old ASCII-only set
+    /// truncated candidates at the first multibyte byte (#225 E07).
     fn is_path_byte(b: u8) -> bool {
         b.is_ascii_alphanumeric()
+            || b >= 0x80
             || matches!(
                 b,
                 b'/' | b'.'
@@ -609,48 +626,89 @@ fn skill_md_paths_impl(text: &str, mut validated: Option<&mut usize>) -> Vec<Str
     // accepted candidates (<= MAX_CANDIDATE_BYTES) are identical to the
     // old floor-bounded scan.
     let mut run_start = 0usize;
+    // Shell quoting state (#225 E07): inside '…' every byte except the
+    // closing quote is a literal path byte (spaces included); inside
+    // "…" the same, except backslash escapes the next byte. Outside
+    // quotes a backslash escapes the next byte (`foo\ bar` is one path
+    // component). Quote characters themselves are NOT path bytes — they
+    // delimit runs, so `"dir with space/SKILL.md"` yields
+    // `dir with space/SKILL.md`. Quoted command substitution
+    // (`$(…)`, backticks) is out of contract: its bytes scan as ordinary
+    // text.
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
     // Distinct candidates and per-candidate length are both bounded: a
     // max-size payload could otherwise materialize hundreds of MB of
     // path strings before any downstream cap applies.
     while pos + NEEDLE.len() <= bytes.len() && out.len() < MAX_CANDIDATES {
-        if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
-            if !is_path_byte(bytes[pos]) {
-                run_start = pos + 1;
+        if &bytes[pos..pos + NEEDLE.len()] == NEEDLE {
+            let end = pos + NEEDLE.len();
+            // Forward boundary: `SKILL.mdx`, `SKILL.md.bak`, `SKILL.md-old`,
+            // and `SKILL.md/…` are not the SKILL.md file. Delimiters that
+            // legitimately follow a filename in prose (`,`, `)`, `"`, space)
+            // are not in this set.
+            if end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric()
+                    || matches!(bytes[end], b'.' | b'_' | b'-' | b'/'))
+            {
+                pos = end;
+                continue;
             }
-            pos += 1;
-            continue;
-        }
-        let end = pos + NEEDLE.len();
-        // Forward boundary: `SKILL.mdx`, `SKILL.md.bak`, `SKILL.md-old`,
-        // and `SKILL.md/…` are not the SKILL.md file. Delimiters that
-        // legitimately follow a filename in prose (`,`, `)`, `"`, space)
-        // are not in this set.
-        if end < bytes.len()
-            && (bytes[end].is_ascii_alphanumeric()
-                || matches!(bytes[end], b'.' | b'_' | b'-' | b'/'))
-        {
+            // The needle's first byte consumed any pending escape.
+            escaped = false;
+            // Bound the UTF-8 validation itself: `str::len` is a byte
+            // count, so `end - run_start` is the same length check
+            // without materializing anything — and rejecting over-length
+            // runs first keeps each hit's validation <=
+            // MAX_CANDIDATE_BYTES. Running from_utf8 on the (possibly
+            // run-length) slice BEFORE the length check made dense hits
+            // inside one long path-byte run quadratic (#225).
+            if end - run_start <= MAX_CANDIDATE_BYTES {
+                if let Some(c) = validated.as_mut() {
+                    **c += end - run_start;
+                }
+                if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
+                    && !candidate.is_empty()
+                    && seen.insert(candidate)
+                {
+                    out.push(candidate.to_string());
+                }
+            }
             pos = end;
             continue;
         }
-        // Bound the UTF-8 validation itself: `str::len` is a byte count,
-        // so `end - run_start` is the same length check without
-        // materializing anything — and rejecting over-length runs first
-        // keeps each hit's validation <= MAX_CANDIDATE_BYTES. Running
-        // from_utf8 on the (possibly run-length) slice BEFORE the length
-        // check made dense hits inside one long path-byte run quadratic
-        // (#225).
-        if end - run_start <= MAX_CANDIDATE_BYTES {
-            if let Some(c) = validated.as_mut() {
-                **c += end - run_start;
+        let b = bytes[pos];
+        if escaped {
+            // The escaped byte is a literal path byte — the run
+            // continues and no quote/escape state applies to it.
+            escaped = false;
+            pos += 1;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                    run_start = pos + 1;
+                } else if q == b'"' && b == b'\\' {
+                    escaped = true;
+                }
+                // Every other byte inside quotes — space, the other
+                // quote char, non-ASCII — is a literal path byte.
+                pos += 1;
             }
-            if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
-                && !candidate.is_empty()
-                && seen.insert(candidate)
-            {
-                out.push(candidate.to_string());
+            None => {
+                if b == b'\\' {
+                    escaped = true;
+                } else if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                    run_start = pos + 1;
+                } else if !is_path_byte(b) {
+                    run_start = pos + 1;
+                }
+                pos += 1;
             }
         }
-        pos = end;
     }
     out
 }
@@ -675,10 +733,57 @@ const TRANSPARENT_PREFIXES: &[&str] = &[
     "sudo", "env", "time", "nice", "nohup", "command", "builtin", "xargs", "exec", "doas",
 ];
 
+/// Split a command line into segments on unquoted `&`, `;`, `|`, and
+/// newlines. Single/double quotes and backslash escapes are honored so
+/// a delimiter inside `"…"` does not split a segment — `echo "a;b";
+/// cat x/SKILL.md` must keep the `cat` segment intact for read-verb
+/// detection (#225 E07). This is a deliberately small shell subset:
+/// `$()`, backticks, and here-docs are not interpreted.
+fn split_shell_segments(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                } else if q == b'"' && b == b'\\' {
+                    escaped = true;
+                }
+            }
+            None => match b {
+                b'\\' => escaped = true,
+                b'\'' | b'"' => quote = Some(b),
+                b'&' | b';' | b'|' | b'\n' => {
+                    out.push(&command[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&command[start..]);
+    out
+}
+
 /// Classify how `command` accesses SKILL.md files. Returns every
 /// `(path, access)` pair — each command segment is classified on its own
 /// read verbs, so `cat a/SKILL.md; grep b/SKILL.md` yields a Read for `a`
 /// and a Reference for `b`. Empty when no SKILL.md path is referenced.
+///
+/// Contract (#225 E07): POSIX-shell-ish tokenization — segments split
+/// on unquoted `& ; |` and newlines; `'…'`/`"…"` quoting and `\`
+/// escapes are honored for both segmentation and path extraction;
+/// non-ASCII (UTF-8) path components are supported. Command
+/// substitution, here-docs, and glob expansion are not interpreted —
+/// their text scans as ordinary arguments.
 pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     let mut out: Vec<(String, Access)> = Vec::new();
     // path -> index into `out`; keeps dedup O(1) per candidate so a
@@ -693,7 +798,7 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     // MAX_EVENTS_PER_PAYLOAD, so accumulating more classifications than
     // that can never change the emitted output.
     const MAX_COMMAND_ACCESSES: usize = MAX_EVENTS_PER_PAYLOAD * 4;
-    for (seq, segment) in command.split(['&', ';', '|', '\n']).enumerate() {
+    for (seq, segment) in split_shell_segments(command).into_iter().enumerate() {
         if out.len() >= MAX_COMMAND_ACCESSES {
             break;
         }
@@ -1095,6 +1200,22 @@ pub fn response_text(value: &Value) -> String {
 /// event log.
 const MAX_EVENTS_PER_PAYLOAD: usize = 64;
 
+/// True when a tool result marks the call as failed: `status:"error"`,
+/// `success:false`, or a non-empty `error` value (null/false/"" are not
+/// errors). Shared by live detection — which applies it to the whole
+/// hook/plugin payload — and DB observation, which applies it to the
+/// tool part's `state` object, so both paths classify the same tool
+/// execution identically (#225 E06).
+pub fn tool_result_failed(v: &Value) -> bool {
+    v.get("status").and_then(Value::as_str) == Some("error")
+        || v.get("success").and_then(Value::as_bool) == Some(false)
+        || v.get("error").is_some_and(|e| {
+            // The OpenCode plugin forwards `error` defensively; any
+            // non-empty error value marks a failed call.
+            !e.is_null() && *e != Value::Bool(false) && e.as_str() != Some("")
+        })
+}
+
 /// Normalize a runtime hook/plugin payload into `skill_load` events —
 /// one per distinct skill access (a command may touch several SKILL.md
 /// files). Empty when the payload carries no skill-load signal.
@@ -1107,17 +1228,8 @@ pub fn detect_all_from_payload(
     observed_via: ObservedVia,
     payload: &Value,
 ) -> Vec<SkillUsageEvent> {
-    // A failed tool call never loaded the skill: payloads carrying an
-    // explicit error status/success flag produce no load events.
-    if payload.get("status").and_then(Value::as_str) == Some("error")
-        || payload.get("success").and_then(Value::as_bool) == Some(false)
-        || payload.get("error").is_some_and(|e| {
-            // The OpenCode plugin forwards `error` defensively; any
-            // non-empty error value marks a failed call. null/false/""
-            // are not errors.
-            !e.is_null() && *e != Value::Bool(false) && e.as_str() != Some("")
-        })
-    {
+    // A failed tool call never loaded the skill.
+    if tool_result_failed(payload) {
         return Vec::new();
     }
     let tool = payload
@@ -1350,29 +1462,32 @@ mod tests {
 
     #[test]
     fn sanitize_session_id_identity_domain_is_first_8192_chars() {
-        // #225 r9: the identity domain is defined ONCE inside
+        // #225 r9/r12: the identity domain is defined ONCE inside
         // normalize — the first SCAN_CHARS(8192) chars feed BOTH head
-        // and hash. Ids agreeing on the domain are the same session
-        // for EVERY producer (hook/plugin/detect/observe); ids
-        // differing inside the domain stay distinct. Work is
-        // O(8192) regardless of input size.
-        let prefix = "p".repeat(9000);
-        assert_eq!(
-            SessionId::normalize(&format!("{prefix}AAA")),
-            SessionId::normalize(&format!("{prefix}BBB")),
-            "ids sharing the domain must share identity by contract"
-        );
-        let p2 = "q".repeat(8191);
+        // and hash. Ids WITHIN the domain (<=8192 chars total) that
+        // differ inside it stay distinct for EVERY producer
+        // (hook/plugin/detect/observe); work is O(8192) regardless of
+        // input size.
+        let p2 = "q".repeat(8100);
         assert_ne!(
-            SessionId::normalize(&format!("{p2}X{}", "z".repeat(100))),
-            SessionId::normalize(&format!("{p2}Y{}", "z".repeat(100))),
+            SessionId::normalize(&format!("{p2}X{}", "z".repeat(90))),
+            SessionId::normalize(&format!("{p2}Y{}", "z".repeat(90))),
             "ids differing inside the domain must stay distinct"
         );
-        // normalize must not scan the tail: a 1 MiB+ id whose tail is
-        // adversarial still produces the domain-bound output quickly.
+        // #225 C01: ids LONGER than the domain cannot be represented
+        // injectively — two distinct overlong ids agreeing on the
+        // first 8192 chars must NOT collapse into one session. They
+        // become unattributed ("") and share no session state.
+        let prefix = "p".repeat(9000);
+        assert_eq!(SessionId::normalize(&format!("{prefix}AAA")), "");
+        assert_eq!(SessionId::normalize(&format!("{prefix}BBB")), "");
+        // Exactly-at-domain boundary still normalizes.
+        let edge = "e".repeat(8192);
+        assert_ne!(SessionId::normalize(&edge), "");
+        // normalize must not scan the tail: a 1 MiB+ id still
+        // resolves in O(SCAN_CHARS).
         let huge = format!("{}{}", "h".repeat(9000), "!".repeat(1 << 20));
-        let out = SessionId::normalize(&huge);
-        assert_eq!(out.len(), 128);
+        assert_eq!(SessionId::normalize(&huge), "");
     }
 
     #[test]
@@ -1599,6 +1714,59 @@ mod tests {
         assert_eq!(multi.len(), 2);
         assert_eq!(multi[0].1, Access::Read);
         assert_eq!(multi[1].1, Access::Reference);
+    }
+
+    /// #225 E07: non-ASCII (UTF-8) path components must stay inside the
+    /// candidate run — the ASCII-only byte set used to truncate at the
+    /// first multibyte byte.
+    #[test]
+    fn skill_md_paths_keeps_non_ascii_components() {
+        assert_eq!(
+            skill_md_paths("cat /home/ユーザー/skills/和名/SKILL.md"),
+            vec!["/home/ユーザー/skills/和名/SKILL.md".to_string()]
+        );
+        // A non-ASCII component adjacent to ASCII still joins the run.
+        assert_eq!(
+            skill_md_paths("cat skills/日本語-skill/SKILL.md"),
+            vec!["skills/日本語-skill/SKILL.md".to_string()]
+        );
+    }
+
+    /// #225 E07: quoted paths keep their spaces; quote characters
+    /// delimit the run so the candidate is the inner path.
+    #[test]
+    fn skill_md_paths_handles_quoted_paths() {
+        assert_eq!(
+            skill_md_paths("cat \"dir with space/my-skill/SKILL.md\""),
+            vec!["dir with space/my-skill/SKILL.md".to_string()]
+        );
+        assert_eq!(
+            skill_md_paths("cat 'dir with space/my-skill/SKILL.md'"),
+            vec!["dir with space/my-skill/SKILL.md".to_string()]
+        );
+        // An escaped space keeps the run together (one candidate, not
+        // split at the space). The emitted path preserves the raw
+        // escape spelling — escapes govern tokenization boundaries;
+        // consumers treat `skill_path` as opaque text and derive the
+        // skill name from the parent directory, which is unaffected.
+        assert_eq!(
+            skill_md_paths("cat dir\\ with\\ space/my-skill/SKILL.md"),
+            vec!["dir\\ with\\ space/my-skill/SKILL.md".to_string()]
+        );
+        // A `;` inside quotes must not end the segment: the `cat` after
+        // it is still the read verb for the quoted path.
+        let accesses = classify_command("echo \"a;b\"; cat \"x y/SKILL.md\"");
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].0, "x y/SKILL.md");
+        assert_eq!(accesses[0].1, Access::Read);
+        // Quoted SKILL.md inside a non-read segment stays a reference.
+        assert_eq!(
+            classify_command("grep foo \"x y/SKILL.md\"")[0].1,
+            Access::Reference
+        );
+        // Unterminated quote: the rest of the line scans as quoted
+        // text — best-effort path extraction, never a panic.
+        let _ = classify_command("cat \"unterminated/x/SKILL.md");
     }
 
     #[test]

@@ -63,6 +63,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Eval gate
+        # #225 G04: recall@3 / forbidden-hit regressions on the
+        # release dataset fail CI; the same script gates the freeze.
+        run: |
+          cargo build --locked
+          scripts/check-eval-gate.sh ./target/debug/skill-graph
       - name: Crates.io package dry-run
         # The crates.io channel's pre-publish proof that needs no
         # token: `cargo publish --dry-run` packs the crate exactly as
@@ -88,6 +94,10 @@ jobs:
         # safeSessionID parity with SessionId::normalize is part
         # of the event contract — verify it, don't assume it (#225).
         run: bun test src/assets/opencode-plugin.test.ts
+      - name: OpenCode plugin host API types
+        # Bundle/syntax checks cannot catch host API drift; type-check
+        # against the pinned real @opencode/plugin package (#225 F05).
+        run: bash scripts/check-plugin-types.sh
       - name: Release verification scripts
         # The npm publish path relies on verify-npm-{arch,tarballs,
         # registry}.sh; their accept/reject behavior — including
@@ -95,6 +105,18 @@ jobs:
         # is a contract, so it is regression-tested here (#225
         # re-review).
         run: bash scripts/test-release-verify.sh
+      - name: Freeze manifest tests
+        # The approved-manifest pipeline (freeze-manifest.sh producer,
+        # verify-freeze-manifest.py consumer) is the release approval
+        # record — identity substitution, missing/duplicate/corrupt
+        # artifacts, and foreign freeze-meta bindings must all be
+        # rejected (#225 A01-A06).
+        run: bash scripts/test-freeze-manifest.sh
+      - name: Release publish state machine tests
+        # publish-release.sh owns every publish/no-publish decision —
+        # create, no-op, additive recovery, and each refuse path —
+        # driven end-to-end against a stubbed gh (#225 F01).
+        run: bash scripts/test-publish-release.sh
       - name: Npm publish path tests
         # publish-npm.sh decides skip-vs-publish and proves registry
         # content identity on both paths; test-npm-publish.sh drives it
@@ -144,6 +166,7 @@ jobs:
           PY
       - name: Crate contains only intended files
         run: |
+          set -o pipefail
           cargo package --list --allow-dirty | sort > /tmp/crate-files.txt
           if grep -Eq '^(tests|evals|npm|docs|plugins|adapters|experiments|\.github|\.agents|\.claude|\.devin)/' /tmp/crate-files.txt; then
             echo "unexpected files in crate package:" >&2

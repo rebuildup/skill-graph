@@ -36,11 +36,15 @@ JSON Schema の正本は `contracts/v1/` に置く。CLI の `--format json` 出
 
 MCP server は read-only 3 tools を公開し、戻り値は対応する CLI
 `--format json` 出力と同一の JSON shape を `structuredContent` と
-text content の両方で返す。
+text content の両方で返す。ただし `structuredContent` は protocol
+規約上 JSON object を要求される（legacy peer では非 object は
+strip される）ため、recommend の配列は `{"recommendations": [...]}`
+の object envelope に包む。配列要素の shape は
+`recommendation.schema.json` と同一。
 
 | MCP tool | 対応 CLI | 返す contract |
 |---|---|---|
-| `recommend` | `recommend --format json` | `recommendation.schema.json`（recommendation 配列） |
+| `recommend` | `recommend --format json` | `{"recommendations": [...]}`（要素は `recommendation.schema.json`） |
 | `discover` | `discover --format json` | `discovery-output.schema.json` |
 | `resolve` | `resolve --format json` | `resolve-result.schema.json` |
 
@@ -354,6 +358,68 @@ Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts
 
 - `availability` は discovery 時点の `available` / `parse_error` のみを表す。
 - installed / available / loaded / applied / unobservable の区別のうち、loaded・applied・観測不能は runtime 側の観測が必要であり、この v1 contract では `availability` に混ぜない。
+- Agent Skills 規格適合は `availability` とは独立の軸で、`spec_violations`
+  （string array、skill-summary schema の required field）が担う
+  （#225 B07）。3 層を区別する:
+  - **valid**: `spec_violations == []` かつ `parse_error` なし。
+  - **compatibility（互換受理）**: frontmatter は parse できるが
+    規格違反がある（name の charset/長/連続ハイフン/dir 名一致、
+    description の欠損・空・1024 超、frontmatter 自体の欠落）。
+    name は規格適合名へ sanitize した上で skill は推薦可能のまま
+    残し、違反内容を `spec_violations` に記録する — 正当な既存
+    skill を規格違反だけで拒否しない。
+  - **parse error**: YAML 破損・hazard・oversized・非 regular file
+    等の hard failure。`availability: parse_error` で推薦対象外。
+  - name の規格判定は `valid_skill_name`（`[a-z0-9-]`、1–64、
+    先頭/末尾 `-` 禁止、**連続ハイフン `--` 禁止** — 現行
+    agentskills.io specification に一致）と、dir 名一致の2規則。
+    dir 名一致は declared name が規格適合かつ dir 名も規格適合な
+    場合のみ検査する。
+
+## 本文アクセスと Progressive Disclosure（#225 B04）
+
+core-contract の「全 `SKILL.md` 本文を常時読み込まない」は
+**モデルへの注入**を制約する規則であり、内部解析の禁止ではない。
+両者を区別する:
+
+- **注入面**: LLM-facing 出力（`additionalContext`、MCP
+  `structuredContent`/`content`、`.recommended`、event log、
+  `discover`/`resolve`/`recommend` の JSON）は `SkillSummary` 以下の
+  metadata のみを運び、`body_text` を含まない
+  （`skill-summary.schema.json` の `additionalProperties: false` が
+  構造的に排除する）。
+- **内部解析**: parser は ≤1 MiB（`MAX_SKILL_BYTES`）の body を読み、
+  link 抽出・resolver の mention 派生・search の weak-signal
+  scoring（`MAX_BODY_SCAN_BYTES`/`MAX_BODY_TERM_WORK` で bound）に
+  使う。これは agent context への注入ではなく、保持量は discovery
+  512 MiB / resolve 128 MiB の budget で bound 済み。
+- したがって「本文を読まない」は「本文を推薦根拠テキストとして
+  モデルへ渡さない」の意味であり、graph 構築のための bounded な
+  内部走査は契約違反ではない。参照ファイル（`references/` 等）の
+  本文は一切読まない — markdown link は target 文字列の字句解析
+  のみで、link 先 file の open は発生しない。
+
+## link 解決の意味論（#225 B06）
+
+`SkillLink.resolved_name` / `resolved_path` の意味を固定する:
+
+- `resolved_name`: link target が**発見済み skill に解決**した
+  場合のみ設定される（Markdown/dir link は `by_path`、Requires/
+  Mention は `by_name`）。実在しない target・範囲外 target では
+  設定されない。
+- `resolved_path`: Markdown link の target を正規化した path を
+  記録する。by_path による skill 解決に加え、`.md` target が
+  **link 元 skill のディレクトリ配下に字句的に収まる**場合にも
+  設定される — この場合は**実在確認を行わない字句解決の記録**で
+  あり、file の存在・skill であることを主張しない（link 先本文は
+  読まない）。skill dir 外への `..` 脱出・絶対 path・root 外は
+  `resolved_path` を持たない。
+- したがって `resolved_name.is_some()` ⟺ skill への解決、
+  `resolved_path.is_some() && resolved_name.is_none()` ⟺
+  skill dir 内の字句解決（dangling を含みうる）、両方 None ⟺
+  解決なし（外部・範囲外・未解決）。backlink 集計は
+  `resolved_path` を `by_path` で再照合するため、実在しない
+  字句 path は backlink を生成しない。
 
 ## 曖昧性と no-output
 
@@ -583,7 +649,9 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   受容 residual。
 - `bench`（eval::run）は dataset 64 MiB・case 10,000 件に加え、
   graph build の総数 256・recommend cutoff `--max` 64・収集する
-  discovery error 合計 4,096 件で bound する。LRU は保持 graph を
+  discovery error 合計 4,096 件で bound する。LRU（bench 内部の
+  計測用 cache — 製品 runtime は call 毎に graph を再構築し
+  永続 cache を持たない）は保持 graph を
   32 に抑えるが総 build work・error 蓄積・case 毎 result 膨張は
   別系統の bound が必要（#144 r19）。CLI `search`/`recommend` の
   `--max` も 64 に clamp する（MCP tool と同じ出力上限）。
@@ -601,6 +669,6 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
 | イベント観測（funnel） | `emitted` は「model が実際に見た注入」のみを表す。recommended[] は注入集合と一致 | plugin は匿名 session に注入経路を持たないため `emitted:false` を記録（Rust は同期 response で匿名注入可能なため true で正しい — 非対称は構造由来） | session 分離テストの `emitted` assertion（匿名 false / attributed true） |
 | ファイル所有権・状態安全 | 検査と操作の間に path が差し替えられない。symlink・他人所有・hardlink を拒否。権限は 0700/0600 | state dir を `O_NOFOLLOW|O_DIRECTORY` dirfd で anchor し全操作を openat/fstatat/fchmod 化。plugin `emit()` は O_NOFOLLOW+O_NONBLOCK+uid 検査 | `tests/` の hook/adapter 系 + contracts.md TMPDIR 契約。dirfd 確立前の path 操作は存在しないことをコード構造で保証 |
 | clean-legacy 所有権 | v0.3.x 成果物のみ削除。`current` は payload 持ち X.Y.Z dir を指す symlink のみ。release dir は `skill-graph` file AND `adapters/` dir の両 marker 必須 | 二相化（全 entry を削除前 FS で classify→delete） | `tests/adapter.rs` clean_legacy 5 件（lookalike・dangling symlink・bin link・nonlegacy target）。旧実装で `current`/marker 無し dir の誤削除を実証 |
-| 配布成果物同一性 | 公開経路の全分岐で「registry/ release が提供する内容」==「検証・freeze された固定成果物の内容」。**release は再ビルドしない**: artifact-verify.yml が唯一の build→native verify→install verify→digest→attest→freeze 経路であり、release.yml は**承認対象を固定 SHA・freeze run ID・成果物 digest で一意に確定**してから公開する — `freeze_run_id` dispatch input による明示 pin、または tag push 時はその tag が trigger した run のみを解決（任意の最新成功 run への差し替えは不可）。download 後に freeze-meta.json（run_id/head_sha/asset/sha256 の結合）・全 digest・**build-provenance attestation（`gh attestation verify`）**を再検証し、承認記録 `freeze-manifest.json`（tag・tag_sha・freeze_run_id・全 asset digest）を Release asset として公開する。既公開 release との再実行では manifest digest と公開 checksum の一致も要求。skip も publish 後も同一不変条件。**pack・artifact 検査・既公開版との照合の完了前に publish 操作は存在しない**。manifest は実 JSON parser で検査（`files[]` 存在・依存順序・`bin` フィールドの target 存在/exec bit/`bin/` 配下 confinement）。pack 対象は絶対パスに解決（裸の `dir/sub` 引数は npm に GitHub repo spec として解釈される — 実 npm で `git ls-remote` を実測）。artifact は gzip magic/integrity・canonical member 名・duplicate member・`package/` 単一 root・regular file/dir のみを archive 段階で要求し、artifact 内 `package.json` が検証済み manifest と**全体 deep-equal**（name/version だけでなく bin/files/dependencies を含む全フィールド — pack 時の drift を name/version で見逃さない）・`files[]` ∪ `bin` target の member 集合存在を要求。**実行可能性は多層で保証**: `verify-npm-bin.sh` が exec bit + `file(1)` 実行形式 + **shared object/dylib/relocatable の拒否（`executable` 語を必須化 — .so は link input であり runnable bin ではない）** + script の shebang dispatchability（`/usr/bin/env <tool>` または絶対 interpreter、bare env 拒否）を要求し、`skill-graph-<target>` 名の package は artifact 内 `bin/*` に `verify-npm-arch.sh` で対象 arch のネイティブバイナリを要求（arch 判定は `file` 出力の型フレーズ直後トークン — interpreter path の部分文字列で spoof 不能）。**registry 照会失敗と未公開を混同しない**: `npm view` の失敗は E404 系のみ「未公開」として publish 経路へ進み、それ以外（network/5xx/auth）は publish 前に中断。**依存元は依存先の事後検証前に公開されない**: E2 は引数順（依存優先）に publish→registry 検証を package 毎にインターリーブ。公開されるのは検証済み .tgz そのもの（re-pack 無し） | `publish-npm.sh`: A `pkg-preflight.mjs`（name/version/files[]/bin targets/依存順序を構造的に検査・出力）→ B bin disk + manifest bin target の実行形式検査 → C 全 package を絶対パスで `npm pack` → D `verify-npm-archive.sh --check-bin` + artifact 内 manifest 同一性 + 必須 member 集合 + platform package の arch 検査 → E1 全 package の registry 照合（既公開は固定 artifact と同一性証明、`npm view` 失敗は E404/それ以外を分類、乖離・照会失敗は publish 0 件で拒否）→ E2 欠損分を順に `npm publish <tgz>` → 各々即座に registry 検証。`verify-npm-tarballs.sh` は archive gate を `verify-npm-archive.sh` に委譲。`verify-npm-arch.sh` は arch トークン位置で判定し executable 形式を必須化（self-test に interpreter-path spoof・shared object/dylib 拒否 case 収録 — e2e の wrong-arch ELF fixture で実際に検出）。**release asset の生成・検証・freeze は単一経路**: `package-target.sh` が deterministic tarball を作り、同じ runner で展開→exec bit（**修復なし — tarball 自体が +x を持つことを要求**）→実行形式→ネイティブ `--version`→arch を検証し、sha256 digest と freeze-meta.json（run pinning 情報）を sidecar に記録する。artifact-verify.yml が全 PR/push/tag で 4 target をこの経路で処理し、`actions/attest-build-provenance` で provenance を付与、検証済み tarball+digest+meta を 90 日保持の workflow artifact として freeze する。release.yml は build job を持たず、pin された freeze run を解決→`gh run download`→**freeze-meta・全 digest・attestation を再検証**→`freeze-manifest.json` を添えて GitHub Release へ promotion するため、公開 bytes は検証 bytes とバイト同一（#225 r10/r11） | `test-release-verify.sh` 46 件 + `test-npm-publish.sh` 62 件 — **`npm pack` は実 npm に委譲**: slash-relative dir・divergent 既公開で publish 0 件・混在 fresh/published・files[]/bin member 欠損拒否・manifest bin の missing/outside-bin//non-exec 拒否・registry query error で publish 0 件・依存先の dist.tarball 検証が依存元 publish に先行することを action log で証明・platform package の script bin / wrong-arch ELF（e_machine patch の実 ELF）拒否・native x86-64 ELF 受理。**mutant 実証**: E1 照合除去・member-set 除去・裸 path・arch 部分一致（interpreter spoof）・旧 publish/tarball verifier での FAIL |
-| 配布チャネル導入（auth-free local） | 全配布チャネルで、**凍結成果物を修復せずに** install → exec → version → **決定的コーパスに対する具体的な機能出力** → uninstall のライフサイクルを公開前に検証できる。検証対象は各チャネルが実際に公開する bytes と同一: crate は `cargo package` の .crate を展開して install（`cargo package` は決定的 — 同一 source で byte-identical な .crate を生成することを実測済みで、`cargo publish` の再 pack は同じ bytes を送る）、npm は実 `npm pack` tarball を install、brew/mise は frozen release tarball を消費。**npm-publish.yml にも chmod 修復は存在しない**（`cp -p` + `[ -x ]` assert — exec bit 喪失は修復ではなく失敗） | `verify-install-local.sh`: exec bit は artifact 由来のみ（chmod 修復なし — package-target.sh / verify-install-local.sh / npm-publish.yml の全経路で排除済み）。基本機能は **5 プロンプトの決定的コーパス**で、各プロンプトがこのリポジトリの skill 集合に対してエンジンが実際に推薦する skill リストと**完全一致**する `additionalContext` を要求（単一プロンプトの fail-open でも、常に同一出力を返す binary でも通らない。skill/ranking 変更時はコーパスを意識的に更新する）。cargo は pack した .crate の展開 source を `cargo install --path`、npm は platform+metapackage の実 tgz を `npm install`（.bin shim→platform payload exec）、brew は `file://` frozen tarball を指す local tap formula で install/uninstall。mise の `github:` backend は release asset を取得するため lifecycle は公開後（asset 契約は本検証で証明済み）。**crates.io 公開後は `scripts/verify-crates-published.sh` が公開 .crate を static.crates.io から取得し `cargo package` 成果物と byte 比較** — 不一致は yank 対象として FAIL（crates.io version は immutable） | artifact-verify.yml が全 4 target の native runner で `package-target.sh` → `verify-install-local.sh` → freeze/upload の順に実行（失敗 run は promotable artifact を残さない）。ローカル実測: crate/npm install・version・hook corpus・uninstall 全 PASS（linux-x64） |
-| 性能 | 推薦・discovery・CLI の latency/throughput/memory が spec 範囲内 | オンメモリ engine、LRU graph cache、全走査に上限 | `docs/evidence/` の測定記録（env/SHA/コーパス/再現コマンド）。process latency は 30 samples の p50/p95/max（p95 が max に退化しない件数）、RSS は `/usr/bin/time -v` を各点 20 回計測した最大値で `assets/readme/data/memory.json` に一元化。README/SVG は `perf-500.json`/`bench-eval.json`/`memory.json` から `gen-readme-assets.py` で再生成 |
+| 配布成果物同一性 | 公開経路の全分岐で「registry/ release が提供する内容」==「**承認済み freeze manifest が digest した固定成果物の bytes**」。**release は再ビルドしない**: artifact-verify.yml が唯一の build→native verify→install verify→digest→attest 経路であり、その最終 job `freeze-manifest` が**承認記録 `freeze-manifest.json` を公開前に一度だけ生成**する — schema・workflow・event(push)・ref・head_sha・run_id・run_attempt・全配布成果物（4 release tarball + 4 platform npm tgz + metapackage tgz + .crate、計 10 件）の sha256/channel/target を束縛。release.yml / npm-publish.yml / crates 検証は**この manifest を承認入力として消費**し、再生成も再解釈もしない: pin された freeze run（`freeze_run_id` dispatch input、または tag push が trigger した run のみ — event=push・head_sha=tag commit・completed/success・run_attempt 一致を API で検証）から artifact を download し、`verify-freeze-manifest.py` が identity 全フィールドと**全 artifact の存在・一意性・digest**を照合、不一致・欠落・重複は拒否。provenance は `gh attestation verify --signer-workflow …/artifact-verify.yml --signer-repo … --source-digest <tag_sha>` で承認 workflow・commit に拘束（run 結合は manifest の run_id+attempt が担う）。既公開 release では公開済み manifest と承認 manifest の **byte 一致**を要求（同 digest でも異なる identity は拒否）。部分公開（manifest のみ・tarball 0 件等）からは欠損分のみ additive に復旧し、不一致 asset は上書きせず拒否。**公開される npm bytes は frozen .tgz そのもの**（`publish-npm.sh` は .tgz 引数を re-pack せず、その bytes を publish → registry は byte-identical に serve）| `freeze-manifest.sh`: 全 frozen-*/freeze-meta.json が当該 run_id/run_attempt/head_sha/workflow に一致することを検査→全 digest 再計算→platform 非依存成果物（meta tgz・crate）を packaged-paths-clean 条件で一度だけ生成→manifest 出力。`verify-freeze-manifest.py`: identity 照合 + artifact dir 群を walk して各 manifest entry が**丁度 1 回・digest 一致**で存在することを証明。`publish-npm.sh`: .tgz 入力は archive gate→extract preflight のみで re-pack せず固定 artifact として Phase D/E を通す。`verify-crate-artifact.sh`（公開前）/`verify-crates-published.sh`（公開後）はともに manifest digest を権威として照合 | `test-freeze-manifest.sh`: valid 受理 + wrong run_id/attempt/sha/event・欠落 channel・corrupt/missing/duplicate artifact・foreign freeze-meta の全拒否。`test-npm-publish.sh`: .tgz 入力で registry が入力 bytes と byte-identical に serve することを実証。release/npm-publish 両 workflow が同一 `verify-freeze-manifest.py` を呼ぶ構造で経路間の契約ドリフトを排除 |
+| 配布チャネル導入（auth-free local） | 全配布チャネルで、**凍結成果物を修復せずに** install → exec → version → **決定的コーパスに対する具体的な機能出力** → uninstall のライフサイクルを公開前に検証できる。検証対象は各チャネルが実際に公開する bytes と同一: crate は freeze-manifest の crates channel digest を持つ .crate で、`verify-crate-artifact.sh` が `cargo publish` 前に packaged bytes == manifest digest を要求（`cargo package` は決定的 — 同一 source/checkout で byte-identical、実測済み）、`verify-crates-published.sh` が公開後に static.crates.io の .crate を同 digest と比較（crates.io version は immutable で再 publish 不可のため、不一致時の復旧は同 version 再公開を前提としない — yank + 原因調査 + 必要なら新版）。npm は frozen .tgz をそのまま publish した bytes を install、brew/mise は frozen release tarball を消費。**npm-publish.yml にも chmod 修復は存在しない**（`cp -p` + `[ -x ]` assert — exec bit 喪失は修復ではなく失敗） | `verify-install-local.sh`: exec bit は artifact 由来のみ（chmod 修復なし — package-target.sh / verify-install-local.sh / npm-publish.yml の全経路で排除済み）。基本機能は **5 プロンプトの決定的コーパス**で、各プロンプトがこのリポジトリの skill 集合に対してエンジンが実際に推薦する skill リストと**完全一致**する `additionalContext` を要求（単一プロンプトの fail-open でも、常に同一出力を返す binary でも通らない。skill/ranking 変更時はコーパスを意識的に更新する）。`interface_smoke` が hook 以外の全公開 I/F を packaged binary 上で検証する: `discover`/`resolve`(name・unresolved)/`recommend`/`deps` の JSON contract、MCP stdio の initialize+tools/list（recommend/discover/resolve tool 存在）、`observe --summary` の funnel shape、`adapter status` + 隔離 HOME での enable→status→disable lifecycle（管理 hook の除去を JSON 検査）。upgrade は同 version の再 install（cargo/npm 双方で冪等に検証済み）、rollback は公開済み旧 version が前提のため公開前検証の対象外として明示する。cargo は freeze された .crate を展開して `cargo install --path`、npm は platform+metapackage の実 tgz を `npm install`（.bin shim→platform payload exec）、brew は `file://` frozen tarball を指す local tap formula で install/uninstall。mise の `github:` backend は release asset を取得するため lifecycle は公開後（asset 契約は本検証で証明済み） | artifact-verify.yml が全 4 target の native runner で `package-target.sh` → `package-npm-platform.sh` → `verify-install-local.sh` → freeze/upload の順に実行し、`freeze-manifest` job が manifest を集約（失敗 run は promotable artifact を残さない）。ローカル実測: crate/npm install・version・hook corpus・uninstall 全 PASS（linux-x64） |
+| 性能 | 推薦・discovery・CLI の latency/throughput/memory が spec 範囲内 | オンメモリ engine（runtime は call 毎に graph を再構築 — 永続 cache・常駐なし。`bench`/`perf` 内部の LRU graph cache は計測専用で製品経路ではない）、全走査に上限 | `docs/evidence/` の測定記録（env/SHA/コーパス/再現コマンド）。process latency は 30 samples の p50/p95/max（p95 が max に退化しない件数）、RSS は `/usr/bin/time -v` を各点 20 回計測した最大値で `assets/readme/data/memory.json` に一元化。README/SVG は `perf-500.json`/`bench-eval.json`/`memory.json` から `gen-readme-assets.py` で再生成 |
