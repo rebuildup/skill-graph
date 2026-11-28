@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write          # actions/attest-build-provenance
+  attestations: write      # artifact attestations
 
 concurrency:
   group: artifact-verify-${{ github.ref }}
@@ -14,13 +16,15 @@ concurrency:
 
 jobs:
   package-and-run:
-    # Pre-publish proof that does NOT wait for a release: every
-    # supported target is built, packaged by the SAME
-    # scripts/package-target.sh release.yml uses, and the packaged
-    # tarball is extracted and EXECUTED natively on its own
-    # OS/arch runner — exec bit, executable format, --version, arch
-    # (#225 r9). The bytes this job verifies are the bytes a release
-    # would upload; there is no separate "packaging for verify" path.
+    # FREEZE point: every supported target is built, packaged by the
+    # SAME scripts/package-target.sh release promotion consumes, and
+    # the packaged tarball is extracted and EXECUTED natively on its
+    # own OS/arch runner — exec bit, executable format, --version,
+    # arch — then auth-free install-verified. The verified tarball +
+    # its sha256 digest are uploaded as a workflow artifact and
+    # build-provenance-attested: release.yml PROMOTES these frozen
+    # bytes instead of rebuilding, so published artifacts are
+    # byte-identical to verified artifacts (#225 r10).
     strategy:
       fail-fast: false
       matrix:
@@ -47,11 +51,37 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: scripts/package-target.sh "${{ matrix.target }}" "${{ matrix.npm_target }}"
+      - name: Attest build provenance
+        # SLSA provenance for the frozen bytes — the digest attested
+        # here is the digest release promotion verifies before
+        # publishing (#225 r10).
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: skill-graph-${{ matrix.target }}.tar.gz
       - name: Auth-free local install verification
         # Install lifecycle on the FROZEN artifacts — no repairs:
-        # cargo install --path, real npm pack+install of both
-        # packages (shim -> platform payload exec), and a brew formula
-        # pointed at the local tarball via file://. Exec permission,
-        # --version, hook smoke, and uninstall are asserted per
-        # channel (#225 r9).
+        # cargo install from the packed .crate, real npm pack+install
+        # of both packages (shim -> platform payload exec), and a
+        # brew local-tap install of the file:// tarball. Exec
+        # permission, --version, deterministic hook output, and
+        # uninstall are asserted per channel (#225 r9/r10). Runs
+        # BEFORE freeze/upload so a failed run never produces
+        # promotable artifacts.
         run: scripts/verify-install-local.sh
+      - name: Freeze verified artifact + digest
+        run: |
+          set -euo pipefail
+          mkdir -p freeze
+          cp "skill-graph-${{ matrix.target }}.tar.gz" \
+             "skill-graph-${{ matrix.target }}.tar.gz.sha256" freeze/
+          # Self-check: the digest file must match the artifact.
+          (cd freeze && shasum -a 256 -c "skill-graph-${{ matrix.target }}.tar.gz.sha256" 2>/dev/null \
+            || sha256sum -c "skill-graph-${{ matrix.target }}.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frozen-${{ matrix.npm_target }}
+          path: freeze/
+          # Frozen artifacts must outlive the gap between freeze and
+          # release; 90 days covers any realistic release cadence.
+          retention-days: 90
+          if-no-files-found: error

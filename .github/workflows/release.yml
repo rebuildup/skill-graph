@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: read # resolve the artifact-verify (freeze) run for the tag SHA
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -52,62 +53,79 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-  build:
+  # NO build job: release does not rebuild. artifact-verify.yml is the
+  # single build+verify+freeze path — it produces the deterministic
+  # tarball, proves it natively on the target runner, install-verifies
+  # it auth-free, digests it, and attests provenance. The release job
+  # below PROMOTES those frozen bytes: it resolves the successful
+  # artifact-verify run for the tag commit, downloads the frozen
+  # artifacts, and re-verifies every sha256 digest before upload —
+  # published bytes are byte-identical to verified bytes (#225 r10).
+  release:
     needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            npm_target: linux-x64
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            npm_target: linux-arm64
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            npm_target: darwin-arm64
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            npm_target: darwin-x64
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
-          # The peeled tag commit resolved and verified in `verify` —
-          # never the ambiguous tag/branch name (#144 r20).
           ref: ${{ needs.verify.outputs.tag_sha }}
-      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
-        with:
-          toolchain: 1.100.0
-          targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package binary and verify artifact natively
-        # Single packaging path shared with artifact-verify.yml:
-        # package-target.sh builds the deterministic tarball AND proves
-        # the packaged bytes on this runner — exec bit, executable
-        # format (shared objects rejected), native --version run, arch
-        # match (#225 r9). The uploaded asset is byte-identical to the
-        # verified artifact.
-        run: scripts/package-target.sh "${{ matrix.target }}" "${{ matrix.npm_target }}"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: skill-graph-${{ matrix.target }}
-          path: skill-graph-${{ matrix.target }}.tar.gz
-
-  release:
-    needs: [verify, build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.verify.outputs.tag_sha }}
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+      - name: Resolve the freeze run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_SHA: ${{ needs.verify.outputs.tag_sha }}
+        run: |
+          set -euo pipefail
+          # The tag push and the tag-triggered artifact-verify run are
+          # concurrent; a same-SHA branch-push run is equally valid
+          # (same commit => same inputs). Poll for ANY successful
+          # artifact-verify run whose head_sha is the verified tag
+          # commit. No run => no frozen artifacts => refuse to build
+          # substitutes (#225 r10).
+          run_id=""
+          for i in $(seq 1 80); do
+            run_id="$(gh api \
+              "repos/$GITHUB_REPOSITORY/actions/workflows/artifact-verify.yml/runs?head_sha=$TAG_SHA&status=success&per_page=1" \
+              -q '.workflow_runs[0].id // empty' 2>/dev/null || true)"
+            [ -n "$run_id" ] && break
+            if [ "$i" = "80" ]; then
+              echo "no successful artifact-verify run for $TAG_SHA after 40min" >&2
+              echo "freeze the commit first: push it to a release-* branch or cut the tag and let artifact-verify finish" >&2
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "promoting artifacts from artifact-verify run $run_id"
+          echo "FREEZE_RUN_ID=$run_id" >> "$GITHUB_ENV"
+      - name: Download frozen artifacts and verify digests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist frozen
+          gh run download "$FREEZE_RUN_ID" --dir frozen
+          # Each frozen-<target> artifact holds the tarball plus its
+          # .sha256 sidecar produced at freeze time. Re-verify EVERY
+          # digest against the downloaded bytes — a truncated or
+          # substituted artifact must fail here, not at publish.
+          shopt -s nullglob
+          dirs=(frozen/frozen-*/)
+          [ "${#dirs[@]}" -eq 4 ] || {
+            echo "expected 4 frozen artifacts, found ${#dirs[@]}" >&2; exit 1; }
+          for d in "${dirs[@]}"; do
+            (cd "$d" && sha256sum -c *.sha256)
+            mv "$d"/*.tar.gz dist/
+          done
+          shopt -u nullglob
+          # The complete target set must be present — the same four
+          # release assets downstream channels consume.
+          for asset in \
+            skill-graph-x86_64-unknown-linux-gnu.tar.gz \
+            skill-graph-aarch64-unknown-linux-gnu.tar.gz \
+            skill-graph-aarch64-apple-darwin.tar.gz \
+            skill-graph-x86_64-apple-darwin.tar.gz; do
+            [ -f "dist/$asset" ] || { echo "missing frozen asset $asset" >&2; exit 1; }
+          done
+          ls -l dist/
       - name: Verify tag and version consistency
         env:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
