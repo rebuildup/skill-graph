@@ -128,8 +128,10 @@ Windows は WSL2 経由。musl・Windows native は対象外。
   `engines: >=14.18` を宣言。CI の実測は Node 22 であり、それ未満
   の floor は未検証。
 - **Rust**（cargo install / crates.io のソースビルド）: MSRV
-  **1.88**（`Cargo.toml` の `rust-version`、CI の msrv job が
-  同一 toolchain で check+test を実施）。
+  **1.89**（`Cargo.toml` の `rust-version`、CI の msrv job が
+  同一 toolchain で check+test を実施。#225 F11 の依存脆弱性
+  修正で rusqlite 0.43 / libsqlite3-sys 0.40 へ更新した際に
+  引き上げ）。
 
 Windows native で `npm install @rebuildup/skill-graph` を実行すると、
 win32 向け optional package が存在しないため os/cpu gating により

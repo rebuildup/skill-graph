@@ -39,6 +39,7 @@ run = [
   "bash scripts/test-freeze-manifest.sh",
   "bash scripts/test-publish-release.sh",
   "bash scripts/test-npm-publish.sh",
+  "bash scripts/check-licenses.sh",
 ]
 
 [tasks.check-eval]
