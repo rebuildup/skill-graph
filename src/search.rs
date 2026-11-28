@@ -68,7 +68,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // Terms carry a provenance source: glossary expansions share the CJK
     // substring they were derived from, so admission can tell independent
     // evidence from one substring's bigram+gloss cluster (#78).
-    let query_tagged = terms_tagged(&query);
+    let query_tagged = terms_tagged(&query, true);
     let query_tagged: Vec<(String, Rc<str>)> =
         query_tagged.into_iter().take(MAX_RECOMMEND_TERMS).collect();
     let query_terms: Vec<String> = query_tagged.iter().map(|(t, _)| t.clone()).collect();
@@ -76,7 +76,7 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // Context terms carry provenance too: a single CJK run's bigram
     // cluster must not satisfy context admission by itself, same rule
     // as description admission (#144 round-10).
-    let context_tagged: Vec<(String, Rc<str>)> = terms_tagged(&context)
+    let context_tagged: Vec<(String, Rc<str>)> = terms_tagged(&context, false)
         .into_iter()
         .take(MAX_RECOMMEND_TERMS)
         .collect();
@@ -382,7 +382,9 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     // - description hits admit when at least two independent query terms match
     //   and at least one is low-df, so generic words in broad descriptions do
     //   not admit by themselves; a single ASCII hit admits when the term is
-    //   unique to that skill (df == 1) and meaningful-length (#319);
+    //   unique to that skill (df == 1) and meaningful-length (#319); hits
+    //   from one curated English synonym cluster (>=2 distinct terms, rare
+    //   ASCII source) also admit (#319);
     // - at least two independent context-term hits in the description admit;
     // - an explicit `requires` declaration admits its dependency when the
     //   declaring skill is admitted (necessity, one hop only);
@@ -716,6 +718,28 @@ fn directly_admitted(
         let term = qterm(info.description_hits[0]);
         term.is_ascii() && term.len() >= 4 && df(term) == 1
     };
+    // A curated English synonym cluster is ONE evidence unit (aliases
+    // share the parent term's provenance, like a CJK word's bigram+gloss
+    // cluster) but semantically curated, so >=2 distinct hit terms from
+    // a single rare ASCII source admits (#319). This keeps recall stable
+    // when a competing skill also contains the source term — df==1
+    // single-hit admission disappears the moment a second skill shares
+    // the word, while the cluster path only needs source rarity.
+    let cluster_hit_terms: HashSet<&str> =
+        info.description_hits.iter().map(|&i| qterm(i)).collect();
+    let cluster_sources: HashSet<&str> = info
+        .description_hits
+        .iter()
+        .map(|&i| {
+            let term = qterm(i);
+            query_sources.get(term).map(|s| &**s).unwrap_or(term)
+        })
+        .collect();
+    let cluster_admitted = cluster_hit_terms.len() >= 2
+        && cluster_sources.len() == 1
+        && cluster_sources
+            .iter()
+            .all(|&s| s.is_ascii() && s.len() >= 4 && rare(s));
     // Description-only admission (no name anchor) requires hits from at
     // least two distinct query-term sources: a single CJK substring emits a
     // bigram cluster plus glossary terms, and those must not count as
@@ -747,6 +771,7 @@ fn directly_admitted(
         || unique_name_hit
         || name_plus_description
         || single_rare_description_hit
+        || cluster_admitted
         || description_admitted
         || context_admitted
 }
@@ -1069,7 +1094,7 @@ const STOPWORDS: &[&str] = &[
 
 #[cfg(test)]
 fn terms(text: &str) -> Vec<String> {
-    terms_tagged(text)
+    terms_tagged(text, true)
         .into_iter()
         .map(|(term, _)| term)
         .collect()
@@ -1090,7 +1115,7 @@ fn term_sources(tagged: &[(String, Rc<str>)]) -> HashMap<String, Rc<str>> {
     sources
 }
 
-fn terms_tagged(text: &str) -> Vec<(String, Rc<str>)> {
+fn terms_tagged(text: &str, en_expand: bool) -> Vec<(String, Rc<str>)> {
     let mut out: Vec<(String, Rc<str>)> = Vec::new();
     let mut ascii_run = String::new();
     let mut cjk_run = String::new();
@@ -1098,7 +1123,18 @@ fn terms_tagged(text: &str) -> Vec<(String, Rc<str>)> {
         if ascii.chars().count() >= 2 {
             let lower = ascii.to_lowercase();
             if !STOPWORDS.contains(&lower.as_str()) {
-                out.push((lower.clone(), Rc::from(lower.as_str())));
+                let source: Rc<str> = Rc::from(lower.as_str());
+                out.push((lower.clone(), source.clone()));
+                // English synonym expansion (#319): aliases share the
+                // parent term's provenance so the whole cluster is ONE
+                // evidence unit, matching the CJK bigram+gloss rule.
+                if en_expand && let Some(aliases) = en_gloss_aliases(&lower) {
+                    for alias in aliases.split_whitespace() {
+                        if alias.len() >= 2 && !STOPWORDS.contains(&alias) {
+                            out.push((alias.to_string(), source.clone()));
+                        }
+                    }
+                }
             }
         }
         ascii.clear();
@@ -1640,6 +1676,102 @@ const GLOSS: &[(&str, &str)] = &[
     ("ログ", "log logging"),
 ];
 
+/// English vocabulary bridging for query-side term expansion (#319).
+/// Real task prompts routinely use different words than skill
+/// descriptions ("--verbose and --output FILE flags" vs "command-line
+/// interfaces ... arguments ... options"). Each entry maps a query term
+/// to curated aliases that share the SAME provenance source as the
+/// original term, so a synonym cluster counts as ONE evidence unit —
+/// the same independence rule that keeps a CJK word's bigram+gloss
+/// cluster from self-admitting (#78). Aliases are matched against
+/// skill text only; they are never emitted as recommendation content.
+const EN_GLOSS: &[(&str, &str)] = &[
+    (
+        "flags",
+        "flag argument arguments option options cli param params parameter parameters",
+    ),
+    (
+        "flag",
+        "flags argument arguments option options cli param params",
+    ),
+    (
+        "arguments",
+        "argument args flag flags option options cli param params",
+    ),
+    (
+        "argument",
+        "arguments args flag flags option options cli param params",
+    ),
+    (
+        "args",
+        "arguments argument flag flags option options cli param params",
+    ),
+    (
+        "options",
+        "option flag flags argument arguments cli param params",
+    ),
+    (
+        "option",
+        "options flag flags argument arguments cli param params",
+    ),
+    (
+        "params",
+        "param parameter parameters argument arguments flag flags option options",
+    ),
+    (
+        "param",
+        "params parameter parameters argument arguments flag flags option options",
+    ),
+    (
+        "parameter",
+        "parameters param params argument arguments flag flags option options",
+    ),
+    (
+        "parameters",
+        "parameter param params argument arguments flag flags option options",
+    ),
+    ("cli", "command line arguments flags options"),
+    ("tests", "test testing pytest spec unit integration"),
+    ("testing", "test tests pytest spec unit integration"),
+    ("pytest", "test tests testing unit"),
+    ("migration", "migrate sql schema alembic"),
+    ("migrate", "migration sql schema alembic"),
+    ("endpoint", "endpoints route routes api rest http handler"),
+    ("endpoints", "endpoint route routes api rest http handler"),
+    ("route", "routes endpoint endpoints api rest http handler"),
+    ("routes", "route endpoint endpoints api rest http handler"),
+    ("config", "configuration settings env validation yaml json"),
+    ("configuration", "config settings env validation yaml json"),
+    ("settings", "config configuration env validation yaml json"),
+    ("logging", "log logger structured json observability"),
+    ("logger", "log logging structured json"),
+    ("deploy", "deployment release ci cd pipeline"),
+    ("deployment", "deploy release ci cd pipeline"),
+    ("debug", "debugging diagnose troubleshoot error"),
+    ("debugging", "debug diagnose troubleshoot error"),
+    ("authentication", "auth login session token credential"),
+    ("login", "auth authentication session token credential"),
+    ("permissions", "permission auth scope role access"),
+    ("permission", "permissions auth scope role access"),
+    ("dependencies", "dependency package library import"),
+    ("dependency", "dependencies package library import"),
+    ("performance", "latency throughput benchmark optimize"),
+    ("errors", "error exception handling status code envelope"),
+    ("error", "errors exception handling status code envelope"),
+    ("exception", "error errors handling try catch"),
+    ("schema", "database table migration sql"),
+    ("verbose", "debug logging output flag flags"),
+];
+
+/// Look up English synonym aliases for an extracted ASCII query term.
+/// Returns alias words that share the term's provenance source.
+fn en_gloss_aliases(term: &str) -> Option<&'static str> {
+    EN_GLOSS
+        .iter()
+        .find(|(key, _)| *key == term)
+        .map(|(_, aliases)| *aliases)
+}
+
 /// Every glossary key present in `text`, independent of term-level
 /// dedup: `gloss_terms` dedups by emitted term, so a key whose gloss
 /// was fully claimed by an earlier key would otherwise be invisible to
@@ -1723,7 +1855,7 @@ mod tests {
 
     #[test]
     fn cjk_provenance_splits_bigrams_from_gloss_keys() {
-        let tagged = terms_tagged("文章を自然にしたい");
+        let tagged = terms_tagged("文章を自然にしたい", true);
         let sources = term_sources(&tagged);
         // Round-10/11: provenance is scoped to the evidence unit — a
         // bigram inside a recognized dictionary word shares that word's
@@ -1737,7 +1869,7 @@ mod tests {
         assert_eq!(sources.get("自然").map(|s| &**s), Some("自然"));
         // A contentful gap is a single evidence unit: every bigram in
         // `報告をトリアージして` shares the gap text as its source.
-        let tagged = terms_tagged("不具合報告をトリアージして");
+        let tagged = terms_tagged("不具合報告をトリアージして", true);
         let gap_sources = term_sources(&tagged);
         let gap = "報告をトリアージして";
         assert_eq!(gap_sources.get("報告").map(|s| &**s), Some(gap));
@@ -1754,7 +1886,7 @@ mod tests {
     /// expansion) cannot self-admit on query `根本原因`.
     #[test]
     fn contained_key_gloss_inherits_covering_source() {
-        let tagged = terms_tagged("根本原因");
+        let tagged = terms_tagged("根本原因", true);
         let sources = term_sources(&tagged);
         // The bigram 原因 is covered by 根本原因; the gloss terms that
         // 原因 would emit (root, cause) must carry the SAME source.
@@ -1763,7 +1895,7 @@ mod tests {
         assert_eq!(sources.get("cause").map(|s| &**s), Some("根本原因"));
         // A standalone 原因 elsewhere in the run is a genuinely
         // independent dictionary word and keeps its own source.
-        let tagged = terms_tagged("根本原因と原因");
+        let tagged = terms_tagged("根本原因と原因", true);
         let sources = term_sources(&tagged);
         assert_eq!(sources.get("原因").map(|s| &**s), Some("原因"));
         assert_eq!(sources.get("root").map(|s| &**s), Some("原因"));
