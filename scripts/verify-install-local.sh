@@ -189,7 +189,10 @@ class SkillGraph < Formula
 end
 EOF
   brew_log="$tmp/brew-install.log"
-  if brew install "$formula" >"$brew_log" 2>&1; then
+  # `./` prefix is REQUIRED: brew parses bare `/abs/path.rb` and
+  # `user/repo` args as tap names ("Invalid tap name"), while
+  # `./formula.rb` is recognized as a local formula file.
+  if (cd "$tmp" && brew install ./skill-graph.rb >"$brew_log" 2>&1); then
     bbin="$(brew --prefix)/bin/skill-graph"
     bout="$("$bbin" --version 2>/dev/null || true)"
     [ "$bout" = "skill-graph $version" ] \
