@@ -498,3 +498,47 @@ fn relative_hook_env_paths_fall_back_to_tmpdir() {
     assert!(tmp.path().join("skill-graph-events.jsonl").exists());
     assert!(!std::path::Path::new("relative-events.jsonl").exists());
 }
+
+/// #225 r6: a non-canonical raw session id must normalize EXACTLY
+/// once across every hook entrypoint. Before the SessionId type split,
+/// prompt_submit re-ran the transform on the already-normalized id and
+/// emitted a different session_id than skill_load — silently splitting
+/// one session's funnel state.
+#[test]
+fn noncanonical_session_id_normalizes_once_across_entrypoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let envs = fixture_env(&dir);
+    let raw = "sess!1";
+    // prompt mode emits prompt_submit + recommendation events.
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "prompt"],
+        &json!({"session_id": raw, "prompt": "alpha task"}),
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0, "prompt rc: {out}");
+    // skill-load mode emits skill_load (+ recommendation) events.
+    let (out, rc) = run_hook(
+        &["hook", "claude-code", "skill-load"],
+        &json!({"session_id": raw, "tool_name": "Skill", "tool_input": {"skill": "alpha-skill"}}),
+        &env_pairs(&envs),
+    );
+    assert_eq!(rc, 0, "skill-load rc: {out}");
+
+    let events = event_lines(&dir.path().join("events.jsonl"));
+    assert!(
+        events.len() >= 2,
+        "expected events from both modes: {events:?}"
+    );
+    let ids: Vec<&str> = events
+        .iter()
+        .map(|e| e["session_id"].as_str().unwrap())
+        .collect();
+    // Single transform of "sess!1" — the shared cross-implementation
+    // vector anchored in events.rs / opencode-plugin.test.ts.
+    for id in &ids {
+        assert_eq!(
+            *id, "sess1-f1437b8fb22261cc21b7a104ca00e1b1",
+            "double-normalized id leaked: {ids:?}"
+        );
+    }
+}

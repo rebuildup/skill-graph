@@ -56,10 +56,13 @@ struct HookEnv {
     /// TMPDIR cannot redirect reads or writes (#225).
     #[cfg(unix)]
     state_fd: Option<std::fs::File>,
-    /// Contract session id for emitted events: `events::sanitize_session_id`
-    /// semantics, so absent ids stay unattributed (`""`) and distinct
-    /// all-invalid ids hash apart instead of collapsing into `"unknown"`.
-    event_session_id: String,
+    /// Contract session id for emitted events: normalized once from the
+    /// raw payload id via `events::SessionId::normalize`. The type makes
+    /// re-normalization impossible — constructors take `&SessionId`, so
+    /// a transform output (reserved `-`+32hex shape) can never be fed
+    /// through the transform a second time and split the session's
+    /// funnel state (#225 r6).
+    event_session_id: events::SessionId,
     timestamp: String,
 }
 
@@ -84,7 +87,7 @@ impl HookEnv {
             .or_else(|| payload.get("sessionId"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        let event_session_id = events::sanitize_session_id(session_id);
+        let event_session_id = events::SessionId::normalize(session_id);
         Self {
             runtime,
             nostate: std::env::var("SKILL_GRAPH_HOOK_NOSTATE").as_deref() == Ok("1"),
@@ -730,9 +733,10 @@ fn run_skill_load(env: &HookEnv, payload: &Value) -> Option<String> {
     // skipped skills simply get no dependency injection this run.
     const MAX_LOAD_RECOMMENDS: usize = 8;
     let mut recommend_budget = MAX_LOAD_RECOMMENDS;
-    for mut event in detected {
-        // Normalize to the contract session id so all events agree.
-        event.session_id = env.event_session_id.clone();
+    for event in detected {
+        // detect_all_from_payload already normalized the same raw
+        // payload id into a SessionId — the type guarantees every
+        // event agrees with env.event_session_id (#225 r6).
         env.log_event(&event);
         let Some(detection) = event.detection else {
             continue;

@@ -86,13 +86,13 @@ function validSkillName(name: string): boolean {
   return /^[a-z0-9-]{1,64}$/.test(name) && !name.startsWith("-") && !name.endsWith("-")
 }
 
-// Mirror events.rs's sanitize_session_id contract: absent/empty ids
+// Mirror events.rs's SessionId::normalize contract: absent/empty ids
 // stay unattributed (""), charset-valid ids pass through bounded, and
 // distinct all-invalid ids hash apart instead of collapsing into one
 // "unknown" funnel session. Exported for the parity contract test
 // (opencode-plugin.test.ts) — the sanitize rules are part of the
 // cross-entrypoint event contract (#225).
-// Session-id contract (#225 r5, parity with events::sanitize_session_id):
+// Session-id contract (#225 r5, parity with events::SessionId::normalize):
 // the sanitized form must be INJECTIVE over arbitrary host input. The
 // previous head+8hex scheme let a charset-valid literal id collide with
 // another id's transformed output ("sess1-deadbeef" == sanitize("sess!1")).
@@ -474,7 +474,15 @@ export function boundJsonValue(v: unknown, depth: number, st: BoundState): unkno
       if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
       const c = boundJsonValue((v as Record<string, unknown>)[k], depth + 1, st)
       if (c === BOUND_FAIL) return BOUND_FAIL
-      out[k] = c
+      // defineProperty, not assignment: k can be "__proto__", where
+      // `out[k] = c` would invoke Object.prototype's setter and either
+      // drop the key or mutate the clone's prototype (#225 r6).
+      Object.defineProperty(out, k, {
+        value: c,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
     }
     return out
   }

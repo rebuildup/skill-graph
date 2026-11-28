@@ -395,6 +395,19 @@ describe("input-bounding properties (#225)", () => {
     expect(st.nodes).toBeGreaterThan(0)
   })
 
+  test("boundJsonValue preserves __proto__ as an own data property", () => {
+    // JSON.parse creates "__proto__" as an own enumerable data
+    // property; a plain `out[k] = c` clone would hit the prototype
+    // setter and lose the key or mutate the clone's prototype (#225 r6).
+    const input = JSON.parse('{"__proto__":{"polluted":true},"ok":1}') as Record<string, unknown>
+    const st = { nodes: 0, strBytes: 0 }
+    const r = boundJsonValue(input, 0, st) as Record<string, unknown>
+    expect(Object.prototype.hasOwnProperty.call(r, "__proto__")).toBe(true)
+    expect((r as any).__proto__).toEqual({ polluted: true })
+    expect(Object.getPrototypeOf(r)).toBe(Object.prototype)
+    expect(({} as any).polluted).toBeUndefined()
+  })
+
   test("boundJsonValue rejects non-JSON and oversized strings", () => {
     const st = () => ({ nodes: 0, strBytes: 0 })
     expect(boundJsonValue(undefined, 0, st())).toBe(BOUND_FAIL)

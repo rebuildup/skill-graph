@@ -80,22 +80,29 @@ queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
 - event log の JSONL 行は `kind` / `schema_version` を持つ行のみ
   contract イベントとして deserialize され、`schema_version` が
   `SCHEMA_VERSION` と一致しない行は `lines_skipped` に計上される。
-- passthrough event の payload 由来文字列フィールドは emit 側
-  constructor と同じ上限に正規化される: `session_id` は
-  `[A-Za-z0-9._-]`・128 文字。canonical な id（全て valid charset・
-  128 文字以内・generated 形状でない）は素通しし、それ以外は
-  valid 文字の先頭 95 文字 + `-` + 元 id の SHA-256 先頭 32 hex
-  （計 ≤128 文字）に変換される。generated 形状（末尾が `-` +
-  32 桁 lowercase hex）は reserved であり literal id としても
-  変換対象になるため、passthrough 名前空間と生成名前空間は
-  構造的に衝突しない（#225 r5: 旧 8 hex 接尾辞では literal id が
-  別 id の変換結果と一致し得た）。charset フィルタで文字が
-  除去された id・128 文字超の id・全滅 id（`u-<hash>`）はいずれも
-  元 id の hash を含むため merge されない（`sess!1` と `sess?1`、
-  および `sess!1` の変換結果に等しい literal id は別 id）。
-  冪等性は契約ではない: charset 損失を伴う写像では冪等性と
-  単射性は両立しないため、sanitize は ingest で一度だけ適用する。
-  `skill_path` 1024、`tool`/`skill_name`/`recommended[].name` 256、
+- passthrough event の `session_id` は**正規化済み contract 形のみ**
+  受理される（`SessionId` の Deserialize が charset `[A-Za-z0-9._-]`・
+  128 文字以内を検証し、不適合行は `lines_skipped`）。正規化の
+  transform は ingest boundary（hook payload・plugin event・
+  transcript/db row）で `SessionId::normalize` が**一度だけ**適用し、
+  それ以降の全経路 — event constructor・state key・observe
+  passthrough — は `SessionId` 型を持つため再変換が型レベルで
+  不可能（#225 r6: 旧実装では正規化済み id を constructor が再度
+  transform し、prompt 系と load 系で session_id が乖離して funnel
+  が分裂した）。canonical な raw id（全て valid charset・128 文字
+  以内・generated 形状でない）は素通しし、それ以外は valid 文字の
+  先頭 95 文字 + `-` + 元 id の SHA-256 先頭 32 hex（計 ≤128 文字）
+  に変換される。generated 形状（末尾が `-` + 32 桁 lowercase hex）は
+  reserved であり literal id としても変換対象になるため、
+  passthrough 名前空間と生成名前空間は構造的に衝突しない（#225 r5:
+  旧 8 hex 接尾辞では literal id が別 id の変換結果と一致し得た）。
+  charset フィルタで文字が除去された id・128 文字超の id・全滅 id
+  （`u-<hash>`）はいずれも元 id の hash を含むため merge されない
+  （`sess!1` と `sess?1`、および `sess!1` の変換結果に等しい
+  literal id は別 id）。冪等性は契約ではない: charset 損失を伴う
+  写像では冪等性と単射性は両立しないため、transform は ingest で
+  一度だけ適用する。`skill_path` 1024、`tool`/`skill_name`/
+  `recommended[].name` 256、
   `reason` 1024、`prompt_hash`/`skill_digest`/`recommended[].digest` 128、
   `timestamp` 64 文字。`recommended` は最大 32 件
   （`MAX_RECOMMENDED`）で打ち切られる。`skill_load.skill_name` は
@@ -566,10 +573,10 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
 
 | 保証対象 | 不変条件 | 構造的機構 | 検証 |
 |---|---|---|---|
-| 入力境界（plugin） | 敵対的・巨大な host payload に対し処理量が O(budget) で有界 | `boundJsonValue`（depth 32 / nodes 8192 / 1 MiB、for..in 遅延走査＋early break、array length は一度だけ読む — Proxy get trap の再読で確保量が検査をすり抜けない）、`resultText`（全ノード計上・64 KiB）、`utf8Slice`（O(budget)）、`detectLoad` の事前 filter | `opencode-plugin.test.ts` の性質テスト: Proxy iterator/descriptor トラップで**走査量そのもの**を観測（旧実装で iters=200,001 / gopd≈50,000 を検出）、2000 件 seeded sweep で safeSessionID 契約、200 件の乱数 result で byte budget |
-| session 状態識別 | sanitize 結果が空の session は per-session state を共有しない。runtime・sanitize 済み id で dedup 名前空間を分離。session_id ≤128 chars。sanitize は単射的（literal id が別 id の生成形状と衝突しない — `-`+32hex suffix は reserved） | Rust `state_disabled` + `<runtime>-<session>` state file 名。plugin `attributed` gate で dedup/queue/sessionCtx/context を全 bypass。`emitted` は実際に注入可能な時のみ true | `sanitize_session_id_property_contract`（3000 件 adversarial sweep: ≤128・charset・決定性・非衝突）+ `sanitize_session_id_reserved_shape_cannot_collide`（literal=生成形状の衝突拒否）、TS 側 `reserved transform shape cannot collide` parity、`anonymous session state isolation`（fake CLI + mock ctx で実 hook を駆動、匿名 dedup 非抑制・queue 非漏洩・emitted:false を検証） |
+| 入力境界（plugin） | 敵対的・巨大な host payload に対し処理量が O(budget) で有界 | `boundJsonValue`（depth 32 / nodes 8192 / 1 MiB、for..in 遅延走査＋early break、array length は一度だけ読む — Proxy get trap の再読で確保量が検査をすり抜けない、clone は defineProperty で `__proto__` 等の特殊キーを own data property として保持）、`resultText`（全ノード計上・64 KiB）、`utf8Slice`（O(budget)）、`detectLoad` の事前 filter | `opencode-plugin.test.ts` の性質テスト: Proxy iterator/descriptor トラップで**走査量そのもの**を観測（旧実装で iters=200,001 / gopd≈50,000 を検出）、2000 件 seeded sweep で safeSessionID 契約、200 件の乱数 result で byte budget、`__proto__` own-property 保持テスト（旧実装で key 喪失を検出） |
+| session 識別・状態分離 | session_id の正規化は ingest boundary で**一度だけ**。正規化済み id と raw id は `SessionId` 型で分離され、再 transform は型レベルで不可能。sanitize は単射的（literal id が別 id の生成形状と衝突しない — `-`+32hex suffix は reserved）。正規化結果が空の session は per-session state を共有しない。runtime・正規化済み id で dedup 名前空間を分離。session_id ≤128 chars | `SessionId::normalize` が唯一の transform 地点。event constructor は `&SessionId` のみ受付。hook `event_session_id`・observe の `Rc<SessionId>`・passthrough の Deserialize 検証（不適合は lines_skipped）。Rust `state_disabled` + `<runtime>-<session>` state file 名。plugin `attributed` gate で dedup/queue/sessionCtx/context を全 bypass。`emitted` は実際に注入可能な時のみ true | `SessionId::normalize` property sweep（3000 件 adversarial: ≤128・charset・決定性・非衝突）+ reserved-shape 衝突拒否 + `noncanonical_session_id_normalizes_once_across_entrypoints`（prompt/skill-load で同一 session_id — **旧実装で二重 transform を実際に検出**）+ passthrough reserved-shape verbatim + invalid session_id → lines_skipped、TS 側 parity、`anonymous session state isolation` |
 | イベント観測（funnel） | `emitted` は「model が実際に見た注入」のみを表す。recommended[] は注入集合と一致 | plugin は匿名 session に注入経路を持たないため `emitted:false` を記録（Rust は同期 response で匿名注入可能なため true で正しい — 非対称は構造由来） | session 分離テストの `emitted` assertion（匿名 false / attributed true） |
 | ファイル所有権・状態安全 | 検査と操作の間に path が差し替えられない。symlink・他人所有・hardlink を拒否。権限は 0700/0600 | state dir を `O_NOFOLLOW|O_DIRECTORY` dirfd で anchor し全操作を openat/fstatat/fchmod 化。plugin `emit()` は O_NOFOLLOW+O_NONBLOCK+uid 検査 | `tests/` の hook/adapter 系 + contracts.md TMPDIR 契約。dirfd 確立前の path 操作は存在しないことをコード構造で保証 |
 | clean-legacy 所有権 | v0.3.x 成果物のみ削除。`current` は payload 持ち X.Y.Z dir を指す symlink のみ。release dir は `skill-graph` file AND `adapters/` dir の両 marker 必須 | 二相化（全 entry を削除前 FS で classify→delete） | `tests/adapter.rs` clean_legacy 5 件（lookalike・dangling symlink・bin link・nonlegacy target）。旧実装で `current`/marker 無し dir の誤削除を実証 |
-| 配布成果物同一性 | 公開経路の全分岐で「registry が提供する内容」==「この build の pack 内容」。skip も publish 後も同一不変条件。**preflight 完了前に publish 操作は存在しない**（部分公開なし）。package.json `files[]` 宣言ファイル・bin 実行形式（exec bit + `file` 判定）・依存 publish 順序は全 package で publish 前に検証。tarball は gzip magic/integrity・`package/` 単一 root・重複メンバー無し・`..` traversal 無し・regular file/dir のみを archive 段階で要求 | `publish-npm.sh` は二相構造（Phase 1: 全 package の manifest/files[]/bin/依存順序 preflight → Phase 2: skip/publish + registry 同一性検証）→ `verify-npm-registry.sh`（view→curl→pack→比較）→ `verify-npm-tarballs.sh`（archive 形式 gate + package/ root + 全木 diff + mode/type listing）/ `verify-npm-arch.sh`（format+arch predicate）/ `verify-npm-bin.sh`（exec bit + executable format） | `test-release-verify.sh` 33 件（内容不一致・missing/extra・exec-bit・file→dir・corrupt・non-gzip・truncated gzip・duplicate member・symlink/hardlink member・traversal member・root 外ファイル・bin 非実行形式/symlink・wrong arch・unknown target）+ `test-npm-publish.sh` 25 件（stub npm registry で fresh publish・同一 skip・divergent 拒否・post-publish tamper 拒否・**後続 package の preflight 失敗で publish 0 件**・files[] 欠損・bin 非実行形式/symlink/dir・依存順序違反・publish 失敗伝播）。**mutant 実証**: 旧 interleaved publish（部分 publish 7 件 FAIL）・旧 tarball verifier（duplicate/symlink/hardlink 受理 3 件 FAIL）・skip 経路 verify 除去で各 suite が FAIL |
+| 配布成果物同一性 | 公開経路の全分岐で「registry が提供する内容」==「検証済み固定 .tgz の内容」。skip も publish 後も同一不変条件。**pack・artifact 検証の完了前に publish 操作は存在しない**（部分公開なし）。manifest は実 JSON parser で検査（`files[]` 存在・依存順序）。tarball は gzip magic/integrity・canonical member 名（`//`・`/./`・`.`/`..` segment・正規化後同一 path の拒否）・duplicate member・`package/` 単一 root・regular file/dir のみを archive 段階で要求。公開されるのは検証済み .tgz そのもの（re-pack 無し） | `publish-npm.sh` 5 相: A `pkg-preflight.mjs`（node による構造化 manifest 検査 — name/version/files[]/依存順序）→ B bin disk 検査 → C 全 package `npm pack` で固定 artifact 生成 → D `verify-npm-archive.sh --check-bin` で artifact 自体を検査 → E `npm publish <tgz>` + `verify-npm-registry.sh`（view→curl→固定 artifact と比較）。`verify-npm-tarballs.sh` は archive gate を `verify-npm-archive.sh` に委譲し全木 diff + mode/type listing。`verify-npm-arch.sh`/`verify-npm-bin.sh` は不変 | `test-release-verify.sh` 44 件（+ canonical member 名: `//`・`/./`・file+dir 同一 canonical path・archive gate 単体の `--check-bin` 受理/拒否）+ `test-npm-publish.sh` 30 件（stub npm registry: fresh publish・同一 skip・divergent 拒否・post-publish tamper 拒否・preflight/artifact 失敗で publish 0 件・files[] 欠損・bin 非実行形式/symlink/dir・依存順序・**非 canonical packed artifact 拒否**・malformed JSON/files[] traversal/非 array files 拒否・publish 失敗伝播）。**mutant 実証**: 旧 publish（部分 publish・artifact 未検査で 4 件 FAIL）・旧 tarball verifier（duplicate/symlink/hardlink 受理）・skip 経路 verify 除去 |
 | 性能 | 推薦・discovery・CLI の latency/throughput/memory が spec 範囲内 | オンメモリ engine、LRU graph cache、全走査に上限 | `docs/evidence/` の測定記録（env/SHA/コーパス/再現コマンド）。process latency は 30 samples の p50/p95/max（p95 が max に退化しない件数）、RSS は `/usr/bin/time -v` を各点 20 回計測した最大値で `assets/readme/data/memory.json` に一元化。README/SVG は `perf-500.json`/`bench-eval.json`/`memory.json` から `gen-readme-assets.py` で再生成 |

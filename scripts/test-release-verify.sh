@@ -191,6 +191,63 @@ tar -czf "$work/outside.tgz" -C "$work/outside" package stray
 expect_reject "archive-level member outside package/ rejected" \
   bash "$TAR_VERIFY" "$work/outside.tgz" "$work/a.tgz"
 
+# --- canonical member names (#225 r6) -----------------------------------
+# Names that would NORMALIZE to the same extraction path must be
+# rejected at the archive level — exact-string dedup cannot see them.
+
+# "package//evil" — interior empty segment normalizes to package/evil
+mkdir -p "$work/nc/package"
+cp -r "$work/a/package/." "$work/nc/package/"
+tar --transform='s|^package/package.json$|package//pkg.json|' \
+  -czf "$work/nc.tgz" -C "$work/nc" package
+expect_reject "member with // rejected (normalizes to package/pkg.json)" \
+  bash "$TAR_VERIFY" "$work/nc.tgz" "$work/a.tgz"
+# Gate-level isolation: the single-artifact verifier must reject these
+# on its own — a two-file diff could mask WHICH check fired.
+expect_reject "archive gate rejects // member" \
+  bash scripts/verify-npm-archive.sh "$work/nc.tgz"
+
+# "package/./x" — "." segment normalizes away at extraction
+mkdir -p "$work/dot/package"
+cp -r "$work/a/package/." "$work/dot/package/"
+tar --transform='s|^package/package.json$|package/./pkg.json|' \
+  -czf "$work/dot.tgz" -C "$work/dot" package
+expect_reject "member with /./ rejected" \
+  bash "$TAR_VERIFY" "$work/dot.tgz" "$work/a.tgz"
+expect_reject "archive gate rejects /./ member" \
+  bash scripts/verify-npm-archive.sh "$work/dot.tgz"
+
+# file "package/x" + dir "package/x/": individually canonical, but the
+# canonical dedup key collides — extraction cannot keep both.
+mkdir -p "$work/coll/package/y"
+cp -r "$work/a/package/." "$work/coll/package/"
+printf 'f\n' > "$work/coll/package/x"
+tar --transform='s|package/y|package/x|' \
+  -czf "$work/coll.tgz" -C "$work/coll" package
+expect_reject "file+dir same canonical path rejected" \
+  bash "$TAR_VERIFY" "$work/coll.tgz" "$work/a.tgz"
+expect_reject "archive gate rejects canonical-key collision" \
+  bash scripts/verify-npm-archive.sh "$work/coll.tgz"
+
+# verify-npm-archive.sh is the shared single-artifact gate used by
+# publish-npm.sh Phase D — exercise it directly, including --check-bin.
+expect_ok "archive gate accepts well-formed tarball" \
+  bash scripts/verify-npm-archive.sh "$work/a.tgz"
+expect_ok "archive gate --check-bin accepts script bin" \
+  bash scripts/verify-npm-archive.sh --check-bin "$work/a.tgz"
+
+# bin payload that is +x but not executable-format, packed into the
+# artifact: Phase D must reject the fixed bytes themselves.
+mkdir -p "$work/badbin/package/bin"
+printf 'just text\n' > "$work/badbin/package/bin/tool"
+chmod +x "$work/badbin/package/bin/tool"
+printf '{}\n' > "$work/badbin/package/package.json"
+tar -czf "$work/badbin.tgz" -C "$work/badbin" package
+expect_reject "archive --check-bin rejects non-executable-format bin" \
+  bash scripts/verify-npm-archive.sh --check-bin "$work/badbin.tgz"
+expect_ok "archive gate without --check-bin does not inspect bin format" \
+  bash scripts/verify-npm-archive.sh "$work/badbin.tgz"
+
 # nonexistent inputs
 expect_reject "missing published file rejected" \
   bash "$TAR_VERIFY" "$work/nope.tgz" "$work/a.tgz"

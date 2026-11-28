@@ -64,6 +64,12 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          # publish-npm.sh's pkg-preflight.mjs parses package.json with
+          # a real JSON parser — node is guaranteed wherever npm runs,
+          # and making it explicit keeps the publish-path tests honest.
+          node-version: "22"
       - name: OpenCode plugin bundles
         # Syntax/bundle check for the embedded plugin source; type
         # resolution against @opencode/plugin is out of scope here.
@@ -72,7 +78,7 @@ jobs:
             --external '@opencode/plugin' \
             --outfile /tmp/opencode-plugin.js
       - name: OpenCode plugin contract tests
-        # safeSessionID parity with events::sanitize_session_id is part
+        # safeSessionID parity with SessionId::normalize is part
         # of the event contract — verify it, don't assume it (#225).
         run: bun test src/assets/opencode-plugin.test.ts
       - name: Release verification scripts

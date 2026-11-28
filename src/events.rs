@@ -109,7 +109,7 @@ pub struct SkillUsageEvent {
     pub kind: EventKind,
     pub runtime: Runtime,
     #[serde(default)]
-    pub session_id: String,
+    pub session_id: SessionId,
     #[serde(default)]
     pub timestamp: String,
     pub observed_via: ObservedVia,
@@ -148,57 +148,147 @@ pub(crate) const MAX_RECOMMENDED: usize = 32;
 /// bound them like `tool`/`skill_path` so a hostile payload cannot write
 /// unbounded strings into every event line. Charset matches the hook's
 /// sanitizer so hook- and detect-emitted events agree.
-/// Session-id contract (#225 r5): the sanitized form must be injective
-/// over arbitrary host input, not merely collision-resistant. The old
-/// scheme let a charset-valid literal id ("sess1-deadbeef") equal the
-/// transformed output of a different id ("sess!1" -> "sess1-deadbeef")
-/// — a structural namespace collision merging two sessions' funnel
-/// state. The fix reserves the transform output shape: any id ending
-/// in `-` + 32 lowercase hex chars is non-canonical and is itself
-/// transformed, so passthrough and generated namespaces can never
-/// overlap. Idempotency is intentionally NOT a contract: for a
-/// charset-lossy mapping, injectivity and idempotency are mutually
-/// exclusive (a fixed-point output would have to be canonical, hence
-/// pass through, hence collide with the literal that produced it).
-/// sanitize runs exactly once per event at ingest.
-pub(crate) fn sanitize_session_id(session_id: &str) -> String {
-    const MAX_ID_CHARS: usize = 128;
-    const HEAD_CHARS: usize = 95; // 95 + 1 + 32 = 128
-    const SCAN_CHARS: usize = 8192;
-    const HASH_HEX: usize = 32;
+/// Session-id contract (#225 r5/r6): the normalized form must be
+/// injective over arbitrary host input, not merely collision-resistant.
+/// The old scheme let a charset-valid literal id ("sess1-deadbeef")
+/// equal the transformed output of a different id ("sess!1" ->
+/// "sess1-deadbeef") — a structural namespace collision merging two
+/// sessions' funnel state. The fix reserves the transform output
+/// shape: any id ending in `-` + 32 lowercase hex chars is
+/// non-canonical and is itself transformed, so passthrough and
+/// generated namespaces can never overlap. Idempotency is
+/// intentionally NOT a contract: for a charset-lossy mapping,
+/// injectivity and idempotency are mutually exclusive (a fixed-point
+/// output would have to be canonical, hence pass through, hence
+/// collide with the literal that produced it).
+///
+/// Type-level separation (#225 r6): `SessionId` is the ONLY
+/// representation of a normalized id. Raw host strings enter the
+/// system exclusively through `SessionId::normalize`, which runs the
+/// transform exactly once per ingest boundary (hook payload, plugin
+/// event, transcript/db row). Every downstream consumer — event
+/// constructors, state keys, observe passthrough — holds a
+/// `SessionId` and can never re-run the transform: doing so on a
+/// transform output (which ends in the reserved shape) would produce
+/// a DIFFERENT id and silently split one session's funnel state.
+/// Re-normalization is therefore a compile-time impossibility, not a
+/// convention.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
 
-    // Canonical fast path: at most MAX_ID_CHARS+1 chars are inspected,
-    // so a hostile multi-MB id cannot force a full scan here. When the
-    // prefix is shorter than the cap it IS the whole string.
-    let prefix: Vec<char> = session_id.chars().take(MAX_ID_CHARS + 1).collect();
-    if prefix.len() <= MAX_ID_CHARS
-        && prefix
-            .iter()
-            .all(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
-        && !has_reserved_suffix(session_id)
+impl SessionId {
+    /// Normalize a raw host-supplied session id into contract form.
+    /// This is the ONLY place the transform runs.
+    pub fn normalize(session_id: &str) -> Self {
+        const MAX_ID_CHARS: usize = 128;
+        const HEAD_CHARS: usize = 95; // 95 + 1 + 32 = 128
+        const SCAN_CHARS: usize = 8192;
+        const HASH_HEX: usize = 32;
+
+        // Canonical fast path: at most MAX_ID_CHARS+1 chars are
+        // inspected, so a hostile multi-MB id cannot force a full scan
+        // here. When the prefix is shorter than the cap it IS the
+        // whole string.
+        let prefix: Vec<char> = session_id.chars().take(MAX_ID_CHARS + 1).collect();
+        if prefix.len() <= MAX_ID_CHARS
+            && prefix
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+            && !has_reserved_suffix(session_id)
+        {
+            return SessionId(session_id.to_string());
+        }
+
+        // Non-canonical: bounded head of valid chars + hash of the
+        // ORIGINAL bytes. The scan cap keeps pathological all-invalid
+        // megabyte ids at O(SCAN_CHARS); the hash covers the full
+        // input so distinct ids cannot collide through a shared head.
+        let mut head = String::new();
+        let mut head_len = 0usize;
+        for (scanned, c) in session_id.chars().enumerate() {
+            if scanned >= SCAN_CHARS || head_len >= HEAD_CHARS {
+                break;
+            }
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                head.push(c);
+                head_len += 1;
+            }
+        }
+        if head.is_empty() {
+            head.push('u');
+        }
+        SessionId(format!(
+            "{head}-{}",
+            &sha256_hex(session_id.as_bytes())[..HASH_HEX]
+        ))
+    }
+
+    /// Adopt an already-normalized id WITHOUT re-running the
+    /// transform — used at trust boundaries where the stored/emitted
+    /// form is re-ingested (event-log passthrough, deserialization).
+    /// Validation is charset + length only: transform outputs
+    /// legitimately end in the reserved `-`+32hex shape, so the
+    /// reserved suffix must NOT be rejected here. Returns None for
+    /// strings that could never be normalize() output.
+    pub fn from_normalized(s: &str) -> Option<Self> {
+        const MAX_ID_CHARS: usize = 128;
+        let mut chars = s.chars();
+        if chars.by_ref().take(MAX_ID_CHARS + 1).count() > MAX_ID_CHARS {
+            return None;
+        }
+        if s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            Some(SessionId(s.to_string()))
+        } else {
+            None
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for SessionId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for SessionId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SessionId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    /// Stored/emitted session ids must already be normalized; an
+    /// invalid value fails the whole event deserialization so the log
+    /// line is counted in `lines_skipped` rather than silently
+    /// re-normalized into a different session.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
     {
-        return session_id.to_string();
+        let s = String::deserialize(deserializer)?;
+        SessionId::from_normalized(&s)
+            .ok_or_else(|| serde::de::Error::custom("session_id is not normalized contract form"))
     }
-
-    // Non-canonical: bounded head of valid chars + hash of the
-    // ORIGINAL bytes. The scan cap keeps pathological all-invalid
-    // megabyte ids at O(SCAN_CHARS); the hash covers the full input so
-    // distinct ids cannot collide through a shared head.
-    let mut head = String::new();
-    let mut head_len = 0usize;
-    for (scanned, c) in session_id.chars().enumerate() {
-        if scanned >= SCAN_CHARS || head_len >= HEAD_CHARS {
-            break;
-        }
-        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
-            head.push(c);
-            head_len += 1;
-        }
-    }
-    if head.is_empty() {
-        head.push('u');
-    }
-    format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..HASH_HEX])
 }
 
 /// True when `s` ends with `-` followed by 32 lowercase hex chars —
@@ -220,7 +310,7 @@ impl SkillUsageEvent {
     pub fn prompt_submit(
         runtime: Runtime,
         observed_via: ObservedVia,
-        session_id: &str,
+        session_id: &SessionId,
         timestamp: &str,
         prompt: &str,
     ) -> Self {
@@ -228,7 +318,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::PromptSubmit,
             runtime,
-            session_id: sanitize_session_id(session_id),
+            session_id: session_id.clone(),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: Some(sha256_hex(prompt.as_bytes())),
@@ -250,7 +340,7 @@ impl SkillUsageEvent {
     pub fn recommendation(
         runtime: Runtime,
         observed_via: ObservedVia,
-        session_id: &str,
+        session_id: &SessionId,
         timestamp: &str,
         prompt_hash: Option<String>,
         trigger: Trigger,
@@ -263,7 +353,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::Recommendation,
             runtime,
-            session_id: sanitize_session_id(session_id),
+            session_id: session_id.clone(),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: prompt_hash.map(|h| h.chars().take(128).collect()),
@@ -293,7 +383,7 @@ impl SkillUsageEvent {
     pub fn skill_load(
         runtime: Runtime,
         observed_via: ObservedVia,
-        session_id: &str,
+        session_id: &SessionId,
         timestamp: &str,
         tool: Option<String>,
         skill_name: Option<String>,
@@ -307,7 +397,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::SkillLoad,
             runtime,
-            session_id: sanitize_session_id(session_id),
+            session_id: session_id.clone(),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: None,
@@ -1043,17 +1133,21 @@ pub fn detect_all_from_payload(
         .cloned()
         .unwrap_or(Value::Null);
     let output = response_text(&output_value);
-    let session_id = payload
-        .get("session_id")
-        .or_else(|| payload.get("sessionID"))
-        .or_else(|| payload.get("sessionId"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    // Normalize the raw payload id exactly once here; every emitted
+    // event carries the resulting SessionId and cannot be re-transformed.
+    let session_id = SessionId::normalize(
+        payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionID"))
+            .or_else(|| payload.get("sessionId"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
     let to_event = |c: LoadClassification| {
         SkillUsageEvent::skill_load(
             runtime,
             observed_via,
-            session_id,
+            &session_id,
             &rfc3339_now(),
             Some(tool.to_string()),
             c.skill_name,
@@ -1213,19 +1307,19 @@ mod tests {
     #[test]
     fn sanitize_session_id_distinguishes_invalid_ids() {
         // Charset-valid ids pass through unchanged.
-        assert_eq!(sanitize_session_id("s-1.ok_2"), "s-1.ok_2");
+        assert_eq!(SessionId::normalize("s-1.ok_2"), "s-1.ok_2");
         // Distinct all-invalid ids must not collapse into one funnel
         // session, while the same id stays deterministic for joins.
-        let a = sanitize_session_id("!!!");
-        let b = sanitize_session_id("???");
+        let a = SessionId::normalize("!!!");
+        let b = SessionId::normalize("???");
         assert!(a.starts_with("u-"));
         assert!(b.starts_with("u-"));
         assert_ne!(a, b);
-        assert_eq!(a, sanitize_session_id("!!!"));
+        assert_eq!(a, SessionId::normalize("!!!"));
         // Empty stays empty — it marks unattributable events.
-        assert_eq!(sanitize_session_id(""), "");
+        assert_eq!(SessionId::normalize(""), "");
         // Overlong ids are truncated at 128 chars.
-        assert_eq!(sanitize_session_id(&"x".repeat(200)).len(), 128);
+        assert_eq!(SessionId::normalize(&"x".repeat(200)).len(), 128);
     }
 
     #[test]
@@ -1235,32 +1329,32 @@ mod tests {
         // the original bytes (parity with the plugin's safeSessionID).
         let a = format!("{}-aaa", "x".repeat(200));
         let b = format!("{}-bbb", "x".repeat(200));
-        let sa = sanitize_session_id(&a);
-        let sb = sanitize_session_id(&b);
+        let sa = SessionId::normalize(&a);
+        let sb = SessionId::normalize(&b);
         assert_eq!(sa.len(), 128);
         assert_eq!(sb.len(), 128);
         assert_ne!(sa, sb);
         assert!(sa.starts_with(&"x".repeat(95)));
         assert!(sa.contains('-'));
         // Deterministic: the same id sanitizes identically for joins.
-        assert_eq!(sa, sanitize_session_id(&a));
+        assert_eq!(sa, SessionId::normalize(&a));
         // Exactly-128-char ids pass through unsuffixed.
         let exact = "y".repeat(128);
-        assert_eq!(sanitize_session_id(&exact), exact);
+        assert_eq!(SessionId::normalize(&exact).as_str(), exact);
     }
 
     #[test]
     fn sanitize_session_id_stripped_chars_stay_distinct() {
         // #225: lossy charset filtering must not merge distinct ids —
         // "sess!1" and "sess?1" both filtered to "sess1" before.
-        let a = sanitize_session_id("sess!1");
-        let b = sanitize_session_id("sess?1");
+        let a = SessionId::normalize("sess!1");
+        let b = SessionId::normalize("sess?1");
         assert_ne!(a, b);
         assert!(a.starts_with("sess1-"));
         assert!(b.starts_with("sess1-"));
         // Deterministic for joins, and a clean id keeps its bare form.
-        assert_eq!(a, sanitize_session_id("sess!1"));
-        assert_eq!(sanitize_session_id("sess1"), "sess1");
+        assert_eq!(a, SessionId::normalize("sess!1"));
+        assert_eq!(SessionId::normalize("sess1"), "sess1");
         // Fixed cross-implementation vector: opencode-plugin.test.ts
         // asserts the same literal — the sanitize rules are a shared
         // event contract across entrypoints.
@@ -1273,16 +1367,16 @@ mod tests {
         // to another id's transform output must not merge their funnel
         // state. Transform outputs end in "-" + 32 lowercase hex; that
         // shape is reserved, so the literal is itself transformed.
-        let transformed = sanitize_session_id("sess!1");
+        let transformed = SessionId::normalize("sess!1");
         let literal = transformed.clone(); // valid charset, <=128
-        assert_ne!(sanitize_session_id(&literal), transformed);
+        assert_ne!(SessionId::normalize(&literal), transformed);
         // A hand-crafted id in the reserved shape is transformed too.
         let crafted = format!("sess1-{}", "0123456789abcdef".repeat(2));
-        assert_ne!(sanitize_session_id(&crafted), crafted);
+        assert_ne!(SessionId::normalize(&crafted).as_str(), crafted);
         // Canonical ids still pass through — the reservation only
         // catches the exact generated shape.
         assert_eq!(
-            sanitize_session_id("sess-0123456789abcdef"),
+            SessionId::normalize("sess-0123456789abcdef"),
             "sess-0123456789abcdef"
         );
     }
@@ -1298,7 +1392,7 @@ mod tests {
             format!("{}!", "x".repeat(200)),
             "sess!1".to_string(),
         ] {
-            let out = sanitize_session_id(&raw);
+            let out = SessionId::normalize(&raw);
             assert!(out.len() <= 128, "{out:?} exceeds 128 chars");
             // Idempotency is intentionally NOT a contract (#225 r5):
             // injectivity and idempotency are mutually exclusive for a
@@ -1309,7 +1403,7 @@ mod tests {
         // separate via the original-bytes hash.
         let a = format!("{}!a", "x".repeat(128));
         let b = format!("{}!b", "x".repeat(128));
-        assert_ne!(sanitize_session_id(&a), sanitize_session_id(&b));
+        assert_ne!(SessionId::normalize(&a), SessionId::normalize(&b));
     }
 
     #[test]
@@ -1345,14 +1439,15 @@ mod tests {
             "\u{0}",
             "\u{1f600}",
         ];
-        let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashMap<String, SessionId> =
+            std::collections::HashMap::new();
         for i in 0..3000u32 {
             let len = (rand() % 300) as usize;
             let mut raw = String::new();
             for _ in 0..len {
                 raw.push_str(pieces[(rand() as usize) % pieces.len()]);
             }
-            let out = sanitize_session_id(&raw);
+            let out = SessionId::normalize(&raw);
             assert!(out.len() <= 128, "{out:?} exceeds 128 chars for {raw:?}");
             // Charset: output is "" or [A-Za-z0-9._-] only — head,
             // "u-", and hash-suffix forms all use the safe alphabet.
@@ -1364,7 +1459,7 @@ mod tests {
             // Deterministic. Idempotency is NOT asserted: it is
             // mutually exclusive with injectivity for this mapping
             // (#225 r5) — see sanitize_session_id's contract comment.
-            assert_eq!(sanitize_session_id(&raw), out);
+            assert_eq!(SessionId::normalize(&raw), out);
             if i < 1000 {
                 seen.insert(raw, out);
             }
@@ -1372,7 +1467,7 @@ mod tests {
         // Distinct raws must not collapse into one sanitized id —
         // hash suffixes make accidental collisions cryptographically
         // improbable across this sample.
-        let outs: std::collections::HashSet<&String> = seen.values().collect();
+        let outs: std::collections::HashSet<&SessionId> = seen.values().collect();
         assert_eq!(outs.len(), seen.len(), "distinct raws collapsed");
     }
 

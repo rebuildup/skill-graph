@@ -672,10 +672,11 @@ fn try_passthrough_event(
         obs.lines_skipped += 1;
         return true;
     }
-    // Normalize payload-controlled fields to the bounds the event
-    // constructors apply; a contract-shaped log line can otherwise carry
-    // unbounded strings into downstream map keys.
-    event.session_id = events::sanitize_session_id(&event.session_id);
+    // session_id needs no re-normalization here: SkillUsageEvent's
+    // Deserialize impl already rejected any value that is not normalized
+    // contract form, and SessionId makes a second transform impossible
+    // by type (#225 r6). The remaining fields are payload-controlled
+    // strings the constructors would have bounded.
     event.skill_path = event.skill_path.map(|p| p.chars().take(1024).collect());
     event.tool = event.tool.map(|t| t.chars().take(256).collect());
     event.skill_name = event.skill_name.map(|n| n.chars().take(256).collect());
@@ -1018,7 +1019,7 @@ fn implied_load(event: &SkillUsageEvent, current_file_len: usize) -> Option<(Ski
     }
     let name = event.skill_name.as_ref()?;
     let load = SkillLoad {
-        session_id: event.session_id.clone(),
+        session_id: event.session_id.to_string(),
         skill: name.clone(),
         timestamp: event.timestamp.clone(),
         file: String::new(),
@@ -1155,11 +1156,11 @@ fn cap_bytes(s: &str, max: usize) -> String {
 #[derive(Default)]
 struct ClaudeScan {
     /// (feed line index, tool_use_id, session_id, timestamp, tool name, input)
-    uses: Vec<(u64, String, String, String, String, Value)>,
+    uses: Vec<(u64, String, events::SessionId, String, String, Value)>,
     /// tool_use_id -> output text
     results: HashMap<String, String>,
     /// (feed line index, session_id, timestamp, text) user prompts
-    prompts: Vec<(u64, String, String, String)>,
+    prompts: Vec<(u64, events::SessionId, String, String)>,
     /// Aggregate retained bytes across uses/results/prompts.
     retained: usize,
     uses_dropped: usize,
@@ -1183,9 +1184,11 @@ impl ClaudeScan {
         let Some(raw_session) = value.get("sessionId").and_then(Value::as_str) else {
             return;
         };
-        // Sanitize once per line: the raw sessionId is unbounded input
+        // Normalize once per line: the raw sessionId is unbounded input
         // and is cloned into every retained use/prompt (#144 r14).
-        let session_id = events::sanitize_session_id(raw_session);
+        // SessionId::normalize is the ONLY transform site — retained
+        // copies and emitted events share the normalized value (#225 r6).
+        let session_id = events::SessionId::normalize(raw_session);
         // Constructors truncate to 64 chars anyway; do it at ingest so
         // the retained copies are already bounded.
         let timestamp = cap_bytes(
@@ -1327,7 +1330,7 @@ impl ClaudeScan {
 /// or buggy transcripts can repeat ids; without this each use would
 /// verify the same output into a separate file_read event (#144 r13).
 struct ClaudeUseRun<'a> {
-    uses: std::slice::Iter<'a, (u64, String, String, String, String, Value)>,
+    uses: std::slice::Iter<'a, (u64, String, events::SessionId, String, String, Value)>,
     results: &'a std::collections::HashMap<String, String>,
     /// tool_use_ids whose output frontmatter was already claimed;
     /// borrows the id strings from `uses`.
@@ -1394,7 +1397,7 @@ struct PendingCall {
     /// per access costs O(1) instead of cloning up-to-4MiB strings
     /// per record (#144 r14).
     call_id: Rc<str>,
-    session_id: Rc<str>,
+    session_id: Rc<events::SessionId>,
     timestamp: Rc<str>,
     /// (skill path, access kind) pairs extracted from exec JS commands
     accesses: Vec<(String, events::Access)>,
@@ -1402,10 +1405,10 @@ struct PendingCall {
 
 #[derive(Default)]
 struct CodexScan {
-    /// Sanitized session id, interned: PendingCall/OverflowAccess share
+    /// Normalized session id, interned: PendingCall/OverflowAccess share
     /// this one allocation instead of cloning the raw (up to 4 MiB)
     /// session_id string per retained access (#144 r14).
-    session_id: Rc<str>,
+    session_id: Rc<events::SessionId>,
     pending: Vec<PendingCall>,
     /// Total `(path, access)` pairs retained across `pending` — bounded
     /// separately from the per-call MAX_CODEX_ACCESSES because the call
@@ -1427,7 +1430,7 @@ struct CodexScan {
     overflow_dropped: usize,
     outputs: HashMap<String, String>,
     /// (feed line index, session, timestamp, text)
-    prompts: Vec<(u64, Rc<str>, Rc<str>, String)>,
+    prompts: Vec<(u64, Rc<events::SessionId>, Rc<str>, String)>,
     prompts_dropped: usize,
     injected: Vec<(u64, SkillUsageEvent)>,
     injected_dropped: usize,
@@ -1442,7 +1445,7 @@ struct OverflowAccess {
     /// Feed line index — orders emitted events against equal/missing
     /// timestamps (#144 r17).
     seq: u64,
-    session_id: Rc<str>,
+    session_id: Rc<events::SessionId>,
     timestamp: Rc<str>,
     call_id: Rc<str>,
     access: events::Access,
@@ -1496,14 +1499,14 @@ impl CodexScan {
                 {
                     // Sanitize once: the raw session_id can be ~4 MiB and
                     // was previously cloned into every retained access.
-                    self.session_id = Rc::from(events::sanitize_session_id(id).as_str());
+                    self.session_id = Rc::new(events::SessionId::normalize(id));
                 }
             }
             Some("token_usage_record") => {
                 if self.session_id.is_empty()
                     && let Some(id) = payload.get("session_id").and_then(Value::as_str)
                 {
-                    self.session_id = Rc::from(events::sanitize_session_id(id).as_str());
+                    self.session_id = Rc::new(events::SessionId::normalize(id));
                 }
             }
             Some("response_item") => match payload.get("type").and_then(Value::as_str) {
@@ -2056,7 +2059,7 @@ fn codex_output_text(payload: &Value) -> String {
 /// hook/plugin pushed into context) back into a `recommendation` event.
 /// This is the transcript-side evidence that a recommendation was delivered.
 fn parse_injected_recommendation(
-    session_id: &str,
+    session_id: &events::SessionId,
     timestamp: &str,
     text: &str,
 ) -> Option<SkillUsageEvent> {
@@ -2221,7 +2224,7 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
                         SkillUsageEvent::prompt_submit(
                             Runtime::Opencode,
                             ObservedVia::Db,
-                            &session_id,
+                            &events::SessionId::normalize(&session_id),
                             &ts,
                             text,
                         ),
@@ -2255,7 +2258,7 @@ fn observe_db(file: &Path, obs: &mut Observation, sessions: &mut SessionSet) -> 
                             SkillUsageEvent::skill_load(
                                 Runtime::Opencode,
                                 ObservedVia::Db,
-                                &session_id,
+                                &events::SessionId::normalize(&session_id),
                                 &ts,
                                 Some(tool.to_string()),
                                 c.skill_name,
@@ -2844,7 +2847,12 @@ mod tests {
     fn injected_recommendation_names_are_capped_during_parse() {
         let names: Vec<String> = (0..10_000).map(|i| format!("skill-{i:05}")).collect();
         let text = format!("skill-graph: 'q' — {}.", names.join(","));
-        let ev = parse_injected_recommendation("s", "2026-01-01T00:00:00Z", &text).expect("event");
+        let ev = parse_injected_recommendation(
+            &crate::events::SessionId::normalize("s"),
+            "2026-01-01T00:00:00Z",
+            &text,
+        )
+        .expect("event");
         assert_eq!(ev.recommended.len(), crate::events::MAX_RECOMMENDED);
     }
 

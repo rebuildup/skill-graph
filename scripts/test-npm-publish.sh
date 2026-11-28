@@ -37,8 +37,31 @@ pack_dir() { # $1=pkgdir $2=out.tgz
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-npmpack.XXXXXX")"
   mkdir -p "$tmp/package"
   cp -r "$1"/. "$tmp/package/"
-  tar -czf "$2" -C "$tmp" package
+  if [ "${FAKE_NPM_BADPACK:-0}" = "1" ]; then
+    # Rename one member to a non-canonical form: "package//evil"
+    # normalizes to package/evil at extraction. The archive gate MUST
+    # reject the artifact before it can be published (#225 r6).
+    printf 'evil\n' > "$tmp/package/evil"
+    tar --transform 's|^package/evil$|package//evil|' -czf "$2" -C "$tmp" package
+  else
+    tar -czf "$2" -C "$tmp" package
+  fi
   rm -rf "$tmp"
+}
+
+# Extract name/version from a packed artifact's manifest — the publish
+# path now ships the fixed .tgz itself, so the stub reads
+# package/package.json out of the tarball.
+artifact_field() { # $1=tgz $2=field — node is guaranteed wherever npm runs
+  tar -xzOf "$1" package/package.json 2>/dev/null | FIELD="$2" node -e '
+    let s = "";
+    process.stdin.on("data", (d) => (s += d)).on("end", () => {
+      try {
+        const v = JSON.parse(s)[process.env.FIELD];
+        if (typeof v === "string") console.log(v);
+      } catch {}
+    });
+  '
 }
 
 case "${1:-}" in
@@ -59,21 +82,36 @@ case "${1:-}" in
     exit 1
     ;;
   publish)
-    dir="$2"
-    name="$(field "$dir" name)"; ver="$(field "$dir" version)"
+    artifact="$2"
+    case "$artifact" in
+      *.tgz) name="$(artifact_field "$artifact" name)"; ver="$(artifact_field "$artifact" version)" ;;
+      *) name="$(field "$artifact" name)"; ver="$(field "$artifact" version)" ;;
+    esac
+    [ -n "$name" ] && [ -n "$ver" ] || { echo "stub npm publish: cannot read manifest" >&2; exit 2; }
     key="$(key_of "$name@$ver")"
     mkdir -p "$root/published" "$root/tarballs"
     if [ "${FAKE_NPM_TAMPER:-0}" = "1" ]; then
-      # Ship content that differs from the local package: the
+      # Ship content that differs from the fixed artifact: the
       # post-publish identity check MUST catch this.
       tamper_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-tamper.XXXXXX")"
-      mkdir -p "$tamper_tmp/package"
-      cp -r "$dir"/. "$tamper_tmp/package/"
+      tar -xzf "$artifact" -C "$tamper_tmp" 2>/dev/null || mkdir -p "$tamper_tmp/package"
       printf 'tampered\n' > "$tamper_tmp/package/tampered.txt"
       tar -czf "$root/tarballs/$key.tgz" -C "$tamper_tmp" package
       rm -rf "$tamper_tmp"
+    elif [ "${FAKE_NPM_BADPACK:-0}" = "1" ] && [[ "$artifact" == *.tgz ]]; then
+      # Repack the artifact dir with a normalization-colliding member
+      # — simulating a corrupted publish payload.
+      rep_tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-repack.XXXXXX")"
+      tar -xzf "$artifact" -C "$rep_tmp"
+      printf 'evil\n' > "$rep_tmp/package/evil"
+      tar --transform 's|^package/evil$|package//evil|' -czf "$root/tarballs/$key.tgz" -C "$rep_tmp" package
+      rm -rf "$rep_tmp"
+    elif [[ "$artifact" == *.tgz ]]; then
+      # The fixed artifact ships byte-identical — what Phase D
+      # verified is what the registry serves.
+      cp "$artifact" "$root/tarballs/$key.tgz"
     else
-      pack_dir "$dir" "$root/tarballs/$key.tgz"
+      pack_dir "$artifact" "$root/tarballs/$key.tgz"
     fi
     echo "$ver" > "$root/published/$key"
     echo "PUBLISH $name@$ver" >> "$root/publish.log"
@@ -91,8 +129,9 @@ case "${1:-}" in
 esac
 SH
 chmod +x "$work/bin/npm"
-# Variant stub whose publish always fails.
+# Variant stub whose publish always fails (matches the whole branch).
 sed 's|^  publish)|  publish) exit 1 ;;|' "$work/bin/npm" > "$work/binfail/npm"
+grep -q 'publish) exit 1' "$work/binfail/npm" || { echo "binfail stub broken" >&2; exit 2; }
 chmod +x "$work/binfail/npm"
 export FAKE_NPM_ROOT="$work/registry"
 
@@ -286,6 +325,72 @@ fi
 [ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
   && ok "order violation prevented ALL publishes" \
   || fail "partial publish on order violation"
+
+echo "== non-canonical packed artifact rejected before ANY publish =="
+reset_registry
+# Stub pack emits a tarball with member "package//evil" — a name that
+# normalizes to package/evil at extraction. Phase D must reject the
+# fixed artifact, so nothing may reach the registry (#225 r6).
+if FAKE_NPM_BADPACK=1 PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out15" 2>&1; then
+  fail "non-canonical packed artifact was published"
+else
+  ok "non-canonical packed artifact rejected"
+  grep -q "non-canonical" "$work/out15" \
+    && ok "rejection names the archive gate" || fail "unclear rejection: $(cat "$work/out15")"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "artifact failure prevented ALL publishes" \
+  || fail "partial publish on artifact failure"
+
+echo "== pkg-preflight: malformed JSON rejected =="
+reset_registry
+mkdir -p pkgBadJson/bin
+printf '{ "name": "@test/bad-json", "version": }\n' > pkgBadJson/package.json
+printf '#!/bin/sh\necho t\n' > pkgBadJson/bin/tool
+chmod +x pkgBadJson/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgBadJson >"$work/out16" 2>&1; then
+  fail "malformed package.json accepted"
+else
+  ok "malformed package.json rejected"
+fi
+
+echo "== pkg-preflight: files[] traversal entry rejected =="
+reset_registry
+mkdir -p pkgEscape/bin
+cat > pkgEscape/package.json <<'JSON'
+{
+  "name": "@test/pkg-escape",
+  "version": "1.0.0",
+  "files": ["bin/tool", "../outside.txt"]
+}
+JSON
+printf '#!/bin/sh\necho t\n' > pkgEscape/bin/tool
+chmod +x pkgEscape/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgEscape >"$work/out17" 2>&1; then
+  fail "files[] traversal entry accepted"
+else
+  ok "files[] traversal entry rejected"
+  grep -q "invalid files" "$work/out17" \
+    && ok "rejection names the bad entry" || fail "unclear rejection"
+fi
+
+echo "== pkg-preflight: non-array files rejected =="
+reset_registry
+mkdir -p pkgFilesStr/bin
+cat > pkgFilesStr/package.json <<'JSON'
+{
+  "name": "@test/pkg-files-str",
+  "version": "1.0.0",
+  "files": "bin/tool"
+}
+JSON
+printf '#!/bin/sh\necho t\n' > pkgFilesStr/bin/tool
+chmod +x pkgFilesStr/bin/tool
+if PATH="$work/bin:$PATH" bash "$PUB" pkgFilesStr >"$work/out18" 2>&1; then
+  fail "non-array files accepted"
+else
+  ok "non-array files rejected"
+fi
 
 echo "== dependency order: dependency first is accepted =="
 reset_registry

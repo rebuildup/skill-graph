@@ -1,0 +1,109 @@
+#!/usr/bin/env node
+// pkg-preflight.mjs — structured package.json preflight for
+// publish-npm.sh. Replaces ad-hoc sed/awk string extraction with a
+// real JSON parser: manifest shape, files[] payload presence, and
+// publish-order constraints are all validated here, BEFORE any
+// `npm pack`/`npm publish` runs (#225 r6).
+//
+// Usage: pkg-preflight.mjs <package-dir> [<package-dir>...]
+//
+// stdout: one "NAME\tVERSION" line per package, in argument order —
+// publish-npm.sh pairs these with the packed artifacts.
+// stderr: one violation per line; exit 1 if ANY check fails.
+//
+// Node is a hard requirement by construction: npm itself is a Node
+// program, so every environment that can run `npm publish` can run
+// this script.
+import { readFileSync, statSync, readdirSync } from "node:fs";
+import { join, isAbsolute } from "node:path";
+
+const dirs = process.argv.slice(2);
+if (dirs.length === 0) {
+  console.error("usage: pkg-preflight.mjs <package-dir>...");
+  process.exit(1);
+}
+
+const fail = (msg) => {
+  console.error(`preflight: ${msg}`);
+  process.exit(1);
+};
+
+const pkgs = dirs.map((dir, i) => {
+  const manifestPath = join(dir, "package.json");
+  let m;
+  try {
+    m = JSON.parse(readFileSync(manifestPath, "utf8"));
+  } catch (e) {
+    fail(`cannot parse ${manifestPath}: ${e.message}`);
+  }
+  if (m === null || typeof m !== "object" || Array.isArray(m)) {
+    fail(`${manifestPath} is not a JSON object`);
+  }
+  const { name, version } = m;
+  if (typeof name !== "string" || name === "") {
+    fail(`${manifestPath}: missing or invalid "name"`);
+  }
+  if (typeof version !== "string" || version === "") {
+    fail(`${manifestPath}: missing or invalid "version"`);
+  }
+
+  // files[]: every declared payload path must exist on disk before
+  // pack — npm silently drops missing entries, shipping a broken
+  // package that only fails at install time (#225 r5). Entries must
+  // be relative paths inside the package: absolute paths and ".."
+  // segments would escape the packed root.
+  if (m.files !== undefined && !Array.isArray(m.files)) {
+    fail(`${manifestPath}: "files" is not an array`);
+  }
+  for (const f of m.files ?? []) {
+    if (typeof f !== "string" || f === "" || isAbsolute(f) || f.split("/").includes("..")) {
+      fail(`${manifestPath}: invalid files[] entry ${JSON.stringify(f)}`);
+    }
+    const p = join(dir, f);
+    let st;
+    try {
+      st = statSync(p);
+    } catch {
+      fail(`required file missing: ${dir}/${f}`);
+    }
+    if (st.isDirectory() && readdirSync(p).length === 0) {
+      fail(`required directory is empty: ${dir}/${f}`);
+    }
+    if (!st.isDirectory() && !st.isFile()) {
+      fail(`required path is not a file or directory: ${dir}/${f}`);
+    }
+  }
+
+  // Publish-order graph: dependencies + optionalDependencies names.
+  // dev/peer deps do not constrain publish order — consumers never
+  // install them.
+  const deps = new Set();
+  for (const key of ["dependencies", "optionalDependencies"]) {
+    const block = m[key];
+    if (block === undefined) continue;
+    if (block === null || typeof block !== "object" || Array.isArray(block)) {
+      fail(`${manifestPath}: "${key}" is not an object`);
+    }
+    for (const dep of Object.keys(block)) deps.add(dep);
+  }
+  return { dir, name, version, deps };
+});
+
+// Order invariant: when two packages in this invocation are related
+// by dependencies/optionalDependencies, the dependency must be
+// published FIRST — a metapackage published before its platform
+// packages would resolve to missing/broken optional deps for early
+// adopters (#225 r5).
+for (let i = 0; i < pkgs.length; i++) {
+  for (const dep of pkgs[i].deps) {
+    const j = pkgs.findIndex((p) => p.name === dep);
+    if (j > i) {
+      fail(
+        `publish order violation: ${pkgs[i].dir} (${pkgs[i].name}) depends on ` +
+          `${dep} but ${pkgs[j].dir} comes later`,
+      );
+    }
+  }
+}
+
+for (const p of pkgs) console.log(`${p.name}\t${p.version}`);

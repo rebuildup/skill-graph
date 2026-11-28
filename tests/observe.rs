@@ -289,10 +289,11 @@ fn rec_event(
     emitted: bool,
 ) -> skill_graph::events::SkillUsageEvent {
     use skill_graph::events::{ObservedVia, RecommendedSkill, Runtime, Trigger};
+    let sid = skill_graph::events::SessionId::normalize(session);
     skill_graph::events::SkillUsageEvent::recommendation(
         Runtime::ClaudeCode,
         ObservedVia::Hook,
-        session,
+        &sid,
         ts,
         None,
         Trigger::PromptSubmit,
@@ -311,10 +312,11 @@ fn rec_event(
 
 fn load_event(session: &str, ts: &str, name: &str) -> skill_graph::events::SkillUsageEvent {
     use skill_graph::events::{Confidence, Detection, ObservedVia, Runtime};
+    let sid = skill_graph::events::SessionId::normalize(session);
     skill_graph::events::SkillUsageEvent::skill_load(
         Runtime::ClaudeCode,
         ObservedVia::Hook,
-        session,
+        &sid,
         ts,
         None,
         Some(name.to_string()),
@@ -408,7 +410,7 @@ fn summary_isolates_sessions_across_runtimes() {
 
     // Empty session id: still counted at top level, absent from by_session.
     let mut no_sid = load_event("", "2026-01-01T00:02:00Z", "gamma");
-    no_sid.session_id = String::new();
+    no_sid.session_id = skill_graph::events::SessionId::default();
     let obs2 = Observation {
         events: vec![no_sid],
         ..Default::default()
@@ -464,16 +466,22 @@ fn summary_reports_errors_and_session_cap() {
     assert_eq!(v["by_session_omitted"], 1);
 }
 
-/// Passthrough events are untrusted log input: session_id is normalized
-/// to the constructor bounds, oversized fields are capped, and a
-/// skill_load with an empty skill_name is counted in lines_skipped
-/// rather than vanishing silently.
+/// Passthrough events are untrusted log input: session_id must already
+/// be normalized contract form — a >128-char or non-charset id fails
+/// deserialization and the line is counted in lines_skipped rather
+/// than re-normalized into a different session (#225 r6). A
+/// skill_load with an empty skill_name is likewise counted in
+/// lines_skipped rather than vanishing silently.
 #[test]
 fn passthrough_normalizes_fields_and_counts_empty_name() {
     let dir = TempDir::new().unwrap();
-    let long_sid = "a".repeat(200);
+    let overlong_sid = "a".repeat(200);
+    let max_sid = "a".repeat(128);
     let event = format!(
-        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{long_sid}","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
+        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{overlong_sid}","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
+    );
+    let kept = format!(
+        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{max_sid}","timestamp":"2026-01-01T00:00:02Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
     );
     write_transcript(
         &dir,
@@ -482,12 +490,14 @@ fn passthrough_normalizes_fields_and_counts_empty_name() {
             event.as_str(),
             // empty skill_name: present but unattributable -> skipped
             r#"{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"s1","timestamp":"2026-01-01T00:00:01Z","observed_via":"hook","skill_name":"","detection":"file_read","confidence":"high"}"#,
+            kept.as_str(),
         ],
     );
     let obs = observe_path(dir.path()).unwrap();
     assert_eq!(obs.events.len(), 1);
-    assert_eq!(obs.lines_skipped, 1);
+    assert_eq!(obs.lines_skipped, 2);
     assert_eq!(obs.events[0].session_id.len(), 128);
+    assert_eq!(obs.events[0].session_id.as_str(), max_sid);
     assert!(
         obs.events[0]
             .session_id
