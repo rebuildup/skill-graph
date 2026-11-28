@@ -9,7 +9,7 @@
     {
       "label": "this repo's skills",
       "skills": 24,
-      "rss_mb": 6.5,
+      "rss_mb": 6.7,
       "kind": "real",
       "command": "discover --root .agents/skills"
     },
@@ -29,7 +29,7 @@
     }
   ],
   "footnotes": [
-    "hook end-to-end: 6.6 MB peak RSS · recommend @500 skills: ~7.0 MB",
+    "hook end-to-end: 6.8 MB peak RSS · recommend @500 skills: ~7.2 MB",
     "measured with /usr/bin/time -v on release build · 20 runs per point, max reported · RSS includes binary + parsed corpus · x-axis: log scale"
   ]
 }
