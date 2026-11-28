@@ -1,7 +1,7 @@
 # v0.5.0 README/SVG 用パフォーマンス・評価エビデンス
 
 Issue: #213。README の性能・精度・効率セクションと `assets/readme/*.svg` の
-データソース。全て release-0-5-0 最終候補 @ `074e6ab` (#225 第7回レビュー対応後、
+データソース。全て release-0-5-0 最終候補 @ `e9e1fc7` (#225 第8回レビュー対応後、
 PR merge 前の ticket head) の release build で実測した。
 
 ## 測定環境
@@ -34,21 +34,21 @@ n=5 では p95 の順位統計量が max に退化していたため。単位 ms
 
 | skills | cold_discover | cold_build | cold_total | warm p50 | warm p95 | warm max | process p50 | process p95 | process max |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 50  | 0.77 | 0.17 | 0.94  | 0.084 | 0.119 | 0.137 | 1.81 | 2.13  | 2.15  |
-| 100 | 1.40 | 0.34 | 1.74  | 0.169 | 0.307 | 0.400 | 3.02 | 3.70  | 4.52  |
-| 200 | 3.25 | 0.69 | 3.94  | 0.342 | 0.435 | 0.545 | 5.25 | 6.20  | 6.99  |
-| 500 | 7.28 | 1.77 | 9.06  | 0.828 | 1.041 | 1.402 | 12.82| 14.56 | 14.82 |
+| 50  | 0.76 | 0.17 | 0.92  | 0.085 | 0.122 | 0.148 | 1.93 | 2.25  | 2.28  |
+| 100 | 1.28 | 0.31 | 1.60  | 0.167 | 0.189 | 0.203 | 2.76 | 3.32  | 3.45  |
+| 200 | 2.78 | 0.73 | 3.52  | 0.357 | 0.379 | 0.409 | 4.57 | 5.58  | 5.95  |
+| 500 | 6.67 | 1.67 | 8.34  | 0.841 | 1.063 | 1.114 | 10.66| 11.63 | 11.89 |
 
 filesystem cache 状態で cold_total は ±20% 程度変動する
-(500 skills で ~8–11ms)。表は最終候補での実測値 (1 run)。
+(500 skills で ~7–9ms)。表は最終候補での実測値 (1 run)。
 
 読み方:
 
-- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~9ms。
+- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~8ms。
 - **warm recommend はサブミリ秒〜1ms 未満** — グラフ構築は cold のみ、
-  推薦は常駐不要の都度プロセスで p95 ~1.0ms (500 skills)。
-- **process p95 (CLI spawn 込み) は 500 skills で ~15ms** (30 samples、
-  max 14.8ms) — hook として実用上無視できるレイテンシ。
+  推薦は常駐不要の都度プロセスで p95 ~1.1ms (500 skills)。
+- **process p95 (CLI spawn 込み) は 500 skills で ~12ms** (30 samples、
+  max 11.9ms) — hook として実用上無視できるレイテンシ。
 
 ## 2. 推薦精度 (`skill-graph bench evals/dataset/cases.jsonl`)
 
@@ -81,22 +81,22 @@ RSS は `/usr/bin/time -v` の "Maximum resident set size" を**各点 20 回
 
 ### 3a. このリポジトリの開発スキル群 (`.agents/skills`, 24 skills)
 
-- `discover`: **Maximum RSS 6.6 MB** (20 runs、観測範囲 6.4–6.6)
+- `discover`: **Maximum RSS 6.5 MB** (20 runs、観測範囲 6.2–6.5)
 - 実際の第三者製 Agent Skills (aude-skills / writing-skills /
   mattpocock/skills / design-skills 由来、keywords 非依存が大半) を含む。
 
 ### 3b. design-skills リポジトリ (`skills/`, 88 skills)
 
-- `discover`: **Maximum RSS 7.4 MB** (20 runs、観測範囲 7.0–7.4)
+- `discover`: **Maximum RSS 7.3 MB** (20 runs、観測範囲 7.0–7.3)
 - 公開されている実在の大規模スキルコーパスでの動作確認。
 
 ### 3c. 合成 500 skills コーパス (`/tmp/corpus500`、perf と同規模)
 
-- `discover`: **Maximum RSS 7.0 MB** (20 runs、観測範囲 6.6–7.0)
+- `discover`: **Maximum RSS 7.1 MB** (20 runs、観測範囲 6.6–7.1)
 - `recommend --root /tmp/corpus500 "performance testing"`: **Maximum
-  RSS 7.2 MB** (20 runs)
+  RSS 7.1 MB** (20 runs)
 
-メモリはコーパス 24→88→500 skills で 6.6→7.4→7.0 MB と**ほぼ一定**
+メモリはコーパス 24→88→500 skills で 6.5→7.3→7.1 MB と**ほぼ一定**
 (パース済み構造が小さいため)。常駐プロセスがないので、コストは呼び出し
 ごとのプロセス起動 + 都度 discovery に限定される。
 
@@ -107,7 +107,7 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
   | ./target/release/skill-graph hook claude-code prompt
 ```
 
-- wall <10ms、**Maximum RSS 6.9 MB** (20 runs、観測範囲 6.5–6.9)
+- wall <10ms、**Maximum RSS 6.8 MB** (20 runs、観測範囲 6.5–6.8)
 - fail-open 設計: 常に exit 0、hook 失敗がエージェントを阻害しない
 - イベントは `~/.local/state/skill-graph/events.jsonl` に append
   (prompt 本文は SHA-256 hash のみ — contracts.md の privacy 契約)
@@ -123,12 +123,12 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
 ## 6. アーキテクチャ上の帰結 (README 記載の根拠)
 
 - **永続キャッシュ・常駐サービス不要**: グラフは呼び出しごとにオンメモリ構築。
-  cold でも 500 skills で ~9ms、warm recommend は ~1ms。
+  cold でも 500 skills で ~8ms、warm recommend は ~1.1ms。
   デーモン・DB・index ファイルの運用コストがゼロ。
 - **プロセスモデル**: 各呼び出しは独立プロセス。state は event log
   (append-only JSONL) のみで、クラッシュしても推薦経路に影響しない。
 - **スケーラビリティ**: discovery が支配的コストだが線形かつ小さい。
-  500 skills ≈ 実用上の上限想定を大きく超える規模でも ~9ms。
+  500 skills ≈ 実用上の上限想定を大きく超える規模でも ~8ms。
 
 ## 7. SVG データソース
 
