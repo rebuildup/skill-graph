@@ -10,7 +10,7 @@
     "optional_total": 31,
     "recommended_total": 88,
     "empty_recommendations": 6,
-    "elapsed_ms": 33,
+    "elapsed_ms": 30,
     "max": 3,
     "required_recall": 1.0,
     "required_recall_at3": 1.0,

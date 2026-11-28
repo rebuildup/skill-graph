@@ -135,7 +135,7 @@ const pkgs = dirs.map((dir, i) => {
     }
     for (const dep of Object.keys(block)) deps.add(dep);
   }
-  return { dir, name, version, deps, files: m.files ?? [], binTargets };
+  return { dir, name, version, deps, files: m.files ?? [], binTargets, manifest: m };
 });
 
 // Order invariant: when two packages in this invocation are related
@@ -156,8 +156,12 @@ for (let i = 0; i < pkgs.length; i++) {
 }
 
 for (const p of pkgs) {
-  // FILES_JSON and BIN_JSON are compact JSON — no literal tabs.
+  // FILES_JSON / BIN_JSON / EXPECTED_JSON are compact JSON — no
+  // literal tabs. EXPECTED_JSON is the ENTIRE manifest: Phase D
+  // deep-compares the artifact's package.json against it, so a pack
+  // that drifted in bin/files/deps — not just name/version — is
+  // caught before publish (#225 r9).
   console.log(
-    `${p.name}\t${p.version}\t${JSON.stringify(p.files)}\t${JSON.stringify(p.binTargets)}`,
+    `${p.name}\t${p.version}\t${JSON.stringify(p.files)}\t${JSON.stringify(p.binTargets)}\t${JSON.stringify(p.manifest)}`,
   );
 }

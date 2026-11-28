@@ -34,21 +34,21 @@ n=5 では p95 の順位統計量が max に退化していたため。単位 ms
 
 | skills | cold_discover | cold_build | cold_total | warm p50 | warm p95 | warm max | process p50 | process p95 | process max |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 50  | 0.76 | 0.17 | 0.92  | 0.085 | 0.122 | 0.148 | 1.93 | 2.25  | 2.28  |
-| 100 | 1.28 | 0.31 | 1.60  | 0.167 | 0.189 | 0.203 | 2.76 | 3.32  | 3.45  |
-| 200 | 2.78 | 0.73 | 3.52  | 0.357 | 0.379 | 0.409 | 4.57 | 5.58  | 5.95  |
-| 500 | 6.67 | 1.67 | 8.34  | 0.841 | 1.063 | 1.114 | 10.66| 11.63 | 11.89 |
+| 50  | 0.83 | 0.16 | 0.99  | 0.089 | 0.132 | 0.133 | 1.87 | 2.16  | 2.29  |
+| 100 | 1.42 | 0.31 | 1.73  | 0.155 | 0.179 | 0.193 | 2.76 | 3.68  | 3.71  |
+| 200 | 2.82 | 0.66 | 3.49  | 0.339 | 0.461 | 0.526 | 4.84 | 5.48  | 7.24  |
+| 500 | 7.25 | 1.65 | 8.90  | 0.836 | 0.953 | 1.008 | 12.47| 14.02 | 14.52 |
 
 filesystem cache 状態で cold_total は ±20% 程度変動する
 (500 skills で ~7–9ms)。表は最終候補での実測値 (1 run)。
 
 読み方:
 
-- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~8ms。
+- **cold_total はほぼ線形** (50→500 で約 9 倍)。500 skills でも ~9ms。
 - **warm recommend はサブミリ秒〜1ms 未満** — グラフ構築は cold のみ、
-  推薦は常駐不要の都度プロセスで p95 ~1.1ms (500 skills)。
-- **process p95 (CLI spawn 込み) は 500 skills で ~12ms** (30 samples、
-  max 11.9ms) — hook として実用上無視できるレイテンシ。
+  推薦は常駐不要の都度プロセスで p95 ~1.0ms (500 skills)。
+- **process p95 (CLI spawn 込み) は 500 skills で ~14ms** (30 samples、
+  max 14.5ms) — hook として実用上無視できるレイテンシ。
 
 ## 2. 推薦精度 (`skill-graph bench evals/dataset/cases.jsonl`)
 
@@ -81,7 +81,7 @@ RSS は `/usr/bin/time -v` の "Maximum resident set size" を**各点 20 回
 
 ### 3a. このリポジトリの開発スキル群 (`.agents/skills`, 24 skills)
 
-- `discover`: **Maximum RSS 6.5 MB** (20 runs、観測範囲 6.2–6.5)
+- `discover`: **Maximum RSS 6.6 MB** (20 runs、観測範囲 6.2–6.6)
 - 実際の第三者製 Agent Skills (aude-skills / writing-skills /
   mattpocock/skills / design-skills 由来、keywords 非依存が大半) を含む。
 
@@ -92,11 +92,11 @@ RSS は `/usr/bin/time -v` の "Maximum resident set size" を**各点 20 回
 
 ### 3c. 合成 500 skills コーパス (`/tmp/corpus500`、perf と同規模)
 
-- `discover`: **Maximum RSS 7.1 MB** (20 runs、観測範囲 6.6–7.1)
+- `discover`: **Maximum RSS 7.0 MB** (20 runs、観測範囲 6.6–7.0)
 - `recommend --root /tmp/corpus500 "performance testing"`: **Maximum
-  RSS 7.1 MB** (20 runs)
+  RSS 7.2 MB** (20 runs、観測範囲 6.7–7.2)
 
-メモリはコーパス 24→88→500 skills で 6.5→7.3→7.1 MB と**ほぼ一定**
+メモリはコーパス 24→88→500 skills で 6.6→7.3→7.0 MB と**ほぼ一定**
 (パース済み構造が小さいため)。常駐プロセスがないので、コストは呼び出し
 ごとのプロセス起動 + 都度 discovery に限定される。
 
@@ -107,7 +107,7 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
   | ./target/release/skill-graph hook claude-code prompt
 ```
 
-- wall <10ms、**Maximum RSS 6.8 MB** (20 runs、観測範囲 6.5–6.8)
+- wall <10ms、**Maximum RSS 6.7 MB** (20 runs、観測範囲 5.3–6.7)
 - fail-open 設計: 常に exit 0、hook 失敗がエージェントを阻害しない
 - イベントは `~/.local/state/skill-graph/events.jsonl` に append
   (prompt 本文は SHA-256 hash のみ — contracts.md の privacy 契約)
@@ -123,12 +123,12 @@ echo '{"hook_event_name":"UserPromptSubmit","prompt":"test performance"}' \
 ## 6. アーキテクチャ上の帰結 (README 記載の根拠)
 
 - **永続キャッシュ・常駐サービス不要**: グラフは呼び出しごとにオンメモリ構築。
-  cold でも 500 skills で ~8ms、warm recommend は ~1.1ms。
+  cold でも 500 skills で ~9ms、warm recommend は ~1.0ms。
   デーモン・DB・index ファイルの運用コストがゼロ。
 - **プロセスモデル**: 各呼び出しは独立プロセス。state は event log
   (append-only JSONL) のみで、クラッシュしても推薦経路に影響しない。
 - **スケーラビリティ**: discovery が支配的コストだが線形かつ小さい。
-  500 skills ≈ 実用上の上限想定を大きく超える規模でも ~8ms。
+  500 skills ≈ 実用上の上限想定を大きく超える規模でも ~9ms。
 
 ## 7. SVG データソース
 

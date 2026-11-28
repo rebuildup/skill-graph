@@ -18,22 +18,22 @@ arch_ok() {
   local out="$2"
   case "$1" in
     # The architecture is the token file(1) prints IMMEDIATELY after
-    # the object-type phrase ("pie executable, x86-64,", "shared
-    # object, ARM aarch64,"). A bare substring match is exploitable:
-    # an aarch64 binary whose interpreter is /lib64/ld-linux-x86-64.so.2
-    # contains "x86-64" and would pass linux-x64 (#225 r8 — caught by
-    # the e2e wrong-arch fixture).
+    # the object-type phrase ("pie executable, x86-64,"). A bare
+    # substring match is exploitable twice over (#225 r8/r9): an
+    # aarch64 binary whose interpreter is /lib64/ld-linux-x86-64.so.2
+    # contains "x86-64", and "shared object, x86-64" is a LINK INPUT,
+    # not a runnable bin — only "executable," positions count.
     linux-x64)
-      [[ "$out" == *ELF* && ( "$out" == *"executable, x86-64"* || "$out" == *"object, x86-64"* ) ]]
+      [[ "$out" == *ELF* && "$out" == *executable* && "$out" != *"shared object"* && "$out" == *"executable, x86-64"* ]]
       ;;
     linux-arm64)
-      [[ "$out" == *ELF* && ( "$out" == *"executable, ARM aarch64"* || "$out" == *"object, ARM aarch64"* ) ]]
+      [[ "$out" == *ELF* && "$out" == *executable* && "$out" != *"shared object"* && "$out" == *"executable, ARM aarch64"* ]]
       ;;
     darwin-x64)
-      [[ "$out" == *Mach-O* && "$out" == *x86_64* ]]
+      [[ "$out" == *Mach-O* && "$out" == *executable* && "$out" != *"shared library"* && "$out" == *x86_64* ]]
       ;;
     darwin-arm64)
-      [[ "$out" == *Mach-O* && "$out" == *arm64* ]]
+      [[ "$out" == *Mach-O* && "$out" == *executable* && "$out" != *"shared library"* && "$out" == *arm64* ]]
       ;;
     *)
       return 2
@@ -62,6 +62,10 @@ self_test() {
   check "x86-64 ELF w/ aarch64 interp REJECTED arm" 0 linux-arm64 "$elf_x64, interpreter /lib/ld-linux-aarch64.so.1"
   check "x86-64 ELF REJECTED for linux-arm64"      0 linux-arm64  "$elf_x64"
   check "aarch64 ELF REJECTED for linux-x64"       0 linux-x64    "$elf_arm"
+  # Shared objects are link inputs, not runnable bins (#225 r9).
+  check "x86-64 shared object REJECTED"            0 linux-x64    'ELF 64-bit LSB shared object, x86-64, version 1 (SYSV)'
+  check "aarch64 shared object REJECTED arm"       0 linux-arm64  'ELF 64-bit LSB shared object, ARM aarch64, version 1 (SYSV)'
+  check "x86_64 dylib REJECTED darwin"             0 darwin-x64   'Mach-O 64-bit dynamically linked shared library x86_64'
   check "arm64 Mach-O accepted for darwin-arm64"   1 darwin-arm64 "$macho_arm"
   check "x86_64 Mach-O accepted for darwin-x64"    1 darwin-x64   "$macho_x64"
   check "arm64 Mach-O REJECTED for darwin-x64"     0 darwin-x64   "$macho_arm"

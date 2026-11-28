@@ -20,16 +20,21 @@
 set -euo pipefail
 
 # exec_ok <file-output> — pure predicate, no I/O. Accepts ELF
-# executables/shared objects/pie, Mach-O binaries, and anything
-# file(1) identifies as a script (shebang present). Rejects text,
-# data, empty, and unclassified output.
+# executables (pie or not), Mach-O executables, and anything file(1)
+# identifies as a script (shebang present). Shared objects/dylibs and
+# relocatables are link inputs, NOT runnable bins, and are rejected
+# (#225 r9). Rejects text, data, empty, and unclassified output.
 exec_ok() {
   local out="$1"
   # file(1) appends "corrupted ..." to otherwise-executable-looking
   # descriptions; a truncated download must not pass on keywords alone.
   [[ "$out" == *corrupt* ]] && return 1
-  [[ "$out" == *ELF* && ( "$out" == *executable* || "$out" == *"shared object"* || "$out" == *"pie executable"* ) ]] && return 0
-  [[ "$out" == *Mach-O* ]] && return 0
+  # ELF: must be an EXECUTABLE object — "shared object" (.so) and
+  # "relocatable" (.o) are link inputs, not runnable bins (#225 r9:
+  # the old predicate accepted shared objects explicitly).
+  [[ "$out" == *ELF* && "$out" == *executable* && "$out" != *"shared object"* && "$out" != *relocatable* ]] && return 0
+  # Mach-O: same rule — a dylib ("shared library") is not a bin.
+  [[ "$out" == *Mach-O* && "$out" == *executable* && "$out" != *"shared library"* ]] && return 0
   [[ "$out" == *script* ]] && return 0
   return 1
 }
@@ -45,8 +50,11 @@ self_test() {
     fails=$((fails + 1))
   }
   check "ELF pie executable accepted"        1 'ELF 64-bit LSB pie executable, x86-64, version 1 (SYSV), dynamically linked'
-  check "ELF shared object accepted"         1 'ELF 64-bit LSB shared object, x86-64, version 1 (SYSV)'
+  check "ELF executable accepted"            1 'ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked'
+  check "ELF shared object REJECTED"         0 'ELF 64-bit LSB shared object, x86-64, version 1 (SYSV)'
+  check "ELF relocatable REJECTED"           0 'ELF 64-bit LSB relocatable, x86-64, version 1 (SYSV)'
   check "Mach-O executable accepted"         1 'Mach-O 64-bit executable arm64'
+  check "Mach-O dylib REJECTED"              0 'Mach-O 64-bit dynamically linked shared library arm64'
   check "env-node script accepted"           1 'a /usr/bin/env node script, ASCII text executable'
   check "shell script accepted"              1 'POSIX shell script, ASCII text executable'
   check "plain text REJECTED"                0 'ASCII text'
