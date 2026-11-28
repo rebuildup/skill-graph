@@ -4,6 +4,15 @@ on:
     branches: [main, "release-*"]
     tags: ["v*"]
   pull_request:
+    # #225 F08: the 4-target build/package/install/attest matrix is the
+    # FREEZE path, not the per-ticket gate. Ticket PRs (base release-*)
+    # run the lightweight ci.yml suite; this workflow runs on release
+    # pushes, tags, release-integration PRs (base main), and manual
+    # dispatch — verification is aggregated where the freeze candidate
+    # is formed. NOTE: manifest identity requires event=push, so a
+    # dispatch run verifies but can never be promoted.
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -99,7 +108,7 @@ jobs:
           # these bytes — an arbitrary later successful run cannot be
           # substituted (#225 r11).
           cat > freeze/freeze-meta.json <<EOF
-          {"workflow":"artifact-verify.yml","head_sha":"$GITHUB_SHA","run_id":"$GITHUB_RUN_ID","run_attempt":"$GITHUB_RUN_ATTEMPT","target":"${{ matrix.target }}","npm_target":"${{ matrix.npm_target }}","asset":"$asset","sha256":"$digest"}
+          {"workflow":"artifact-verify.yml","head_sha":"$GITHUB_SHA","run_id":$GITHUB_RUN_ID,"run_attempt":$GITHUB_RUN_ATTEMPT,"target":"${{ matrix.target }}","npm_target":"${{ matrix.npm_target }}","asset":"$asset","sha256":"$digest"}
           EOF
           # Self-check: the digest file must match the artifact.
           (cd freeze && shasum -a 256 -c "$asset.sha256" 2>/dev/null \
@@ -138,6 +147,14 @@ jobs:
           pattern: frozen-*
           path: frozen
           merge-multiple: false
+      - name: Eval gate (freeze acceptance, #225 G04)
+        # recall/forbidden regressions on the release dataset block
+        # the freeze — promotion consumes only manifests produced
+        # after this gate passed.
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          scripts/check-eval-gate.sh ./target/debug/skill-graph
       - name: Aggregate frozen artifacts into the approved manifest
         id: manifest
         run: |

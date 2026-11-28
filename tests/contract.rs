@@ -31,6 +31,14 @@ fn assert_skill_summary(value: &Value) {
         .and_then(Value::as_str)
         .expect("availability");
     assert!(matches!(availability, "available" | "parse_error"));
+    // #225 B07: spec conformance is a separate axis from parse errors.
+    assert!(
+        value
+            .get("spec_violations")
+            .and_then(Value::as_array)
+            .is_some(),
+        "missing spec_violations"
+    );
 }
 
 #[test]

@@ -84,6 +84,12 @@ bad()  { echo "FAIL: $1" >&2; fails=$((fails + 1)); }
 # context (or none) cannot pass.
 hook_corpus() {
   local bin="$1" sess="$2" i=0 out expected fails=0 prompt want
+  # Corpus isolation (#225 F04): pin the skill roots to THIS repo's
+  # canonical skill dir (.agents/skills — .claude/.devin entries are
+  # symlinks into it) so HOME-level or runtime-specific skills cannot
+  # change the expected recommendation lists. Without this the same
+  # binary could pass or fail depending on the runner's HOME.
+  export SKILL_GRAPH_ROOTS="$root/.agents/skills"
   while IFS=$'\t' read -r prompt want; do
     [ -n "$prompt" ] || continue
     i=$((i + 1))
@@ -107,6 +113,120 @@ check for security vulnerabilities	security-maintenance
 create a new agent skill	skill-selection, system-quality
 write documentation for the new API	onboarding
 CORPUS
+  [ "$fails" -eq 0 ]
+}
+
+# interface_smoke <bin> — every PUBLIC interface on the installed
+# artifact, not just the hook path (#225 F03): discover/resolve/
+# recommend/deps JSON contracts, the MCP stdio server, and adapter
+# status must all work from the packaged bytes. Roots are pinned to
+# the repo's canonical skills (same isolation as hook_corpus).
+interface_smoke() {
+  local bin="$1" i=0 fails=0
+  export SKILL_GRAPH_ROOTS="$root/.agents/skills"
+  i=$((i + 1))
+  "$bin" discover --format json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert isinstance(d.get("skills"),list) and d["skills"], "empty skills"
+s=d["skills"][0]
+for k in ("name","description","path","root","digest","availability","spec_violations"):
+    assert k in s, f"missing {k}"
+' || { echo "interface[$i] discover contract failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  "$bin" resolve code-review --format json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d.get("kind") in ("name","path"), d
+' || { echo "interface[$i] resolve failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  "$bin" recommend "please review this pull request" --format json 2>/dev/null \
+    | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+recs=d.get("recommendations") if isinstance(d,dict) else d
+assert isinstance(recs,list) and recs, "no recommendations"
+assert any(r["skill"]["name"]=="code-review" for r in recs), [r["skill"]["name"] for r in recs]
+' || { echo "interface[$i] recommend failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  "$bin" deps code-review --format json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert isinstance(d,list), d
+' || { echo "interface[$i] deps failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  printf '%s\n%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"verify","version":"0"}}}' \
+    '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    | "$bin" mcp 2>/dev/null | python3 -c '
+import json,sys
+tools=None
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    m=json.loads(line)
+    r=m.get("result") or {}
+    if isinstance(r.get("tools"),list): tools={t["name"] for t in r["tools"]}
+assert tools and {"recommend","discover","resolve"} <= tools, tools
+' || { echo "interface[$i] mcp tools/list failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  "$bin" adapter status claude-code >/dev/null 2>&1 \
+    || { echo "interface[$i] adapter status failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  obs_dir="$tmp/obs-empty-$$"
+  mkdir -p "$obs_dir"
+  "$bin" observe "$obs_dir" --summary 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for k in ("sessions","recommendations","emitted_recommendations","delivery_rate_pct","events"):
+    assert k in d, f"missing {k}"
+' || { echo "interface[$i] observe --summary failed" >&2; fails=$((fails + 1)); }
+
+  i=$((i + 1))
+  "$bin" resolve definitely-not-a-skill --format json 2>/dev/null | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+assert d.get("kind")=="unresolved", d
+' || { echo "interface[$i] resolve unresolved contract failed" >&2; fails=$((fails + 1)); }
+
+  # adapter lifecycle in an isolated HOME: enable writes config,
+  # status reports it, disable removes the managed hook — the full
+  # install/modify/remove cycle on the packaged binary (#225 F03).
+  i=$((i + 1))
+  iso_home="$tmp/iso-home-$$"
+  mkdir -p "$iso_home"
+  if HOME="$iso_home" "$bin" adapter enable claude-code --user >/dev/null 2>&1 \
+     && HOME="$iso_home" "$bin" adapter status claude-code --user >/dev/null 2>&1 \
+     && [ -s "$iso_home/.claude/settings.json" ]; then
+    if HOME="$iso_home" "$bin" adapter disable claude-code --user >/dev/null 2>&1; then
+      # disable removes the managed hook; when nothing else remains
+      # it may delete settings.json entirely — both are clean states.
+      if [ -f "$iso_home/.claude/settings.json" ]; then
+        python3 -c '
+import json,sys
+s=json.load(open(sys.argv[1]))
+hooks=json.dumps(s.get("hooks",{}))
+assert "skill-graph" not in hooks, hooks
+' "$iso_home/.claude/settings.json" \
+          && ok "interface[$i] adapter enable/status/disable lifecycle" \
+          || { echo "interface[$i] adapter disable left managed hook" >&2; fails=$((fails + 1)); }
+      else
+        ok "interface[$i] adapter enable/status/disable lifecycle"
+      fi
+    else
+      echo "interface[$i] adapter disable failed" >&2; fails=$((fails + 1));
+    fi
+  else
+    echo "interface[$i] adapter enable/status failed" >&2; fails=$((fails + 1));
+  fi
+
   [ "$fails" -eq 0 ]
 }
 
@@ -169,6 +289,17 @@ if cargo package --allow-dirty --locked >/dev/null 2>&1; then
       hook_corpus "$cbin" "verify-crate-$$-$RANDOM" \
         && ok "crate install hook corpus (5 prompts)" \
         || bad "crate install hook output"
+      interface_smoke "$cbin" \
+        && ok "crate install public interfaces (discover/resolve/recommend/deps/mcp/adapter)" \
+        || bad "crate install interface smoke"
+      # Upgrade path: reinstalling over an existing install must
+      # succeed and leave a working binary (#225 F03).
+      if cargo install --path "$pkg_dir" --root "$cargo_root" --locked >/dev/null 2>&1 \
+         && [ "$("$cbin" --version)" = "skill-graph $version" ]; then
+        ok "crate reinstall (upgrade path)"
+      else
+        bad "crate reinstall (upgrade path)"
+      fi
       cargo uninstall --root "$cargo_root" skill-graph >/dev/null 2>&1 \
         && [ ! -e "$cbin" ] \
         && ok "crate uninstall lifecycle" \
@@ -225,6 +356,18 @@ if npm install --prefix "$npm_inst" \
   hook_corpus "$shim" "verify-npm-$$-$RANDOM" \
     && ok "npm install hook corpus (5 prompts)" \
     || bad "npm install hook output"
+  interface_smoke "$shim" \
+    && ok "npm install public interfaces" \
+    || bad "npm install interface smoke"
+  # Upgrade path: reinstalling the same tgz set over the existing
+  # install must succeed and keep the shim working (#225 F03).
+  if npm install --prefix "$npm_inst" \
+       "$npm_tmp/plat/$plat_tgz" "$npm_tmp/meta/$meta_tgz" >/dev/null 2>&1 \
+     && [ "$("$shim" --version 2>/dev/null)" = "skill-graph $version" ]; then
+    ok "npm reinstall (upgrade path)"
+  else
+    bad "npm reinstall (upgrade path)"
+  fi
   # Lifecycle: uninstall must remove the shim AND the payload.
   npm uninstall --prefix "$npm_inst" "$meta_name" "$plat_name" >/dev/null 2>&1 || true
   { [ ! -e "$shim" ] && [ ! -d "$npm_inst/node_modules/$plat_name" ]; } \
@@ -286,6 +429,9 @@ EOF
       hook_corpus "$bbin" "verify-brew-$$-$RANDOM" \
         && ok "brew install hook corpus (5 prompts)" \
         || bad "brew install hook output"
+      interface_smoke "$bbin" \
+        && ok "brew install public interfaces" \
+        || bad "brew install interface smoke"
       HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall "$tap_name/skill-graph" >/dev/null 2>&1 \
         && [ ! -e "$bbin" ] \
         && ok "brew uninstall lifecycle" \

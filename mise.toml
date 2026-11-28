@@ -22,5 +22,32 @@ description = "Run synthetic corpus performance benchmark"
 run = "cargo run --quiet --bin skill-graph -- perf"
 
 [tasks.check]
-description = "Run formatting check, lint, and tests"
-run = ["cargo fmt --all -- --check", "cargo clippy --all-targets -- -D warnings", "cargo test"]
+description = "Run the full local gate: fmt, clippy, cargo+bun tests, release-script tests"
+# #225 F07: `check` covers every LOCAL correctness gate — Rust
+# fmt/clippy/test, the embedded plugin's bun contract tests, and the
+# release-path shell suites. It does NOT cover network-dependent or
+# freeze-time verification: plugin host-API typecheck
+# (scripts/check-plugin-types.sh), 4-target packaging/install
+# (artifact-verify.yml), benchmarks/evals (mise run bench/perf),
+# and publish flows — those run in CI / at freeze.
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+  "bun test src/assets/opencode-plugin.test.ts",
+  "bash scripts/test-release-verify.sh",
+  "bash scripts/test-freeze-manifest.sh",
+  "bash scripts/test-publish-release.sh",
+  "bash scripts/test-npm-publish.sh",
+]
+
+[tasks.check-eval]
+description = "Run the release eval dataset and enforce freeze thresholds (#225 G04)"
+run = [
+  "cargo build --locked",
+  "bash scripts/check-eval-gate.sh ./target/debug/skill-graph",
+]
+
+[tasks.check-plugin-types]
+description = "Type-check the OpenCode plugin against real @opencode/plugin types (network)"
+run = "bash scripts/check-plugin-types.sh"

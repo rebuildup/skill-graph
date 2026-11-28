@@ -1,4 +1,5 @@
 use skill_graph::discovery::discover;
+use skill_graph::model::Availability;
 use skill_graph::parser::parse_skill;
 use skill_graph::resolver::build;
 use skill_graph::search::recommend;
@@ -460,17 +461,21 @@ fn cjk_key_plus_particle_cannot_self_admit() {
 
 /// Round-13: a parse-error skill must never admit — including via the
 /// exact-name path — so it cannot seed requires-propagation for a
-/// dependency it declares.
+/// dependency it declares. #225 B07 split spec violations out of
+/// parse_error: a skill with an invalid frontmatter name is now
+/// compatibility-accepted (sanitized name + spec_violations) and its
+/// requires declarations work normally — this test uses a hard parse
+/// failure (broken YAML) for the exclusion guarantee instead.
 #[test]
 fn parse_error_skill_cannot_seed_requires() {
     let temp = tempfile::tempdir().unwrap();
-    // Dir fallback yields the valid name "bad-deploy" while the
-    // frontmatter name violates the spec charset -> parse_error set.
     let bad = temp.path().join("bad-deploy");
     fs::create_dir_all(&bad).unwrap();
+    // Broken YAML frontmatter: parse_error set, no metadata survives,
+    // so no requires link can exist — the skill is fully excluded.
     fs::write(
         bad.join("SKILL.md"),
-        "---\nname: \"bad\\ndeploy\"\ndescription: d\nmetadata:\n  requires-skills: victim-skill\n---\n\nbody\n",
+        "---\nname: [unclosed\ndescription: d\n---\n\nbody\n",
     )
     .unwrap();
     write_skill_md(
@@ -485,4 +490,115 @@ fn parse_error_skill_cannot_seed_requires() {
         recs.iter().all(|r| r.skill.name != "victim-skill"),
         "parse-error skill must not admit its requires target: {recs:?}"
     );
+}
+
+/// #225 B07: spec violations are compatibility-accepted — the skill
+/// stays discoverable/recommendable under a sanitized name with the
+/// violation recorded, distinct from a hard parse error.
+#[test]
+fn spec_violations_are_compat_accepted_not_parse_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    // Dir fallback yields the valid name "bad-deploy"; the frontmatter
+    // name contains a newline (spec charset violation).
+    let bad = temp.path().join("bad-deploy");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(
+        bad.join("SKILL.md"),
+        "---\nname: \"bad\\ndeploy\"\ndescription: bad deploy helper\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Consecutive hyphens violate the current spec name rule.
+    let hyph = temp.path().join("hyph");
+    fs::create_dir_all(&hyph).unwrap();
+    fs::write(
+        hyph.join("SKILL.md"),
+        "---\nname: foo--bar\ndescription: d\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Declared name valid but != directory name.
+    let mismatched = temp.path().join("real-dir");
+    fs::create_dir_all(&mismatched).unwrap();
+    fs::write(
+        mismatched.join("SKILL.md"),
+        "---\nname: other-name\ndescription: d\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Missing description.
+    let nodesc = temp.path().join("nodesc");
+    fs::create_dir_all(&nodesc).unwrap();
+    fs::write(nodesc.join("SKILL.md"), "---\nname: nodesc\n---\n\nbody\n").unwrap();
+
+    let graph = build(discover(&[temp.path().to_path_buf()]));
+    let bad = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&bad))
+        .unwrap();
+    assert_eq!(bad.name, "bad-deploy", "sanitized to dir fallback");
+    assert!(bad.parse_error.is_none());
+    assert!(
+        bad.spec_violations
+            .iter()
+            .any(|v| v.contains("skill-name spec")),
+        "{:?}",
+        bad.spec_violations
+    );
+
+    let hyph = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&hyph))
+        .unwrap();
+    // "foo--bar" is spec-invalid: sanitized to the valid dir name.
+    assert_eq!(hyph.name, "hyph");
+    assert!(hyph.parse_error.is_none());
+    assert!(
+        hyph.spec_violations
+            .iter()
+            .any(|v| v.contains("skill-name spec")),
+        "{:?}",
+        hyph.spec_violations
+    );
+
+    let mismatched = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&mismatched))
+        .unwrap();
+    assert_eq!(mismatched.name, "other-name");
+    assert!(mismatched.parse_error.is_none());
+    assert!(
+        mismatched
+            .spec_violations
+            .iter()
+            .any(|v| v.contains("parent directory")),
+        "{:?}",
+        mismatched.spec_violations
+    );
+
+    let nodesc = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&nodesc))
+        .unwrap();
+    assert!(nodesc.parse_error.is_none());
+    assert!(
+        nodesc
+            .spec_violations
+            .iter()
+            .any(|v| v.contains("description")),
+        "{:?}",
+        nodesc.spec_violations
+    );
+
+    // Compat acceptance: spec-violating skills remain recommendable.
+    let recs = recommend(&graph, "bad deploy helper", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "bad-deploy"),
+        "compat-accepted skill must be recommendable: {recs:?}"
+    );
+    // And the violation is visible on the wire summary.
+    let summary = bad.summary();
+    assert!(!summary.spec_violations.is_empty());
+    assert!(matches!(summary.availability, Availability::Available));
 }

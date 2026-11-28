@@ -300,7 +300,14 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<ProcResu
   // Attach a catch immediately: a stream error before the read resolves
   // would otherwise be an unhandled rejection.
   const readAll = (async () => {
-    const reader = proc.stdout.getReader()
+    // Every spawn site uses stdout:"pipe", but Bun.spawn's return type
+    // admits `number | undefined` — narrow defensively (#225 F05).
+    const stream = proc.stdout
+    if (!stream || typeof stream === "number") {
+      try { proc.kill() } catch {}
+      return ""
+    }
+    const reader = stream.getReader()
     const chunks: Uint8Array[] = []
     let total = 0
     try {
