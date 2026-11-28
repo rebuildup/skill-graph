@@ -147,8 +147,15 @@ jobs:
             pkg="npm/skill-graph-${target}"
             mkdir -p "$pkg/bin" /tmp/sg-pkg
             tar -xzf "dist/skill-graph-${triple}.tar.gz" -C /tmp/sg-pkg
-            cp /tmp/sg-pkg/skill-graph "$pkg/bin/skill-graph"
-            chmod +x "$pkg/bin/skill-graph"
+            # cp -p carries the frozen tarball's exec bit through
+            # EXACTLY — no chmod repair: if the payload lacked +x the
+            # assert below fails instead of silently fixing it
+            # (#225 r10/r11).
+            cp -p /tmp/sg-pkg/skill-graph "$pkg/bin/skill-graph"
+            [ -x "$pkg/bin/skill-graph" ] || {
+              echo "frozen payload lost exec bit: $pkg/bin/skill-graph" >&2
+              exit 1
+            }
             rm -rf /tmp/sg-pkg
             if [ "$target" = "linux-x64" ]; then
               got="$("$pkg/bin/skill-graph" --version)"

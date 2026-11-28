@@ -12,7 +12,9 @@
 #   version         — --version reports the manifest/Cargo version
 #   basic function  — hook claude-code prompt must emit the
 #                     documented additionalContext injection for a
-#                     deterministic prompt (not merely exit 0)
+#                     deterministic CORPUS of prompts with pinned
+#                     expected skill lists (not merely exit 0, and not
+#                     a single anecdotal prompt — #225 r11)
 #   lifecycle       — install -> verify -> uninstall leaves nothing
 #   artifact bind   — cargo installs the PACKED .crate; npm installs
 #                     real npm-pack tarballs of both packages; brew
@@ -70,17 +72,42 @@ fails=0
 ok()   { echo "PASS: $1"; }
 bad()  { echo "FAIL: $1" >&2; fails=$((fails + 1)); }
 
-# hook_smoke <bin> <session-id> — basic FUNCTION proof, not just
-# fail-open exit 0: feed a deterministic prompt and require the
-# documented additionalContext injection contract in stdout
-# (#225 r10 — an empty-JSON smoke proves nothing about whether the
-# binary can actually recommend).
-hook_smoke() {
-  local bin="$1" sess="$2" out
-  out="$(printf '%s' \
-    "{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"please review this pull request carefully\",\"session_id\":\"$sess\"}" \
-    | "$bin" hook claude-code prompt 2>/dev/null)" || return 1
-  printf '%s' "$out" | grep -q '"additionalContext":"skill-graph: skills relevant to this task'
+# hook_corpus <bin> <session-prefix> — basic FUNCTION proof on a
+# deterministic corpus, not fail-open exit 0 and not one anecdotal
+# prompt (#225 r10/r11): each prompt must produce the EXACT
+# additionalContext skill list the engine recommends for it against
+# THIS repository's skill set. Expectations are pinned on purpose —
+# a change to repo skills or ranking that alters recommendations must
+# update this corpus deliberately, which is exactly the signal a
+# release gate should give. The corpus covers multiple distinct
+# recommendation outcomes so a binary that always emits the same
+# context (or none) cannot pass.
+hook_corpus() {
+  local bin="$1" sess="$2" i=0 out expected fails=0 prompt want
+  while IFS=$'\t' read -r prompt want; do
+    [ -n "$prompt" ] || continue
+    i=$((i + 1))
+    out="$(printf '%s' \
+      "{\"hook_event_name\":\"UserPromptSubmit\",\"prompt\":\"$prompt\",\"session_id\":\"$sess-$i\"}" \
+      | "$bin" hook claude-code prompt 2>/dev/null)" || {
+      echo "corpus[$i] hook invocation failed: $prompt" >&2
+      fails=$((fails + 1)); continue; }
+    expected="\"additionalContext\":\"skill-graph: skills relevant to this task — $want. Read the matching SKILL.md before relying on it.\""
+    if printf '%s' "$out" | grep -qF "$expected"; then
+      continue
+    fi
+    echo "corpus[$i] mismatch for prompt '$prompt'" >&2
+    echo "  want substring: $expected" >&2
+    echo "  got: $out" >&2
+    fails=$((fails + 1))
+  done <<'CORPUS'
+please review this pull request carefully	code-review, github-delivery, writing-discipline
+improve this rust code quality	system-quality, code-naming, quality-gate
+check for security vulnerabilities	security-maintenance
+create a new agent skill	skill-selection, system-quality
+write documentation for the new API	onboarding
+CORPUS
+  [ "$fails" -eq 0 ]
 }
 
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-install-verify.XXXXXX")"
@@ -139,8 +166,8 @@ if cargo package --allow-dirty --locked >/dev/null 2>&1; then
       else
         bad "crate install --version got '$cout'"
       fi
-      hook_smoke "$cbin" "verify-crate-$$-$RANDOM" \
-        && ok "crate install hook output" \
+      hook_corpus "$cbin" "verify-crate-$$-$RANDOM" \
+        && ok "crate install hook corpus (5 prompts)" \
         || bad "crate install hook output"
       cargo uninstall --root "$cargo_root" skill-graph >/dev/null 2>&1 \
         && [ ! -e "$cbin" ] \
@@ -195,8 +222,8 @@ if npm install --prefix "$npm_inst" \
   [ "$nout" = "skill-graph $version" ] \
     && ok "npm install --version via shim ($nout)" \
     || bad "npm install --version got '$nout'"
-  hook_smoke "$shim" "verify-npm-$$-$RANDOM" \
-    && ok "npm install hook output" \
+  hook_corpus "$shim" "verify-npm-$$-$RANDOM" \
+    && ok "npm install hook corpus (5 prompts)" \
     || bad "npm install hook output"
   # Lifecycle: uninstall must remove the shim AND the payload.
   npm uninstall --prefix "$npm_inst" "$meta_name" "$plat_name" >/dev/null 2>&1 || true
@@ -256,8 +283,8 @@ EOF
       [ "$bout" = "skill-graph $version" ] \
         && ok "brew install --version ($bout)" \
         || bad "brew install --version got '$bout'"
-      hook_smoke "$bbin" "verify-brew-$$-$RANDOM" \
-        && ok "brew install hook output" \
+      hook_corpus "$bbin" "verify-brew-$$-$RANDOM" \
+        && ok "brew install hook corpus (5 prompts)" \
         || bad "brew install hook output"
       HOMEBREW_NO_AUTO_UPDATE=1 brew uninstall "$tap_name/skill-graph" >/dev/null 2>&1 \
         && [ ! -e "$bbin" ] \
