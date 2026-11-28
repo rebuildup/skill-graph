@@ -73,6 +73,59 @@ fn keywords_bridge_paraphrased_task_phrasing() {
 }
 
 #[test]
+fn single_rare_description_term_admits_at_corpus_scale() {
+    // #319: a real task prompt may share exactly one content word with a
+    // skill's description vocabulary. Requiring two description hits made
+    // recommend() abstain on "--verbose and --output FILE flags" even
+    // though "flags" is a corpus-rare, meaningful term.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("skills");
+    write_skill_md(
+        &root.join("cli-arg-parsing"),
+        "cli-arg-parsing",
+        "Design command-line interfaces with clear flags, subcommands, help text, and validation. Use when adding CLI options, arguments, or a new command-line tool.",
+    );
+    // Distractors carry the prompt's other vocabulary so the target's
+    // "flags" hit stays the only description evidence it receives.
+    for i in 0..24 {
+        write_skill_md(
+            &root.join(format!("distractor-{i:02}")),
+            &format!("distractor-{i:02}"),
+            &format!("Reference for distractor topic number {i} covering reports, files, users, and lists."),
+        );
+    }
+    let graph = build(discover(&[root]));
+    let recs = recommend(
+        &graph,
+        "Create tools/report.py that prints the user list from app/main.py, with --verbose and --output FILE flags.",
+        "",
+        5,
+    );
+    assert!(
+        recs.iter().any(|r| r.skill.name == "cli-arg-parsing"),
+        "expected cli-arg-parsing in recommendations, got: {:?}",
+        recs.iter().map(|r| &r.skill.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn single_common_description_term_does_not_admit() {
+    // Guard for the #319 relaxation: a lone hit only admits when the term
+    // is corpus-rare. A term shared across many descriptions stays out.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("skills");
+    for i in 0..24 {
+        write_skill_md(
+            &root.join(format!("common-{i:02}")),
+            &format!("common-{i:02}"),
+            "Guidance for handling files and reports in production systems.",
+        );
+    }
+    let graph = build(discover(&[root]));
+    assert!(recommend(&graph, "handle the files", "", 5).is_empty());
+}
+
+#[test]
 fn stopword_and_punctuation_only_queries_do_not_recommend() {
     // Regression for #46: generic English function words and punctuation
     // matched description text and admitted irrelevant skills on real
