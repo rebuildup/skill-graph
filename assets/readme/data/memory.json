@@ -9,14 +9,14 @@
     {
       "label": "this repo's skills",
       "skills": 24,
-      "rss_mb": 6.7,
+      "rss_mb": 6.6,
       "kind": "real",
       "command": "discover --root .agents/skills"
     },
     {
       "label": "design-skills repo",
       "skills": 88,
-      "rss_mb": 7.3,
+      "rss_mb": 7.4,
       "kind": "real",
       "command": "discover --root <design-skills>/skills"
     },
@@ -29,7 +29,7 @@
     }
   ],
   "footnotes": [
-    "hook end-to-end: 6.8 MB peak RSS · recommend @500 skills: ~7.2 MB",
+    "hook end-to-end: 6.9 MB peak RSS · recommend @500 skills: ~7.2 MB",
     "measured with /usr/bin/time -v on release build · 20 runs per point, max reported · RSS includes binary + parsed corpus · x-axis: log scale"
   ]
 }
