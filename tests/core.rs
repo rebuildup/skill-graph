@@ -91,7 +91,9 @@ fn single_rare_description_term_admits_at_corpus_scale() {
         write_skill_md(
             &root.join(format!("distractor-{i:02}")),
             &format!("distractor-{i:02}"),
-            &format!("Reference for distractor topic number {i} covering reports, files, users, and lists."),
+            &format!(
+                "Reference for distractor topic number {i} covering reports, files, users, and lists."
+            ),
         );
     }
     let graph = build(discover(&[root]));
