@@ -109,7 +109,7 @@ pub struct SkillUsageEvent {
     pub kind: EventKind,
     pub runtime: Runtime,
     #[serde(default)]
-    pub session_id: String,
+    pub session_id: SessionId,
     #[serde(default)]
     pub timestamp: String,
     pub observed_via: ObservedVia,
@@ -148,44 +148,185 @@ pub(crate) const MAX_RECOMMENDED: usize = 32;
 /// bound them like `tool`/`skill_path` so a hostile payload cannot write
 /// unbounded strings into every event line. Charset matches the hook's
 /// sanitizer so hook- and detect-emitted events agree.
-pub(crate) fn sanitize_session_id(session_id: &str) -> String {
-    // Materialize at most 129 filtered chars: the overflow branch only
-    // needs a 119-char head plus a hash of the ORIGINAL input, so a
-    // hostile multi-MB session id cannot force a full-size allocation.
-    let mut filtered = String::new();
-    let mut chars = session_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-');
-    for c in chars.by_ref().take(129) {
-        filtered.push(c);
+/// Session-id contract (#225 r5/r6): the normalized form must be
+/// injective over arbitrary host input, not merely collision-resistant.
+/// The old scheme let a charset-valid literal id ("sess1-deadbeef")
+/// equal the transformed output of a different id ("sess!1" ->
+/// "sess1-deadbeef") — a structural namespace collision merging two
+/// sessions' funnel state. The fix reserves the transform output
+/// shape: any id ending in `-` + 32 lowercase hex chars is
+/// non-canonical and is itself transformed, so passthrough and
+/// generated namespaces can never overlap. Idempotency is
+/// intentionally NOT a contract: for a charset-lossy mapping,
+/// injectivity and idempotency are mutually exclusive (a fixed-point
+/// output would have to be canonical, hence pass through, hence
+/// collide with the literal that produced it).
+///
+/// Type-level separation (#225 r6): `SessionId` is the ONLY
+/// representation of a normalized id. Raw host strings enter the
+/// system exclusively through `SessionId::normalize`, which runs the
+/// transform exactly once per ingest boundary (hook payload, plugin
+/// event, transcript/db row). Every downstream consumer — event
+/// constructors, state keys, observe passthrough — holds a
+/// `SessionId` and can never re-run the transform: doing so on a
+/// transform output (which ends in the reserved shape) would produce
+/// a DIFFERENT id and silently split one session's funnel state.
+/// Re-normalization is therefore a compile-time impossibility, not a
+/// convention.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct SessionId(String);
+
+impl SessionId {
+    /// Normalize a raw host-supplied session id into contract form.
+    /// This is the ONLY place the transform runs.
+    pub fn normalize(session_id: &str) -> Self {
+        const MAX_ID_CHARS: usize = 128;
+        const HEAD_CHARS: usize = 95; // 95 + 1 + 32 = 128
+        const SCAN_CHARS: usize = 8192;
+        const HASH_HEX: usize = 32;
+
+        // Canonical fast path: at most MAX_ID_CHARS+1 chars are
+        // inspected, so a hostile multi-MB id cannot force a full scan
+        // here. When the prefix is shorter than the cap it IS the
+        // whole string.
+        let prefix: Vec<char> = session_id.chars().take(MAX_ID_CHARS + 1).collect();
+        if prefix.len() <= MAX_ID_CHARS
+            && prefix
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-')
+            && !has_reserved_suffix(session_id)
+        {
+            return SessionId(session_id.to_string());
+        }
+
+        // #225 C01: an id longer than the identity domain cannot be
+        // represented injectively within the bounded work budget —
+        // two distinct overlong ids agreeing on the first SCAN_CHARS
+        // chars would collapse into ONE session and share its state.
+        // Collapse them into the unattributed (empty) namespace
+        // instead: they share no session state, and work stays
+        // O(SCAN_CHARS) for any input size.
+        if session_id.chars().take(SCAN_CHARS + 1).count() > SCAN_CHARS {
+            return SessionId(String::new());
+        }
+
+        // Non-canonical: the identity DOMAIN is the first SCAN_CHARS
+        // chars — head AND hash both derive from it. Work is
+        // O(SCAN_CHARS) for ANY input size, and two raw ids that agree
+        // on the domain are the same session BY CONTRACT across every
+        // producer (hook, plugin, detect, observe). #225 r9: hashing
+        // the full input made work O(input) while the plugin's
+        // transport-side slice made the effective domain plugin-local
+        // — the domain must be defined once, inside normalize.
+        let domain: String = session_id.chars().take(SCAN_CHARS).collect();
+        let mut head = String::new();
+        let mut head_len = 0usize;
+        for c in domain.chars() {
+            if head_len >= HEAD_CHARS {
+                break;
+            }
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                head.push(c);
+                head_len += 1;
+            }
+        }
+        if head.is_empty() {
+            head.push('u');
+        }
+        SessionId(format!(
+            "{head}-{}",
+            &sha256_hex(domain.as_bytes())[..HASH_HEX]
+        ))
     }
-    if filtered.chars().count() > 128 {
-        // Truncation must not merge distinct ids that share a 128-char
-        // prefix: keep a bounded head plus a hash suffix of the original,
-        // mirroring the plugin's safeSessionID exactly.
-        let head: String = filtered.chars().take(119).collect();
-        return format!("{head}-{}", &sha256_hex(session_id.as_bytes())[..8]);
+
+    /// Adopt an already-normalized id WITHOUT re-running the
+    /// transform — used at trust boundaries where the stored/emitted
+    /// form is re-ingested (event-log passthrough, deserialization).
+    /// Validation is charset + length only: transform outputs
+    /// legitimately end in the reserved `-`+32hex shape, so the
+    /// reserved suffix must NOT be rejected here. Returns None for
+    /// strings that could never be normalize() output.
+    pub fn from_normalized(s: &str) -> Option<Self> {
+        const MAX_ID_CHARS: usize = 128;
+        let mut chars = s.chars();
+        if chars.by_ref().take(MAX_ID_CHARS + 1).count() > MAX_ID_CHARS {
+            return None;
+        }
+        if s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            Some(SessionId(s.to_string()))
+        } else {
+            None
+        }
     }
-    let safe = filtered;
-    if safe.is_empty() && !session_id.is_empty() {
-        // Distinct invalid ids must not collapse into one "unknown"
-        // funnel session: derive a deterministic suffix from the
-        // original bytes so different ids stay distinct while the same
-        // id remains joinable. SHA-256 (truncated) is used rather than
-        // DefaultHasher because the OpenCode plugin must produce the
-        // identical id for the same payload — the hash is part of the
-        // cross-entrypoint event contract.
-        format!("unknown-{}", &sha256_hex(session_id.as_bytes())[..16])
-    } else {
-        safe
+
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
+}
+
+impl std::ops::Deref for SessionId {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for SessionId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SessionId {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'de> Deserialize<'de> for SessionId {
+    /// Stored/emitted session ids must already be normalized; an
+    /// invalid value fails the whole event deserialization so the log
+    /// line is counted in `lines_skipped` rather than silently
+    /// re-normalized into a different session.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        SessionId::from_normalized(&s)
+            .ok_or_else(|| serde::de::Error::custom("session_id is not normalized contract form"))
+    }
+}
+
+/// True when `s` ends with `-` followed by 32 lowercase hex chars —
+/// the transform output shape. A longer hex tail still matches
+/// (over-reserving only costs an extra transform of a literal id,
+/// never a collision). Caller guarantees `s` is ASCII safe-charset,
+/// so byte slicing is exact.
+fn has_reserved_suffix(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 33 || b[b.len() - 33] != b'-' {
+        return false;
+    }
+    b[b.len() - 32..]
+        .iter()
+        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
 }
 
 impl SkillUsageEvent {
     pub fn prompt_submit(
         runtime: Runtime,
         observed_via: ObservedVia,
-        session_id: &str,
+        session_id: &SessionId,
         timestamp: &str,
         prompt: &str,
     ) -> Self {
@@ -193,7 +334,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::PromptSubmit,
             runtime,
-            session_id: sanitize_session_id(session_id),
+            session_id: session_id.clone(),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: Some(sha256_hex(prompt.as_bytes())),
@@ -215,7 +356,7 @@ impl SkillUsageEvent {
     pub fn recommendation(
         runtime: Runtime,
         observed_via: ObservedVia,
-        session_id: &str,
+        session_id: &SessionId,
         timestamp: &str,
         prompt_hash: Option<String>,
         trigger: Trigger,
@@ -228,7 +369,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::Recommendation,
             runtime,
-            session_id: sanitize_session_id(session_id),
+            session_id: session_id.clone(),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: prompt_hash.map(|h| h.chars().take(128).collect()),
@@ -258,7 +399,7 @@ impl SkillUsageEvent {
     pub fn skill_load(
         runtime: Runtime,
         observed_via: ObservedVia,
-        session_id: &str,
+        session_id: &SessionId,
         timestamp: &str,
         tool: Option<String>,
         skill_name: Option<String>,
@@ -272,7 +413,7 @@ impl SkillUsageEvent {
             schema_version: SCHEMA_VERSION,
             kind: EventKind::SkillLoad,
             runtime,
-            session_id: sanitize_session_id(session_id),
+            session_id: session_id.clone(),
             timestamp: timestamp.chars().take(64).collect(),
             observed_via,
             prompt_hash: None,
@@ -425,9 +566,29 @@ pub fn skill_name_from_path(path: &str) -> Option<String> {
 /// Candidates are maximal non-delimiter runs ending at `SKILL.md`; callers
 /// must still validate with `is_skill_md_path`.
 pub fn skill_md_paths(text: &str) -> Vec<String> {
+    skill_md_paths_impl(text, None)
+}
+
+/// Test-visible variant returning the total bytes handed to UTF-8
+/// validation, so the dense-hit regression test can assert bounded work
+/// deterministically instead of relying on wall-clock timing (#225).
+#[cfg(test)]
+fn skill_md_paths_counting(text: &str) -> (Vec<String>, usize) {
+    let mut validated = 0usize;
+    let out = skill_md_paths_impl(text, Some(&mut validated));
+    (out, validated)
+}
+
+fn skill_md_paths_impl(text: &str, mut validated: Option<&mut usize>) -> Vec<String> {
     const NEEDLE: &[u8] = b"SKILL.md";
+    /// Unquoted path bytes: the ASCII filename-ish set plus every
+    /// non-ASCII byte. UTF-8 multibyte sequences are entirely >= 0x80,
+    /// so non-ASCII (e.g. Japanese) path components stay inside the run
+    /// and are UTF-8 validated at the end — the old ASCII-only set
+    /// truncated candidates at the first multibyte byte (#225 E07).
     fn is_path_byte(b: u8) -> bool {
         b.is_ascii_alphanumeric()
+            || b >= 0x80
             || matches!(
                 b,
                 b'/' | b'.'
@@ -451,6 +612,8 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut pos = 0usize;
+    const MAX_CANDIDATES: usize = 256;
+    const MAX_CANDIDATE_BYTES: usize = 4096;
     // Start of the contiguous path-byte run ending at `pos`, tracked
     // forward: every byte is classified exactly once (needle bodies are
     // path bytes, so `pos = end` jumps never break the run), giving each
@@ -463,39 +626,89 @@ pub fn skill_md_paths(text: &str) -> Vec<String> {
     // accepted candidates (<= MAX_CANDIDATE_BYTES) are identical to the
     // old floor-bounded scan.
     let mut run_start = 0usize;
+    // Shell quoting state (#225 E07): inside '…' every byte except the
+    // closing quote is a literal path byte (spaces included); inside
+    // "…" the same, except backslash escapes the next byte. Outside
+    // quotes a backslash escapes the next byte (`foo\ bar` is one path
+    // component). Quote characters themselves are NOT path bytes — they
+    // delimit runs, so `"dir with space/SKILL.md"` yields
+    // `dir with space/SKILL.md`. Quoted command substitution
+    // (`$(…)`, backticks) is out of contract: its bytes scan as ordinary
+    // text.
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
     // Distinct candidates and per-candidate length are both bounded: a
     // max-size payload could otherwise materialize hundreds of MB of
     // path strings before any downstream cap applies.
-    const MAX_CANDIDATES: usize = 256;
-    const MAX_CANDIDATE_BYTES: usize = 4096;
     while pos + NEEDLE.len() <= bytes.len() && out.len() < MAX_CANDIDATES {
-        if &bytes[pos..pos + NEEDLE.len()] != NEEDLE {
-            if !is_path_byte(bytes[pos]) {
-                run_start = pos + 1;
+        if &bytes[pos..pos + NEEDLE.len()] == NEEDLE {
+            let end = pos + NEEDLE.len();
+            // Forward boundary: `SKILL.mdx`, `SKILL.md.bak`, `SKILL.md-old`,
+            // and `SKILL.md/…` are not the SKILL.md file. Delimiters that
+            // legitimately follow a filename in prose (`,`, `)`, `"`, space)
+            // are not in this set.
+            if end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric()
+                    || matches!(bytes[end], b'.' | b'_' | b'-' | b'/'))
+            {
+                pos = end;
+                continue;
             }
-            pos += 1;
-            continue;
-        }
-        let end = pos + NEEDLE.len();
-        // Forward boundary: `SKILL.mdx`, `SKILL.md.bak`, `SKILL.md-old`,
-        // and `SKILL.md/…` are not the SKILL.md file. Delimiters that
-        // legitimately follow a filename in prose (`,`, `)`, `"`, space)
-        // are not in this set.
-        if end < bytes.len()
-            && (bytes[end].is_ascii_alphanumeric()
-                || matches!(bytes[end], b'.' | b'_' | b'-' | b'/'))
-        {
+            // The needle's first byte consumed any pending escape.
+            escaped = false;
+            // Bound the UTF-8 validation itself: `str::len` is a byte
+            // count, so `end - run_start` is the same length check
+            // without materializing anything — and rejecting over-length
+            // runs first keeps each hit's validation <=
+            // MAX_CANDIDATE_BYTES. Running from_utf8 on the (possibly
+            // run-length) slice BEFORE the length check made dense hits
+            // inside one long path-byte run quadratic (#225).
+            if end - run_start <= MAX_CANDIDATE_BYTES {
+                if let Some(c) = validated.as_mut() {
+                    **c += end - run_start;
+                }
+                if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
+                    && !candidate.is_empty()
+                    && seen.insert(candidate)
+                {
+                    out.push(candidate.to_string());
+                }
+            }
             pos = end;
             continue;
         }
-        if let Ok(candidate) = std::str::from_utf8(&bytes[run_start..end])
-            && candidate.len() <= MAX_CANDIDATE_BYTES
-            && !candidate.is_empty()
-            && seen.insert(candidate)
-        {
-            out.push(candidate.to_string());
+        let b = bytes[pos];
+        if escaped {
+            // The escaped byte is a literal path byte — the run
+            // continues and no quote/escape state applies to it.
+            escaped = false;
+            pos += 1;
+            continue;
         }
-        pos = end;
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                    run_start = pos + 1;
+                } else if q == b'"' && b == b'\\' {
+                    escaped = true;
+                }
+                // Every other byte inside quotes — space, the other
+                // quote char, non-ASCII — is a literal path byte.
+                pos += 1;
+            }
+            None => {
+                if b == b'\\' {
+                    escaped = true;
+                } else if b == b'\'' || b == b'"' {
+                    quote = Some(b);
+                    run_start = pos + 1;
+                } else if !is_path_byte(b) {
+                    run_start = pos + 1;
+                }
+                pos += 1;
+            }
+        }
     }
     out
 }
@@ -520,10 +733,57 @@ const TRANSPARENT_PREFIXES: &[&str] = &[
     "sudo", "env", "time", "nice", "nohup", "command", "builtin", "xargs", "exec", "doas",
 ];
 
+/// Split a command line into segments on unquoted `&`, `;`, `|`, and
+/// newlines. Single/double quotes and backslash escapes are honored so
+/// a delimiter inside `"…"` does not split a segment — `echo "a;b";
+/// cat x/SKILL.md` must keep the `cat` segment intact for read-verb
+/// detection (#225 E07). This is a deliberately small shell subset:
+/// `$()`, backticks, and here-docs are not interpreted.
+fn split_shell_segments(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                } else if q == b'"' && b == b'\\' {
+                    escaped = true;
+                }
+            }
+            None => match b {
+                b'\\' => escaped = true,
+                b'\'' | b'"' => quote = Some(b),
+                b'&' | b';' | b'|' | b'\n' => {
+                    out.push(&command[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+    out.push(&command[start..]);
+    out
+}
+
 /// Classify how `command` accesses SKILL.md files. Returns every
 /// `(path, access)` pair — each command segment is classified on its own
 /// read verbs, so `cat a/SKILL.md; grep b/SKILL.md` yields a Read for `a`
 /// and a Reference for `b`. Empty when no SKILL.md path is referenced.
+///
+/// Contract (#225 E07): POSIX-shell-ish tokenization — segments split
+/// on unquoted `& ; |` and newlines; `'…'`/`"…"` quoting and `\`
+/// escapes are honored for both segmentation and path extraction;
+/// non-ASCII (UTF-8) path components are supported. Command
+/// substitution, here-docs, and glob expansion are not interpreted —
+/// their text scans as ordinary arguments.
 pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     let mut out: Vec<(String, Access)> = Vec::new();
     // path -> index into `out`; keeps dedup O(1) per candidate so a
@@ -538,7 +798,7 @@ pub fn classify_command(command: &str) -> Vec<(String, Access)> {
     // MAX_EVENTS_PER_PAYLOAD, so accumulating more classifications than
     // that can never change the emitted output.
     const MAX_COMMAND_ACCESSES: usize = MAX_EVENTS_PER_PAYLOAD * 4;
-    for (seq, segment) in command.split(['&', ';', '|', '\n']).enumerate() {
+    for (seq, segment) in split_shell_segments(command).into_iter().enumerate() {
         if out.len() >= MAX_COMMAND_ACCESSES {
             break;
         }
@@ -646,10 +906,14 @@ pub fn classify_tool_access_all(
 ) -> Vec<LoadClassification> {
     let lower = tool.to_ascii_lowercase();
     if lower == "skill" {
+        // Claude Code uses `skill`; OpenCode's native skill tool uses
+        // `id`. The tool-name gate already scopes this branch, so the
+        // generic `id` key is unambiguous here.
         let raw = input
             .get("skill")
             .or_else(|| input.get("name"))
             .or_else(|| input.get("skill_name"))
+            .or_else(|| input.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("");
         return vec![LoadClassification {
@@ -940,6 +1204,22 @@ pub fn response_text(value: &Value) -> String {
 /// event log.
 const MAX_EVENTS_PER_PAYLOAD: usize = 64;
 
+/// True when a tool result marks the call as failed: `status:"error"`,
+/// `success:false`, or a non-empty `error` value (null/false/"" are not
+/// errors). Shared by live detection — which applies it to the whole
+/// hook/plugin payload — and DB observation, which applies it to the
+/// tool part's `state` object, so both paths classify the same tool
+/// execution identically (#225 E06).
+pub fn tool_result_failed(v: &Value) -> bool {
+    v.get("status").and_then(Value::as_str) == Some("error")
+        || v.get("success").and_then(Value::as_bool) == Some(false)
+        || v.get("error").is_some_and(|e| {
+            // The OpenCode plugin forwards `error` defensively; any
+            // non-empty error value marks a failed call.
+            !e.is_null() && *e != Value::Bool(false) && e.as_str() != Some("")
+        })
+}
+
 /// Normalize a runtime hook/plugin payload into `skill_load` events —
 /// one per distinct skill access (a command may touch several SKILL.md
 /// files). Empty when the payload carries no skill-load signal.
@@ -952,17 +1232,8 @@ pub fn detect_all_from_payload(
     observed_via: ObservedVia,
     payload: &Value,
 ) -> Vec<SkillUsageEvent> {
-    // A failed tool call never loaded the skill: payloads carrying an
-    // explicit error status/success flag produce no load events.
-    if payload.get("status").and_then(Value::as_str) == Some("error")
-        || payload.get("success").and_then(Value::as_bool) == Some(false)
-        || payload.get("error").is_some_and(|e| {
-            // The OpenCode plugin forwards `error` defensively; any
-            // non-empty error value marks a failed call. null/false/""
-            // are not errors.
-            !e.is_null() && *e != Value::Bool(false) && e.as_str() != Some("")
-        })
-    {
+    // A failed tool call never loaded the skill.
+    if tool_result_failed(payload) {
         return Vec::new();
     }
     let tool = payload
@@ -983,17 +1254,21 @@ pub fn detect_all_from_payload(
         .cloned()
         .unwrap_or(Value::Null);
     let output = response_text(&output_value);
-    let session_id = payload
-        .get("session_id")
-        .or_else(|| payload.get("sessionID"))
-        .or_else(|| payload.get("sessionId"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    // Normalize the raw payload id exactly once here; every emitted
+    // event carries the resulting SessionId and cannot be re-transformed.
+    let session_id = SessionId::normalize(
+        payload
+            .get("session_id")
+            .or_else(|| payload.get("sessionID"))
+            .or_else(|| payload.get("sessionId"))
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    );
     let to_event = |c: LoadClassification| {
         SkillUsageEvent::skill_load(
             runtime,
             observed_via,
-            session_id,
+            &session_id,
             &rfc3339_now(),
             Some(tool.to_string()),
             c.skill_name,
@@ -1153,19 +1428,19 @@ mod tests {
     #[test]
     fn sanitize_session_id_distinguishes_invalid_ids() {
         // Charset-valid ids pass through unchanged.
-        assert_eq!(sanitize_session_id("s-1.ok_2"), "s-1.ok_2");
+        assert_eq!(SessionId::normalize("s-1.ok_2"), "s-1.ok_2");
         // Distinct all-invalid ids must not collapse into one funnel
         // session, while the same id stays deterministic for joins.
-        let a = sanitize_session_id("!!!");
-        let b = sanitize_session_id("???");
-        assert!(a.starts_with("unknown-"));
-        assert!(b.starts_with("unknown-"));
+        let a = SessionId::normalize("!!!");
+        let b = SessionId::normalize("???");
+        assert!(a.starts_with("u-"));
+        assert!(b.starts_with("u-"));
         assert_ne!(a, b);
-        assert_eq!(a, sanitize_session_id("!!!"));
+        assert_eq!(a, SessionId::normalize("!!!"));
         // Empty stays empty — it marks unattributable events.
-        assert_eq!(sanitize_session_id(""), "");
+        assert_eq!(SessionId::normalize(""), "");
         // Overlong ids are truncated at 128 chars.
-        assert_eq!(sanitize_session_id(&"x".repeat(200)).len(), 128);
+        assert_eq!(SessionId::normalize(&"x".repeat(200)).len(), 128);
     }
 
     #[test]
@@ -1175,18 +1450,176 @@ mod tests {
         // the original bytes (parity with the plugin's safeSessionID).
         let a = format!("{}-aaa", "x".repeat(200));
         let b = format!("{}-bbb", "x".repeat(200));
-        let sa = sanitize_session_id(&a);
-        let sb = sanitize_session_id(&b);
+        let sa = SessionId::normalize(&a);
+        let sb = SessionId::normalize(&b);
         assert_eq!(sa.len(), 128);
         assert_eq!(sb.len(), 128);
         assert_ne!(sa, sb);
-        assert!(sa.starts_with(&"x".repeat(119)));
+        assert!(sa.starts_with(&"x".repeat(95)));
         assert!(sa.contains('-'));
         // Deterministic: the same id sanitizes identically for joins.
-        assert_eq!(sa, sanitize_session_id(&a));
+        assert_eq!(sa, SessionId::normalize(&a));
         // Exactly-128-char ids pass through unsuffixed.
         let exact = "y".repeat(128);
-        assert_eq!(sanitize_session_id(&exact), exact);
+        assert_eq!(SessionId::normalize(&exact).as_str(), exact);
+    }
+
+    #[test]
+    fn sanitize_session_id_identity_domain_is_first_8192_chars() {
+        // #225 r9/r12: the identity domain is defined ONCE inside
+        // normalize — the first SCAN_CHARS(8192) chars feed BOTH head
+        // and hash. Ids WITHIN the domain (<=8192 chars total) that
+        // differ inside it stay distinct for EVERY producer
+        // (hook/plugin/detect/observe); work is O(8192) regardless of
+        // input size.
+        let p2 = "q".repeat(8100);
+        assert_ne!(
+            SessionId::normalize(&format!("{p2}X{}", "z".repeat(90))),
+            SessionId::normalize(&format!("{p2}Y{}", "z".repeat(90))),
+            "ids differing inside the domain must stay distinct"
+        );
+        // #225 C01: ids LONGER than the domain cannot be represented
+        // injectively — two distinct overlong ids agreeing on the
+        // first 8192 chars must NOT collapse into one session. They
+        // become unattributed ("") and share no session state.
+        let prefix = "p".repeat(9000);
+        assert_eq!(SessionId::normalize(&format!("{prefix}AAA")), "");
+        assert_eq!(SessionId::normalize(&format!("{prefix}BBB")), "");
+        // Exactly-at-domain boundary still normalizes.
+        let edge = "e".repeat(8192);
+        assert_ne!(SessionId::normalize(&edge), "");
+        // normalize must not scan the tail: a 1 MiB+ id still
+        // resolves in O(SCAN_CHARS).
+        let huge = format!("{}{}", "h".repeat(9000), "!".repeat(1 << 20));
+        assert_eq!(SessionId::normalize(&huge), "");
+    }
+
+    #[test]
+    fn sanitize_session_id_stripped_chars_stay_distinct() {
+        // #225: lossy charset filtering must not merge distinct ids —
+        // "sess!1" and "sess?1" both filtered to "sess1" before.
+        let a = SessionId::normalize("sess!1");
+        let b = SessionId::normalize("sess?1");
+        assert_ne!(a, b);
+        assert!(a.starts_with("sess1-"));
+        assert!(b.starts_with("sess1-"));
+        // Deterministic for joins, and a clean id keeps its bare form.
+        assert_eq!(a, SessionId::normalize("sess!1"));
+        assert_eq!(SessionId::normalize("sess1"), "sess1");
+        // Fixed cross-implementation vector: opencode-plugin.test.ts
+        // asserts the same literal — the sanitize rules are a shared
+        // event contract across entrypoints.
+        assert_eq!(a, "sess1-f1437b8fb22261cc21b7a104ca00e1b1");
+    }
+
+    #[test]
+    fn sanitize_session_id_reserved_shape_cannot_collide() {
+        // #225 r5 structural collision: a charset-valid LITERAL id equal
+        // to another id's transform output must not merge their funnel
+        // state. Transform outputs end in "-" + 32 lowercase hex; that
+        // shape is reserved, so the literal is itself transformed.
+        let transformed = SessionId::normalize("sess!1");
+        let literal = transformed.clone(); // valid charset, <=128
+        assert_ne!(SessionId::normalize(&literal), transformed);
+        // A hand-crafted id in the reserved shape is transformed too.
+        let crafted = format!("sess1-{}", "0123456789abcdef".repeat(2));
+        assert_ne!(SessionId::normalize(&crafted).as_str(), crafted);
+        // Canonical ids still pass through — the reservation only
+        // catches the exact generated shape.
+        assert_eq!(
+            SessionId::normalize("sess-0123456789abcdef"),
+            "sess-0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn sanitize_session_id_never_exceeds_contract_limit() {
+        // #225 re-review: the stripped-chars suffix must not push the
+        // result past the 128-char session_id contract — a 128-char
+        // filtered id plus "-" + 8 hash chars emitted 137 before.
+        for raw in [
+            format!("{}!", "x".repeat(128)),
+            format!("{}?", "x".repeat(120)),
+            format!("{}!", "x".repeat(200)),
+            "sess!1".to_string(),
+        ] {
+            let out = SessionId::normalize(&raw);
+            assert!(out.len() <= 128, "{out:?} exceeds 128 chars");
+            // Idempotency is intentionally NOT a contract (#225 r5):
+            // injectivity and idempotency are mutually exclusive for a
+            // charset-lossy map — a fixed-point output would be
+            // canonical and collide with the literal that made it.
+        }
+        // Distinct long ids that share a 119-char filtered head still
+        // separate via the original-bytes hash.
+        let a = format!("{}!a", "x".repeat(128));
+        let b = format!("{}!b", "x".repeat(128));
+        assert_ne!(SessionId::normalize(&a), SessionId::normalize(&b));
+    }
+
+    #[test]
+    fn sanitize_session_id_property_contract() {
+        // Property sweep over adversarial inputs (#225 re-review): the
+        // contract — ≤128 chars, charset-safe, deterministic — must
+        // hold for ARBITRARY session ids, not just the hand-picked
+        // cases above. Idempotency is deliberately NOT part of the
+        // contract (#225 r5): it is mutually exclusive with
+        // injectivity for a charset-lossy map. Deterministic LCG, no
+        // external deps; mirrors the plugin-side property test in
+        // opencode-plugin.test.ts.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let pieces: [&str; 14] = [
+            "a",
+            "Z",
+            "0",
+            "-",
+            ".",
+            "_",
+            "!",
+            "?",
+            " ",
+            "/",
+            "\n",
+            "é",
+            "\u{0}",
+            "\u{1f600}",
+        ];
+        let mut seen: std::collections::HashMap<String, SessionId> =
+            std::collections::HashMap::new();
+        for i in 0..3000u32 {
+            let len = (rand() % 300) as usize;
+            let mut raw = String::new();
+            for _ in 0..len {
+                raw.push_str(pieces[(rand() as usize) % pieces.len()]);
+            }
+            let out = SessionId::normalize(&raw);
+            assert!(out.len() <= 128, "{out:?} exceeds 128 chars for {raw:?}");
+            // Charset: output is "" or [A-Za-z0-9._-] only — head,
+            // "u-", and hash-suffix forms all use the safe alphabet.
+            assert!(
+                out.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+                "unsafe charset in {out:?} from {raw:?}"
+            );
+            // Deterministic. Idempotency is NOT asserted: it is
+            // mutually exclusive with injectivity for this mapping
+            // (#225 r5) — see sanitize_session_id's contract comment.
+            assert_eq!(SessionId::normalize(&raw), out);
+            if i < 1000 {
+                seen.insert(raw, out);
+            }
+        }
+        // Distinct raws must not collapse into one sanitized id —
+        // hash suffixes make accidental collisions cryptographically
+        // improbable across this sample.
+        let outs: std::collections::HashSet<&SessionId> = seen.values().collect();
+        assert_eq!(outs.len(), seen.len(), "distinct raws collapsed");
     }
 
     #[test]
@@ -1235,16 +1668,25 @@ mod tests {
     #[test]
     fn skill_md_paths_dense_hits_stay_linear() {
         // 5000 'a's + 500 ",SKILL.md" hits: every candidate is the full
-        // run prefix (>4 KiB) — all rejected, and the call must not
-        // degrade to ~500x5000 byte-ops.
-        let hostile = format!("{}{}", "a".repeat(5000), ",SKILL.md".repeat(500));
-        assert!(skill_md_paths(&hostile).is_empty());
+        // run prefix (>4 KiB) — all rejected, and no hit may pay a
+        // run-length UTF-8 validation.
+        let (paths, validated) =
+            skill_md_paths_counting(&format!("{}{}", "a".repeat(5000), ",SKILL.md".repeat(500)));
+        assert!(paths.is_empty());
+        assert_eq!(validated, 0, "over-length hits reached UTF-8 validation");
         // Run-start hits within the bound still extract: "a"*4000 keeps
-        // the first ~10 candidates <= 4096 bytes, the rest reject.
-        let bounded = format!("{}{}", "a".repeat(4000), ",SKILL.md".repeat(500));
-        let paths = skill_md_paths(&bounded);
+        // the first ~10 candidates <= 4096 bytes, the rest reject — and
+        // only those in-bound hits may reach UTF-8 validation.
+        let (paths, validated) =
+            skill_md_paths_counting(&format!("{}{}", "a".repeat(4000), ",SKILL.md".repeat(500)));
         assert_eq!(paths.len(), 10, "{paths:?}");
         assert!(paths.iter().all(|p| p.starts_with(&"a".repeat(100))));
+        // ~12 in-bound hits x <=4096 bytes each; the pre-fix code would
+        // have validated every hit's growing prefix (~500 x ~6 KiB).
+        assert!(
+            validated <= 64 * 4096,
+            "validated {validated} bytes for 500 hits — per-hit work unbounded"
+        );
     }
 
     #[test]
@@ -1276,6 +1718,59 @@ mod tests {
         assert_eq!(multi.len(), 2);
         assert_eq!(multi[0].1, Access::Read);
         assert_eq!(multi[1].1, Access::Reference);
+    }
+
+    /// #225 E07: non-ASCII (UTF-8) path components must stay inside the
+    /// candidate run — the ASCII-only byte set used to truncate at the
+    /// first multibyte byte.
+    #[test]
+    fn skill_md_paths_keeps_non_ascii_components() {
+        assert_eq!(
+            skill_md_paths("cat /home/ユーザー/skills/和名/SKILL.md"),
+            vec!["/home/ユーザー/skills/和名/SKILL.md".to_string()]
+        );
+        // A non-ASCII component adjacent to ASCII still joins the run.
+        assert_eq!(
+            skill_md_paths("cat skills/日本語-skill/SKILL.md"),
+            vec!["skills/日本語-skill/SKILL.md".to_string()]
+        );
+    }
+
+    /// #225 E07: quoted paths keep their spaces; quote characters
+    /// delimit the run so the candidate is the inner path.
+    #[test]
+    fn skill_md_paths_handles_quoted_paths() {
+        assert_eq!(
+            skill_md_paths("cat \"dir with space/my-skill/SKILL.md\""),
+            vec!["dir with space/my-skill/SKILL.md".to_string()]
+        );
+        assert_eq!(
+            skill_md_paths("cat 'dir with space/my-skill/SKILL.md'"),
+            vec!["dir with space/my-skill/SKILL.md".to_string()]
+        );
+        // An escaped space keeps the run together (one candidate, not
+        // split at the space). The emitted path preserves the raw
+        // escape spelling — escapes govern tokenization boundaries;
+        // consumers treat `skill_path` as opaque text and derive the
+        // skill name from the parent directory, which is unaffected.
+        assert_eq!(
+            skill_md_paths("cat dir\\ with\\ space/my-skill/SKILL.md"),
+            vec!["dir\\ with\\ space/my-skill/SKILL.md".to_string()]
+        );
+        // A `;` inside quotes must not end the segment: the `cat` after
+        // it is still the read verb for the quoted path.
+        let accesses = classify_command("echo \"a;b\"; cat \"x y/SKILL.md\"");
+        assert_eq!(accesses.len(), 1);
+        assert_eq!(accesses[0].0, "x y/SKILL.md");
+        assert_eq!(accesses[0].1, Access::Read);
+        // Quoted SKILL.md inside a non-read segment stays a reference.
+        assert_eq!(
+            classify_command("grep foo \"x y/SKILL.md\"")[0].1,
+            Access::Reference
+        );
+        // Unterminated quote: the rest of the line scans as quoted
+        // text — best-effort path extraction, never a panic.
+        let _ = classify_command("cat \"unterminated/x/SKILL.md");
     }
 
     #[test]
@@ -1311,6 +1806,12 @@ mod tests {
         let c = classify_tool_access("Skill", &input, "").unwrap();
         assert_eq!(c.detection, Detection::NativeInvocation);
         assert_eq!(c.skill_name.as_deref(), Some("alpha-skill"));
+
+        // OpenCode's native `skill` tool takes `id`, not `skill`.
+        let input = json!({"id": "api-error-handling"});
+        let c = classify_tool_access("skill", &input, "").unwrap();
+        assert_eq!(c.detection, Detection::NativeInvocation);
+        assert_eq!(c.skill_name.as_deref(), Some("api-error-handling"));
     }
 
     #[test]

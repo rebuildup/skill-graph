@@ -140,3 +140,67 @@ fn parse_errors_are_surfaced_and_skipped_by_recommend() {
     assert!(recs.iter().any(|rec| rec.skill.name == "beta-skill"));
     assert!(!recs.iter().any(|rec| rec.skill.name == "bad-skill"));
 }
+
+/// #225 B06: `resolved_path`/`resolved_name` semantics are canonicalized:
+/// `resolved_name` is set only when the link resolves to a discovered
+/// skill; `resolved_path` additionally records the *lexical* resolution
+/// of an in-skill-directory `.md` target whether or not the file exists
+/// (no body is read — it is a path record, not an existence claim).
+#[test]
+fn markdown_resolution_distinguishes_lexical_path_from_skill_target() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("skills");
+    fs::create_dir_all(&root).unwrap();
+    write_skill(&root, "alpha-skill", "alpha", "body");
+    write_skill(&root, "beta-skill", "beta", "body");
+
+    // Real non-skill file inside the skill dir.
+    let alpha = root.join("alpha-skill");
+    fs::create_dir_all(alpha.join("references")).unwrap();
+    fs::write(alpha.join("references/guide.md"), "guide\n").unwrap();
+
+    fs::write(
+        alpha.join("SKILL.md"),
+        "---\nname: alpha-skill\ndescription: alpha\n---\n\n\
+         [guide](references/guide.md) \
+         [missing](references/nope.md) \
+         [sib](../beta-skill) \
+         [sibmd](../beta-skill/SKILL.md)\n",
+    )
+    .unwrap();
+
+    let graph = build(discover(&[root]));
+    let skill = graph
+        .skills
+        .iter()
+        .find(|s| s.name == "alpha-skill")
+        .unwrap();
+    let link = |t: &str| skill.links.iter().find(|l| l.target == t).unwrap();
+
+    // Existing non-skill .md: lexical path recorded, no skill name.
+    let guide = link("references/guide.md");
+    assert!(guide.resolved_name.is_none());
+    assert_eq!(
+        guide.resolved_path.as_deref(),
+        Some(alpha.join("references/guide.md").as_path())
+    );
+
+    // Nonexistent in-scope .md: lexical resolution is still recorded —
+    // resolved_path is a path record, not an existence or skill claim.
+    let missing = link("references/nope.md");
+    assert!(missing.resolved_name.is_none());
+    assert_eq!(
+        missing.resolved_path.as_deref(),
+        Some(alpha.join("references/nope.md").as_path())
+    );
+
+    // Directory link to a sibling skill resolves to that skill.
+    let sib = link("../beta-skill");
+    assert_eq!(sib.resolved_name.as_deref(), Some("beta-skill"));
+    assert!(sib.resolved_path.is_some());
+
+    // Direct SKILL.md link to a sibling resolves by path.
+    let sibmd = link("../beta-skill/SKILL.md");
+    assert_eq!(sibmd.resolved_name.as_deref(), Some("beta-skill"));
+    assert!(sibmd.resolved_path.is_some());
+}

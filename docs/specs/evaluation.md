@@ -82,3 +82,22 @@ cross-lingual（英語 query ↔ 和文 description 等）と言い換えの双�
 | F | text search + 参照 graph を使う Hook 推薦 |
 
 同じ model、task、初期状態、利用可能 skill、skill revision を可能な限り固定する。実際の読み込みと成果物品質への効果を区別する。
+
+## Freeze eval gate (#225 G04)
+
+`scripts/check-eval-gate.sh` が release dataset
+（`evals/dataset/cases.jsonl`）を対象 binary で `bench` し、以下の
+閾値を機械検査する。CI（ci.yml）と freeze 受入
+（artifact-verify.yml `freeze-manifest` job）の双方が同一 script を
+呼び、閾値未達は freeze/promotion を拒否する。
+
+| 指標 | 閾値 | 根拠 |
+|---|---|---|
+| cases | dataset 全件実行 | 切り詰め・空 run の合格を排除 |
+| required_recall | 1.0 | required skill の推薦漏れは release 不適格 |
+| required_recall_at3 | 1.0 | 推薦上限 3 件の budget 内で全 required を回収 |
+| forbidden_hits | 0 | forbidden skill の出現は 0 件必須 |
+
+precision / recall@5 / elapsed_ms は情報指標であり gate 対象外
+（ranking 変更で正当に変動しうる）。閾値を変更する場合は本表と
+dataset の変更を同一 commit で行い、独立レビューを経る。

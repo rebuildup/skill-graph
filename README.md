@@ -1,244 +1,92 @@
 # skill-graph
 
-Agent Skills の発見・参照解決・推薦を支援する、エージェント非依存の CLI
-ツール。標準の Agent Skills を変更せず、導入済みスキルの `SKILL.md`、
-Markdown リンク、frontmatter、作業コンテキストから必要なスキルへ到達
-できるようにする。
+導入済みの Agent Skills の中から、**いまのタスクに本当に必要な
+スキルを見つけてエージェントに届ける**ランタイム非依存 CLI。
+Claude Code / Codex / OpenCode で同じ仕組みが使え
+（opt-in adapter）、runtime の native discovery が届かない
+スキルも推薦経由でエージェントへ届けられる。
+標準の Agent Skills 仕様は変更しない。
 
-対応ランタイム: **Claude Code / Codex / OpenCode**（opt-in adapter）。
+## 実測: 効果が出る条件を実ランタイムで確認した
 
-## Install
+実ランタイム A/B 実験（OpenCode・Devin、同一 model・同一タスク・
+複数 skill corpus）を実施した。結果は条件で分かれる。
 
-パッケージマネージャから導入する。hook の有効化は install では行われず、
-後述の `skill-graph adapter enable` で明示的に opt-in する。
+- **runtime が既に全スキルを surface する環境では差が出ない**:
+  OpenCode（plugin on/off、n=24 session/群）で呼び出し数
+  1.29 vs 1.25/session、正解ロード率 87.5% vs 83.3%（いずれも
+  非有意）。Devin でも corpus 8件・157件の両方で 8/8 vs 8/8。
+- **runtime が surface しない root のスキルには明確な効果**:
+  実務 skill 8件を runtime 非検出の場所へ移した条件で、
+  推薦注入群は **23/24 session で正解スキルをロード**、対照群は
+  **0/24**（そのスキルに到達する経路が存在しない）。
+  唯一の系統的失敗は推薦 recall 欠陥（Issue #319）で、
+  修正後の round では 8/8 × 2 を記録。
 
-**現時点で利用可能なチャネルは mise（`github:` backend）と Homebrew。**
-npm と crates.io は配布 workflow とパッケージ定義は v0.4.0 に含まれるが、
-外部レジストリへの公開は未完了（`NPM_TOKEN` / crates.io token 未設定）
-のため **準備中** であり、現状は install できない。
+つまり「入っているのに使われない」の解消は、runtime の
+native discovery が届かないスキル集合に対して実測で確認
+できた。delivery（推薦が文脈へ届く）と conversion
+（推薦→SKILL.md 読込）は全条件で機能している。
+条件・分母・生データ・限界は
+[OpenCode 記録](docs/evidence/2026-11-28-v050-usage-effect-ab.md)・
+[Devin 記録](docs/evidence/2026-11-29-v050-usage-effect-devin-ab.md)
+・[surface 分析](docs/evidence/2026-11-28-v050-skill-surface-analysis.md)
+を参照。
 
-### mise（推奨・動作保証チャネル）
+## 課題: スキルは入れたのに使われない
+
+Agent Skills を導入しても、エージェントが「どのスキルが今回の
+タスクに効くか」を自力で選べなければ、SKILL.md は読まれず眠る。
+corpus が増えるほど選択は難しくなり、関係ないスキルを読んだり、
+必要なスキルを見落としたりする。
+
+skill-graph はこの選択を肩代わりする。プロンプトを受け取った時点で
+関連スキルを推薦し、hook / plugin 経由でエージェントの文脈へ注入
+する。エージェントは注入された候補から SKILL.md を実際に読み、
+宣言された依存スキルも辿れる。
+
+## 仕組み
+
+```text
+prompt → skill-graph recommend → additionalContext / system context
+        → エージェントが SKILL.md を読む → skill_load を記録
+        → 宣言依存を追加推薦
+```
+
+- **fail-open**: バイナリ不在・内部エラーでもセッションをブロック
+  しない。壊れた hook が残っても runtime の通常動作は妨げない。
+- **プライバシー**: prompt は SHA-256 hash のみ保存。会話本文・
+  コマンド・tool response は永続化しない。
+- **常駐しない**: デーモン・DB・インデックス・キャッシュを持たず、
+  呼び出しごとのオンメモリ処理。レイテンシ p95 ≈ 17ms
+  （500 skills、プロセス起動込み。詳細は
+  [evidence](docs/evidence/2026-11-27-v050-readme-perf-eval.md)）。
+- **推薦品質**: オフライン評価セットで Recall@3 = 52/52・
+  不要推薦 0・ネガティブケース全棄権（合成コーパス。
+  実利用効果とは別指標として区別する）。
+
+## Quick start
 
 ```bash
-mise use -g github:rebuildup/skill-graph          # 最新版
-mise use -g github:rebuildup/skill-graph@0.4.0   # バージョン固定
+mise use -g github:rebuildup/skill-graph   # または brew / npm / cargo（詳細は docs/install.md）
+skill-graph adapter enable claude-code      # codex / opencode も同様
+skill-graph adapter status claude-code      # enabled を確認
 ```
 
-GitHub Release のバイナリ tarball を直接取得するため、外部レジストリの
-公開状態に依存しない。clean environment での導入はこの経路を保証する。
+`adapter enable` はランタイムの設定ファイル（Claude Code
+`settings.json`、Codex `hooks.json`、OpenCode `opencode.json`）へ
+hook/plugin を**絶対パスで冪等に追記**する。`adapter disable` で
+追加分のみ除去できる。対応 OS・最低バージョン:
+Linux x86_64/ARM64 (glibc 2.39+)・macOS 15+・WSL2。
+Windows native は対象外。インストール手順・CLI リファレンス・
+MCP 設定・adapter 詳細・プライバシー境界・既知の制限は
+[docs/install.md](docs/install.md) にまとめた。
 
-### Homebrew
+## Documents
 
-```bash
-brew install rebuildup/tap/skill-graph
-```
+- [docs/install.md](docs/install.md) — 導入・CLI・adapter・privacy・制限
+- [docs/evidence/](docs/evidence/) — 性能・推薦品質・実利用効果の実測記録
+- [docs/specs/](docs/specs/) — 仕様・評価枠組み・観測 pilot 計画
+- [docs/adr/](docs/adr/) — 設計判断
 
-`rebuildup/homebrew-tap` の formula が v0.4.0 release asset を参照する
-（`on_macos`/`on_linux` × Intel/ARM）。
-
-### npm / Bun / pnpm（準備中・未公開）
-
-```bash
-npm install -g @rebuildup/skill-graph
-bun add -g @rebuildup/skill-graph
-pnpm add -g @rebuildup/skill-graph
-```
-
-パッケージ定義は `npm/` にあり、platform 別バイナリを optional
-dependency として同梱する設計（postinstall のダウンロード・ビルドなし）。
-ただし **npm registry への publish は未実施**（`NPM_TOKEN` 未設定）のため、
-現時点ではこのコマンドは失敗する。公開完了までは mise または Homebrew
-を使うこと。
-
-### crates.io（準備中・未公開）
-
-```bash
-cargo install skill-graph
-```
-
-crate 定義は `Cargo.toml` にあるが **crates.io への publish は未実施**
-（registry token 未設定）のため、現時点ではこのコマンドは失敗する。
-
-ソースからビルドする場合（Rust toolchain は `rust-toolchain.toml` 参照）:
-
-```bash
-git clone https://github.com/rebuildup/skill-graph && cd skill-graph
-cargo build --release   # -> target/release/skill-graph
-```
-
-### 対応プラットフォーム
-
-Linux x86_64/ARM64 (glibc, WSL2 含む)、macOS x86_64/ARM64。
-Windows は WSL2 経由。musl・Windows native は対象外。
-
-Windows native で `npm install @rebuildup/skill-graph` を実行すると、
-win32 向け optional package が存在しないため os/cpu gating により
-インストールが失敗する。これは意図した診断であり、Windows では
-WSL2 内で導入・実行する。ソースからのビルドも Windows native は
-サポート対象外（動作未検証）である。
-
-## CLI
-
-```bash
-skill-graph discover [--root <dir>]...                  # スキル列挙
-skill-graph search <query> [--root ...]                  # キーワード検索
-skill-graph recommend <query> [--root ...]               # 推薦（--format json）
-skill-graph resolve <target> [--root ...]                # 名前/リンク解決
-skill-graph observe <path> [--summary]                     # transcript/DB/イベントログの観測集計（--summary で funnel 指標）
-skill-graph detect --runtime <rt> --via <via>            # hook/plugin 用イベント正規化（stdin）
-                                                         # --via 既定値は "hook"。有効値: hook|plugin|transcript|db
-skill-graph hook <claude-code|codex|opencode> <prompt|skill-load> # ランタイム hook 入口（stdin、fail-open）
-skill-graph mcp                                          # stdio MCP server（read-only tools）
-skill-graph adapter <enable|disable|status> <rt>         # adapter ライフサイクル管理
-skill-graph bench <dataset> / perf                       # 評価・性能ハーネス
-```
-
-既定の探索 root: `~/.claude/skills`、`~/.agents/skills`、`./skills`、
-`./.claude/skills`、`./.agents/skills` 等。root の解決は全入口で共通:
-`SKILL_GRAPH_ROOTS`（colon 区切り）が設定されていれば **常に最優先**
-（`--root` や MCP tool の `roots` より優先される）→ 明示引数 →
-既定 root の順。`--root` は env 未設定時の上書きとして使う。
-永続キャッシュ・daemon・PATH 変更は行わない。
-
-## MCP server
-
-`skill-graph mcp` は stdio トランスポートの MCP server。CLI と同一の
-Discovery → Resolver → Recommendation エンジンを read-only tool として
-公開する（ADR-0005）。tool は `recommend` / `discover` / `resolve` の
-3 つで、状態変更・イベント書き込みは行わない。
-
-```bash
-skill-graph mcp   # stdio。JSON-RPC を stdin/stdout で話す
-```
-
-各クライアントの MCP 設定例（`command` はインストール済み
-`skill-graph` のパス）:
-
-```jsonc
-// Claude Code: ~/.claude.json またはプロジェクト .mcp.json
-{ "mcpServers": { "skill-graph": { "command": "skill-graph", "args": ["mcp"] } } }
-
-// OpenCode: opencode.json
-{ "mcp": { "skill-graph": { "type": "local", "command": ["skill-graph", "mcp"] } } }
-
-// Codex: ~/.codex/config.toml
-[mcp_servers.skill-graph]
-command = "skill-graph"
-args = ["mcp"]
-```
-
-`observe --summary` は observation-pilot の funnel 指標
-（delivery / conversion / unnecessary-load / timeliness / context
-consumption、runtime 別内訳つき）を算出する。
-
-## Runtime adapters（opt-in）
-
-`skill-graph adapter` がランタイムのネイティブ設定へ hook/plugin を
-**絶対パス・冪等 merge** で追加する。PATH・shell rc・無関係な設定は
-変更しない。`--user`（既定）/ `--project`（カレントプロジェクト）を選択可。
-
-```bash
-skill-graph adapter enable  claude-code
-skill-graph adapter enable  codex
-skill-graph adapter enable  opencode
-skill-graph adapter status  claude-code   # enabled/disabled/broken + legacy 検出通知
-skill-graph adapter disable claude-code   # 追加エントリのみ除去・完全復元
-```
-
-| Runtime | Mechanism | 備考 |
-|---|---|---|
-| claude-code | `settings.json` hooks（UserPromptSubmit / PostToolUse `Skill`） | hook コマンドは `<bin> hook claude-code <mode>` |
-| codex | `hooks.json`（UserPromptSubmit / PostToolUse `Bash`） | 初回は Codex TUI の `/hooks` で trust が必要（通常導入経路） |
-| opencode | `opencode.json` `plugins` → 同梱 TS plugin | `file://` specifier、plugin は `~/.local/share/skill-graph/opencode-plugin/` に materialize |
-
-hook コマンドには enable 時に PATH 解決した `skill-graph` の絶対パスを
-埋め込む。mise shim・npm global bin・brew のいずれのパスでも動作する。
-明示指定は `--bin <path>`（opencode は plugin が `SKILL_GRAPH_BIN` /
-PATH で解決するため `--bin` は使えない）。PATH 上の候補は `hook`
-サブコマンド対応を実際に probe するため、v0.3.x の古いバイナリが
-先に見つかっても埋め込まれない。
-
-### 挙動
-
-- prompt 受付時に関連スキルを推薦し `additionalContext`（または
-  OpenCode の system context）として注入。
-- SKILL.md の実読み込みを検出すると `skill_load` イベントを発行し、
-  宣言された依存スキルを追加推薦。
-- すべて fail-open: バイナリ不在・内部エラーでもセッションをブロック
-  しない（hook は常に exit 0、plugin は spawn 失敗を握りつぶす）。
-  パッケージ削除後に壊れた hook が残っても runtime の通常動作は妨げない。
-- イベントは `${TMPDIR}/skill-graph-events.jsonl`（JSONL）へ。
-  prompt は SHA-256 hash のみで本文・コマンド・tool response は
-  **一切保存しない**。
-- `skill-graph hook`（claude-code / codex / opencode）が参照する環境変数:
-  `SKILL_GRAPH_EVENT_LOG` で保存先変更、`SKILL_GRAPH_HOOK_NOSTATE=1`
-  で全書き込み無効化（state marker も生成しない no-save mode）、
-  `SKILL_GRAPH_EVENT_LOG_MAX`（既定 64MiB）でローテーション。
-- OpenCode plugin も `SKILL_GRAPH_EVENT_LOG`・`SKILL_GRAPH_ROOTS`・
-  `SKILL_GRAPH_BIN`・`SKILL_GRAPH_HOOK_NOSTATE`・
-  `SKILL_GRAPH_EVENT_LOG_MAX` を hook と同じ規約で参照する
-  （NOSTATE で全イベント書き込み停止、上限超過で `.1` へ
-  ローテーション）。recommend の query は stdin 経由
-  （`--query-stdin`）で、prompt 本文は argv に載らない。
-
-## Update / Uninstall
-
-- **更新**: 各パッケージマネージャの通常手順（`mise upgrade`、
-  `brew upgrade`、公開後は `npm install -g @rebuildup/skill-graph@latest`、
-  `cargo install --force`）。hook コマンドのパスが変わらない限り
-  adapter の再 enable は不要。パスが変わった場合は
-  `adapter disable && adapter enable` で張り替える。
-- **無効化（一時）**: `SKILL_GRAPH_HOOK_NOSTATE=1` でイベント書き込み停止
-  （`skill-graph hook` と OpenCode plugin の両経路に適用される）。
-- **adapter のみ無効化**: `skill-graph adapter disable <rt>`。
-  追加したエントリのみ除去し、他の hook/plugin・設定は保持。
-  `{}` まで減った設定ファイルは削除される（symlink 管理の設定は
-  リンクを残して target に `{}` を書き込む）。
-- **完全削除**: パッケージマネージャの uninstall に加え、事前に
-  `adapter disable` を実行して hook/plugin 参照を除去する
-  （残っても fail-open だが、設定を清潔に保つため推奨）。
-
-## v0.3.x からの移行
-
-v0.3.x の `install.sh` / `adapters/install.sh` で導入した環境は、
-新版インストール後に一度だけ移行する:
-
-```bash
-skill-graph adapter enable <rt>   # 旧 skill-graph-recommend-hook /
-                                  # /skill-graph plugin 参照を自動検出・除去して置き換え
-skill-graph adapter status <rt>   # enabled を確認後、旧配置を削除
-rm -rf ~/.local/share/skill-graph ~/.local/bin/skill-graph
-```
-
-Codex の `/hooks` trust はコマンド文字列の hash-pin のため、移行で
-コマンドが変わると **一度だけ再 trust が必要**（ユーザー操作）。
-
-## Privacy
-
-- 保存するのは `contracts/v1/skill-usage-event.schema.json` のイベント
-  のみ。会話本文・コマンド・tool response は永続化しない。
-- transcript / `opencode.db` の解析は read-only。`observe` はソースを
-  変更しない。
-- 既定の保存先は `${TMPDIR}`（揮発領域）のみ。永続的な観測が必要な場合は
-  `SKILL_GRAPH_EVENT_LOG` にユーザー指定パスを明示する（opt-in）。
-
-## Known limitations
-
-- macOS バイナリは提供するが実機検証は限定的。
-- Codex の skill-load 検出は `PostToolUse` matcher `Bash` のコマンド分類
-  （Codex に Skill tool は存在しない）。
-- bun は os/cpu gating を適用しないため全 platform package を取得する
-  （shim が正しい arch を選択するため動作上の問題はない）。
-- 永続キャッシュ・Embedding・グラフDB は意図的に未実装（v1.0.0 spec で
-  非採用を確定。MCP server は実装済み）。
-- マーカー（`# skill-graph-managed`）を持たない `hook <rt> <mode>`
-  形式のコマンドは、bin 名が `skill-graph` の場合のみ自動認識される。
-  手動編集や開発版で書かれた独自名バイナリの hook は `status` で
-  disabled と表示されるため、手動除去するか marker 付きで
-  `adapter enable` を再実行する。
-
-## Development
-
-`AGENTS.md`（開発契約）、`docs/specs/`（仕様・評価・pilot 計画）、
-`docs/evidence/`（実測記録）、`docs/adr/`（設計判断）が正本。
-品質ゲート: `mise run check`（fmt + clippy + test）。
+開発者向け: `AGENTS.md`（開発契約）、品質ゲート `mise run check`。

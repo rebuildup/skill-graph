@@ -43,6 +43,8 @@
   - query term が skill name に 2 語以上一致、または 1 語一致かつ corpus 内で低頻度（df ≤ max(2, distinct skill name 数の 10%)）かつ 4 文字以上
   - name hit 1 語以上 + description hit 2 語以上（name が identity を anchor し description が主題適合を確認する `name_plus_description`）
   - description hit 2 語以上、うち少なくとも 1 語が低頻度、かつ hit が **2 つ以上の独立した provenance source** から来ること（単一の CJK evidence unit が出す bigram cluster + glossary 展開を独立証拠と数えない）
+  - description hit が **ちょうど 1 語**で、その語が ASCII・4 文字以上・corpus 内でその skill のみに出現（df == 1）すること（`single_rare_description_hit`。語彙のずれで 1 語しか一致しない実務 prompt の recall を救済しつつ、複数 skill に共有される曖昧語では admit しない — #319）
+  - description hit が **1 つの curated 英語同意語 cluster**（`EN_GLOSS`、query term とその alias が同一 provenance source を共有）から **2 語以上の異なる term** で一致し、その source term が ASCII・4 文字以上・低頻度であること（`cluster_admitted`。alias は query 側のみに展開し context には適用しない — #319。df==1 経路が競合 skill 追加で消失する脆弱性を解消）
   - context term が description に 2 語以上一致し、同様に 2 つ以上の独立 source から来ること
   - 加えて、admitted skill の explicit `requires` link 先は necessity として伝播 admit される（parse-error skill は seed にも target にもならない）。伝播の (seed × link × 同名 copy) 組合せは 4,000,000 検査で打ち切り、伝播 reason も 1 skill 64 件の cap を共有する（#144 r17）。
   document frequency は name + description を対象に計算するが、description 側には frontmatter の `keywords` と組み込み glossary による CJK→英語展開（`expand_gloss`）を含む（`src/search.rs` の `document_frequency`）。Markdown link・名前言及・backlink・body text・link target の一致は relatedness / weak evidence であり、単独では推薦しない。

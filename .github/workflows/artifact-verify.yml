@@ -1,0 +1,196 @@
+name: Artifact verify
+on:
+  push:
+    branches: [main, "release-*"]
+    tags: ["v*"]
+  pull_request:
+    # #225 F08: the 4-target build/package/install/attest matrix is the
+    # FREEZE path, not the per-ticket gate. Ticket PRs (base release-*)
+    # run the lightweight ci.yml suite; this workflow runs on release
+    # pushes, tags, release-integration PRs (base main), and manual
+    # dispatch — verification is aggregated where the freeze candidate
+    # is formed. NOTE: manifest identity requires event=push, so a
+    # dispatch run verifies but can never be promoted.
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write          # actions/attest-build-provenance
+  attestations: write      # artifact attestations
+
+concurrency:
+  group: artifact-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-run:
+    # FREEZE point: every supported target is built, packaged by the
+    # SAME scripts/package-target.sh release promotion consumes, and
+    # the packaged tarball is extracted and EXECUTED natively on its
+    # own OS/arch runner — exec bit, executable format, --version,
+    # arch — then auth-free install-verified. The verified tarball +
+    # its sha256 digest are uploaded as a workflow artifact and
+    # build-provenance-attested: release.yml PROMOTES these frozen
+    # bytes instead of rebuilding, so published artifacts are
+    # byte-identical to verified artifacts (#225 r10).
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            npm_target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            npm_target: linux-arm64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            npm_target: darwin-arm64
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            npm_target: darwin-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - run: scripts/package-target.sh "${{ matrix.target }}" "${{ matrix.npm_target }}"
+      - name: Pack platform npm artifact around the frozen payload
+        # Every distribution channel's installable bytes are frozen
+        # HERE, not rebuilt at publish time (#225 A06): the .tgz is
+        # packed from the verified tarball's payload and digested
+        # into the approved manifest.
+        id: npmpkg
+        run: |
+          set -euo pipefail
+          mkdir -p freeze
+          scripts/package-npm-platform.sh "${{ matrix.npm_target }}" \
+            "skill-graph-${{ matrix.target }}.tar.gz"
+          npm_tgz="$(find . -maxdepth 1 -name 'rebuildup-skill-graph-${{ matrix.npm_target }}-*.tgz' -print -quit)"
+          [ -n "$npm_tgz" ] || { echo "platform npm tgz not produced" >&2; exit 1; }
+          npm_tgz="${npm_tgz#./}"
+          cp "$npm_tgz" "$npm_tgz.sha256" freeze/
+          echo "tgz=$npm_tgz" >> "$GITHUB_OUTPUT"
+      - name: Attest build provenance
+        # SLSA provenance for the frozen bytes — the digest attested
+        # here is the digest release promotion verifies before
+        # publishing (#225 r10).
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            skill-graph-${{ matrix.target }}.tar.gz
+            ${{ steps.npmpkg.outputs.tgz }}
+      - name: Auth-free local install verification
+        # Install lifecycle on the FROZEN artifacts — no repairs:
+        # cargo install from the packed .crate, real npm pack+install
+        # of both packages (shim -> platform payload exec), and a
+        # brew local-tap install of the file:// tarball. Exec
+        # permission, --version, deterministic hook output, and
+        # uninstall are asserted per channel (#225 r9/r10). Runs
+        # BEFORE freeze/upload so a failed run never produces
+        # promotable artifacts.
+        run: scripts/verify-install-local.sh
+      - name: Freeze verified artifact + digest + provenance meta
+        run: |
+          set -euo pipefail
+          mkdir -p freeze
+          asset="skill-graph-${{ matrix.target }}.tar.gz"
+          cp "$asset" "$asset.sha256" freeze/
+          digest="$(awk '{print $1}' "$asset.sha256")"
+          # freeze-meta.json binds this artifact to the EXACT run that
+          # produced and verified it: release promotion requires the
+          # pinned run_id + head_sha to match before it will publish
+          # these bytes — an arbitrary later successful run cannot be
+          # substituted (#225 r11).
+          cat > freeze/freeze-meta.json <<EOF
+          {"workflow":"artifact-verify.yml","head_sha":"$GITHUB_SHA","run_id":$GITHUB_RUN_ID,"run_attempt":$GITHUB_RUN_ATTEMPT,"target":"${{ matrix.target }}","npm_target":"${{ matrix.npm_target }}","asset":"$asset","sha256":"$digest"}
+          EOF
+          # Self-check: the digest file must match the artifact.
+          (cd freeze && shasum -a 256 -c "$asset.sha256" 2>/dev/null \
+            || sha256sum -c "$asset.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frozen-${{ matrix.npm_target }}
+          path: freeze/
+          # Frozen artifacts must outlive the gap between freeze and
+          # release; 90 days covers any realistic release cadence.
+          retention-days: 90
+          if-no-files-found: error
+
+  freeze-manifest:
+    # APPROVAL RECORD (#225 A01-A06): after all four targets freeze,
+    # this job re-verifies every per-target freeze-meta binding,
+    # recomputes every digest, produces the platform-independent
+    # artifacts (metapackage .tgz, .crate) once from this checkout,
+    # and emits freeze-manifest.json — the single manifest release,
+    # npm, and crates promotion must match EXACTLY. The manifest is
+    # created HERE, before any approval/publish step consumes it;
+    # promotion never regenerates it.
+    needs: package-and-run
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: 1.100.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: frozen-*
+          path: frozen
+          merge-multiple: false
+      - name: Eval gate (freeze acceptance, #225 G04)
+        # recall/forbidden regressions on the release dataset block
+        # the freeze — promotion consumes only manifests produced
+        # after this gate passed.
+        run: |
+          set -euo pipefail
+          cargo build --locked
+          scripts/check-eval-gate.sh ./target/debug/skill-graph
+      - name: Aggregate frozen artifacts into the approved manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          scripts/freeze-manifest.sh frozen manifest-out
+          meta_tgz="$(find manifest-out -maxdepth 1 -name 'rebuildup-skill-graph-*.tgz' -print -quit)"
+          crate="$(find manifest-out -maxdepth 1 -name 'skill-graph-*.crate' -print -quit)"
+          [ -n "$meta_tgz" ] && [ -n "$crate" ] || {
+            echo "manifest-out missing meta tgz or crate" >&2; exit 1; }
+          echo "meta_tgz=${meta_tgz#manifest-out/}" >> "$GITHUB_OUTPUT"
+          echo "crate=${crate#manifest-out/}" >> "$GITHUB_OUTPUT"
+      - name: Install-verify the APPROVED artifact set
+        # The manifest is the approval record — now prove the exact
+        # 10 digested artifacts it names actually install: cargo from
+        # the manifest .crate, npm from the manifest .tgz set (real
+        # upgrade path), brew from the manifest tarball. Every byte
+        # installed is re-hashed against freeze-manifest.json BEFORE
+        # install; nothing is re-packed (#225 A06/F03).
+        run: |
+          set -euo pipefail
+          mkdir -p frozen-set
+          cp -r frozen/frozen-* frozen-set/
+          cp manifest-out/* frozen-set/
+          scripts/verify-install-local.sh --frozen-set frozen-set
+      - name: Attest manifest + channel artifacts
+        # Provenance for the approval record itself and the
+        # platform-independent publish bytes (#225 A04).
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            manifest-out/freeze-manifest.json
+            manifest-out/${{ steps.manifest.outputs.meta_tgz }}
+            manifest-out/${{ steps.manifest.outputs.crate }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: approved-manifest
+          path: manifest-out/
+          retention-days: 90
+          if-no-files-found: error

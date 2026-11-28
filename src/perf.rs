@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 const QUERY: &str = "rust cli implementation cargo checks";
 const CONTEXT: &str = "module boundaries verification harness";
-const PROCESS_SAMPLES: usize = 5;
+// 30 process samples so p95 is a real order statistic (with n=5 the
+// p95 index collapsed onto the max — the reported "p95" was just the
+// slowest spawn, #225 r5). Worst-case cost: 16 sizes × 30 spawns.
+const PROCESS_SAMPLES: usize = 30;
 
 pub fn run(sizes: &[usize], iterations: usize) -> Result<Value, String> {
     if sizes.is_empty() {
@@ -122,6 +125,7 @@ fn run_size_inner(root: &PathBuf, size: usize, iterations: usize) -> Result<Valu
         "warm_recommend_max_ms": millis(warm_samples.iter().max().copied().unwrap_or_default()),
         "process_p50_ms": percentile(&process_samples, 0.50),
         "process_p95_ms": percentile(&process_samples, 0.95),
+        "process_max_ms": millis(process_samples.iter().max().copied().unwrap_or_default()),
         "process_samples": process_samples.len(),
         "recommended_count": recommended_count,
         "cleanup_ok": cleanup_ok,

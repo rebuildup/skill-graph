@@ -1,0 +1,57 @@
+{
+  "headline": "Peak RSS stays under ~7.5 MB across tested corpus sizes",
+  "subheadline": "peak RSS of `skill-graph discover` per invocation · no index or cache files",
+  "method": "/usr/bin/time -v 'Maximum resident set size' per process invocation, release build @ d69468a, quiet machine",
+  "value_rule": "rss_mb = maximum observed across samples_per_point runs (conservative peak)",
+  "samples_per_point": 20,
+  "measured_at": "2026-11-28",
+  "points": [
+    {
+      "label": "repo .agents/skills",
+      "skills": 24,
+      "rss_mb": 6.6,
+      "kind": "real",
+      "command": "discover --root .agents/skills"
+    },
+    {
+      "label": "design-skills repo",
+      "skills": 88,
+      "rss_mb": 7.4,
+      "kind": "real",
+      "command": "discover --root <design-skills>/skills"
+    },
+    {
+      "label": "synthetic 50",
+      "skills": 50,
+      "rss_mb": 6.4,
+      "kind": "synthetic",
+      "command": "discover --root <uniform corpus>"
+    },
+    {
+      "label": "synthetic 100",
+      "skills": 100,
+      "rss_mb": 6.3,
+      "kind": "synthetic",
+      "command": "discover --root <uniform corpus>"
+    },
+    {
+      "label": "synthetic 200",
+      "skills": 200,
+      "rss_mb": 6.6,
+      "kind": "synthetic",
+      "command": "discover --root <uniform corpus>"
+    },
+    {
+      "label": "synthetic 500",
+      "skills": 500,
+      "rss_mb": 7.4,
+      "kind": "synthetic",
+      "command": "discover --root <uniform corpus>"
+    }
+  ],
+  "footnotes": [
+    "synthetic series: identical ~240-byte SKILL.md template, only skill count varies (controlled body size)",
+    "hook end-to-end (verified additionalContext injection, 20/20 runs): 7.0 MB peak RSS · recommend @500 skills: 7.2 MB",
+    "measured with /usr/bin/time -v on release build · 20 runs per point, max reported · RSS includes binary + parsed corpus · x-axis: log scale"
+  ]
+}

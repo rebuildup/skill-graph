@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
   "project": "skill-graph",
-  "applied_project_init_revision": "285b139b01c199d3d4135d90f3cc3f6a932eff3b",
+  "applied_project_init_revision": "2ac7951c01cdce3a59dade7eb6434e9b13382cb8",
+  "applied_project_init_revision_note": "upstream rebuildup/project-init was renamed to rebuildup/aude-skills (same repository, aude-skills#212 / v0.4.1). This value is the adopted aude-skills commit recorded in skills-lock.json (v0.14.1); the previous 285b139b… revision predates the rename.",
   "runtime": {
     "primary": "rust",
     "version_source": "rust-toolchain.toml",

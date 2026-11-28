@@ -1,4 +1,5 @@
 use skill_graph::discovery::discover;
+use skill_graph::model::Availability;
 use skill_graph::parser::parse_skill;
 use skill_graph::resolver::build;
 use skill_graph::search::recommend;
@@ -69,6 +70,61 @@ fn keywords_bridge_paraphrased_task_phrasing() {
         3,
     );
     assert_eq!(recs[0].skill.name, "gamma-skill");
+}
+
+#[test]
+fn single_rare_description_term_admits_at_corpus_scale() {
+    // #319: a real task prompt may share exactly one content word with a
+    // skill's description vocabulary. Requiring two description hits made
+    // recommend() abstain on "--verbose and --output FILE flags" even
+    // though "flags" is a corpus-rare, meaningful term.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("skills");
+    write_skill_md(
+        &root.join("cli-arg-parsing"),
+        "cli-arg-parsing",
+        "Design command-line interfaces with clear flags, subcommands, help text, and validation. Use when adding CLI options, arguments, or a new command-line tool.",
+    );
+    // Distractors carry the prompt's other vocabulary so the target's
+    // "flags" hit stays the only description evidence it receives.
+    for i in 0..24 {
+        write_skill_md(
+            &root.join(format!("distractor-{i:02}")),
+            &format!("distractor-{i:02}"),
+            &format!(
+                "Reference for distractor topic number {i} covering reports, files, users, and lists."
+            ),
+        );
+    }
+    let graph = build(discover(&[root]));
+    let recs = recommend(
+        &graph,
+        "Create tools/report.py that prints the user list from app/main.py, with --verbose and --output FILE flags.",
+        "",
+        5,
+    );
+    assert!(
+        recs.iter().any(|r| r.skill.name == "cli-arg-parsing"),
+        "expected cli-arg-parsing in recommendations, got: {:?}",
+        recs.iter().map(|r| &r.skill.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn single_common_description_term_does_not_admit() {
+    // Guard for the #319 relaxation: a lone hit only admits when the term
+    // is corpus-rare. A term shared across many descriptions stays out.
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("skills");
+    for i in 0..24 {
+        write_skill_md(
+            &root.join(format!("common-{i:02}")),
+            &format!("common-{i:02}"),
+            "Guidance for handling files and reports in production systems.",
+        );
+    }
+    let graph = build(discover(&[root]));
+    assert!(recommend(&graph, "handle the files", "", 5).is_empty());
 }
 
 #[test]
@@ -385,6 +441,52 @@ fn resolver_mentions_are_capped_per_skill() {
     assert_eq!(mentions, 64, "mention cap should engage deterministically");
 }
 
+/// #225: the per-skill mention cap applies to resolved mentions, not to
+/// scanned tokens — unrelated vocabulary sorting before a real skill
+/// name must not crowd the genuine reference out of the cap.
+#[test]
+fn resolver_mentions_ignore_unrelated_token_flood() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["real-target", "other-skill"] {
+        let d = dir.path().join(name);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: fixture\n---\nbody\n"),
+        )
+        .unwrap();
+    }
+    let mentioner = dir.path().join("mentioner");
+    std::fs::create_dir_all(&mentioner).unwrap();
+    // 70 non-skill tokens that sort before "real-target"/"other-skill":
+    // under the old take(64)-then-filter order they consumed the entire
+    // cap and both genuine mentions were lost.
+    let flood = (0..70)
+        .map(|i| format!("aaa-filler-{i:02}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::fs::write(
+        mentioner.join("SKILL.md"),
+        format!("---\nname: mentioner\ndescription: flood\n---\n{flood} real-target other-skill\n"),
+    )
+    .unwrap();
+
+    let graph = build(discover(&[dir.path().to_path_buf()]));
+    let skill = graph
+        .skills
+        .iter()
+        .find(|s| s.name == "mentioner")
+        .expect("mentioner discovered");
+    let mut names: Vec<&str> = skill
+        .links
+        .iter()
+        .filter(|l| l.kind == skill_graph::model::LinkKind::Mention)
+        .map(|l| l.target.as_str())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["other-skill", "real-target"]);
+}
+
 /// #144 round-11: a CJK run that contains a recognized dictionary word
 /// plus uncovered characters (particles/suffixes like する) must still
 /// count as ONE evidence unit. Previously the uncovered bigrams fell
@@ -414,17 +516,21 @@ fn cjk_key_plus_particle_cannot_self_admit() {
 
 /// Round-13: a parse-error skill must never admit — including via the
 /// exact-name path — so it cannot seed requires-propagation for a
-/// dependency it declares.
+/// dependency it declares. #225 B07 split spec violations out of
+/// parse_error: a skill with an invalid frontmatter name is now
+/// compatibility-accepted (sanitized name + spec_violations) and its
+/// requires declarations work normally — this test uses a hard parse
+/// failure (broken YAML) for the exclusion guarantee instead.
 #[test]
 fn parse_error_skill_cannot_seed_requires() {
     let temp = tempfile::tempdir().unwrap();
-    // Dir fallback yields the valid name "bad-deploy" while the
-    // frontmatter name violates the spec charset -> parse_error set.
     let bad = temp.path().join("bad-deploy");
     fs::create_dir_all(&bad).unwrap();
+    // Broken YAML frontmatter: parse_error set, no metadata survives,
+    // so no requires link can exist — the skill is fully excluded.
     fs::write(
         bad.join("SKILL.md"),
-        "---\nname: \"bad\\ndeploy\"\ndescription: d\nmetadata:\n  requires-skills: victim-skill\n---\n\nbody\n",
+        "---\nname: [unclosed\ndescription: d\n---\n\nbody\n",
     )
     .unwrap();
     write_skill_md(
@@ -439,4 +545,115 @@ fn parse_error_skill_cannot_seed_requires() {
         recs.iter().all(|r| r.skill.name != "victim-skill"),
         "parse-error skill must not admit its requires target: {recs:?}"
     );
+}
+
+/// #225 B07: spec violations are compatibility-accepted — the skill
+/// stays discoverable/recommendable under a sanitized name with the
+/// violation recorded, distinct from a hard parse error.
+#[test]
+fn spec_violations_are_compat_accepted_not_parse_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    // Dir fallback yields the valid name "bad-deploy"; the frontmatter
+    // name contains a newline (spec charset violation).
+    let bad = temp.path().join("bad-deploy");
+    fs::create_dir_all(&bad).unwrap();
+    fs::write(
+        bad.join("SKILL.md"),
+        "---\nname: \"bad\\ndeploy\"\ndescription: bad deploy helper\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Consecutive hyphens violate the current spec name rule.
+    let hyph = temp.path().join("hyph");
+    fs::create_dir_all(&hyph).unwrap();
+    fs::write(
+        hyph.join("SKILL.md"),
+        "---\nname: foo--bar\ndescription: d\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Declared name valid but != directory name.
+    let mismatched = temp.path().join("real-dir");
+    fs::create_dir_all(&mismatched).unwrap();
+    fs::write(
+        mismatched.join("SKILL.md"),
+        "---\nname: other-name\ndescription: d\n---\n\nbody\n",
+    )
+    .unwrap();
+    // Missing description.
+    let nodesc = temp.path().join("nodesc");
+    fs::create_dir_all(&nodesc).unwrap();
+    fs::write(nodesc.join("SKILL.md"), "---\nname: nodesc\n---\n\nbody\n").unwrap();
+
+    let graph = build(discover(&[temp.path().to_path_buf()]));
+    let bad = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&bad))
+        .unwrap();
+    assert_eq!(bad.name, "bad-deploy", "sanitized to dir fallback");
+    assert!(bad.parse_error.is_none());
+    assert!(
+        bad.spec_violations
+            .iter()
+            .any(|v| v.contains("skill-name spec")),
+        "{:?}",
+        bad.spec_violations
+    );
+
+    let hyph = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&hyph))
+        .unwrap();
+    // "foo--bar" is spec-invalid: sanitized to the valid dir name.
+    assert_eq!(hyph.name, "hyph");
+    assert!(hyph.parse_error.is_none());
+    assert!(
+        hyph.spec_violations
+            .iter()
+            .any(|v| v.contains("skill-name spec")),
+        "{:?}",
+        hyph.spec_violations
+    );
+
+    let mismatched = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&mismatched))
+        .unwrap();
+    assert_eq!(mismatched.name, "other-name");
+    assert!(mismatched.parse_error.is_none());
+    assert!(
+        mismatched
+            .spec_violations
+            .iter()
+            .any(|v| v.contains("parent directory")),
+        "{:?}",
+        mismatched.spec_violations
+    );
+
+    let nodesc = graph
+        .skills
+        .iter()
+        .find(|s| s.path.starts_with(&nodesc))
+        .unwrap();
+    assert!(nodesc.parse_error.is_none());
+    assert!(
+        nodesc
+            .spec_violations
+            .iter()
+            .any(|v| v.contains("description")),
+        "{:?}",
+        nodesc.spec_violations
+    );
+
+    // Compat acceptance: spec-violating skills remain recommendable.
+    let recs = recommend(&graph, "bad deploy helper", "", 5);
+    assert!(
+        recs.iter().any(|r| r.skill.name == "bad-deploy"),
+        "compat-accepted skill must be recommendable: {recs:?}"
+    );
+    // And the violation is visible on the wire summary.
+    let summary = bad.summary();
+    assert!(!summary.spec_violations.is_empty());
+    assert!(matches!(summary.availability, Availability::Available));
 }

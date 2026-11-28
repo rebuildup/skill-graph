@@ -218,7 +218,15 @@ fn add_mentions(
     let mut tokens: Vec<String> = tokens.into_iter().collect();
     tokens.sort_unstable();
     let mut mentions = Vec::new();
-    for token in tokens.into_iter().take(MAX_MENTIONS_PER_SKILL) {
+    // The cap applies to MENTIONS, not scanned tokens: filtering for
+    // real skill names before counting keeps unrelated vocabulary from
+    // crowding genuine references out of the budget (#225). Sorted
+    // token order keeps truncation deterministic.
+    let mut taken = 0usize;
+    for token in tokens {
+        if taken >= MAX_MENTIONS_PER_SKILL {
+            break;
+        }
         if token == self_name {
             continue;
         }
@@ -228,13 +236,13 @@ fn add_mentions(
             // Each mention retains target + resolved_name clones plus
             // the SkillLink itself — derived links the parser's budget
             // never saw, so they draw from the shared resolve budget
-            // (#144 r19). Sorted token order keeps truncation
-            // deterministic.
+            // (#144 r19).
             let charge = token.len() as u64 * 2 + 384;
             if charge > *budget {
                 break;
             }
             *budget -= charge;
+            taken += 1;
             mentions.push(SkillLink {
                 target: token.clone(),
                 kind: LinkKind::Mention,
@@ -244,6 +252,42 @@ fn add_mentions(
         }
     }
     skills[index].links.extend(mentions);
+}
+
+/// Declared `requires` dependencies of `skill_name`, resolved against
+/// the graph (#225 B08): the union of resolved requires targets across
+/// every discovered copy of the name — sorted, deduplicated,
+/// self-references excluded. Returns (name, digest) pairs; the digest
+/// is the first discovered copy's, matching by_name representative
+/// semantics. Generic recommendations are NOT dependencies and must
+/// never be surfaced through this path — the skill-load hook and the
+/// OpenCode plugin both consume this single definition so their
+/// "declares dependencies" claims stay truthful.
+pub fn declared_dependencies(graph: &Graph, skill_name: &str) -> Vec<(String, String)> {
+    let mut deps: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for skill in graph.skills.iter().filter(|s| s.name == skill_name) {
+        for link in &skill.links {
+            if link.kind != LinkKind::Requires {
+                continue;
+            }
+            let Some(name) = &link.resolved_name else {
+                continue;
+            };
+            if name == skill_name || !seen.insert(name.clone()) {
+                continue;
+            }
+            let digest = graph
+                .by_name
+                .get(name)
+                .and_then(|idx| idx.first())
+                .map(|&i| graph.skills[i].digest.clone())
+                .unwrap_or_default();
+            deps.push((name.clone(), digest));
+        }
+    }
+    deps.sort();
+    deps
 }
 
 pub fn normalize_path(path: &Path) -> PathBuf {

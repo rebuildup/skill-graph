@@ -170,51 +170,6 @@ fn hardlinked_event_log_is_not_appended() {
     );
 }
 
-/// D-01: the .recommended session-state write obeys the same contract —
-/// a hardlinked state file is not truncated/rewritten.
-#[test]
-fn hardlinked_recommended_state_is_not_rewritten() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let rec = state.join("sec1.recommended");
-    std::fs::write(&rec, "alpha-skill\n").unwrap();
-    std::fs::hard_link(&rec, state.join("alias.recommended")).unwrap();
-
-    let envs = base_envs(&dir, &[]);
-    let (_, rc) = run_hook(&["hook", "claude-code", "prompt"], &prompt_payload(), &envs);
-    assert_eq!(rc, 0);
-    assert_eq!(
-        std::fs::read_to_string(&rec).unwrap(),
-        "alpha-skill\n",
-        "multiply-linked session state must not be rewritten"
-    );
-}
-
-/// D-01: a FIFO at the .recommended state path must not hang the hook on
-/// either the read or the write path.
-#[cfg(unix)]
-#[test]
-fn fifo_recommended_state_does_not_hang() {
-    let dir = tempfile::tempdir().unwrap();
-    let state = dir.path().join("state");
-    std::fs::create_dir_all(&state).unwrap();
-    let rec = state.join("sec1.recommended");
-    let c = std::ffi::CString::new(rec.to_string_lossy().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-
-    let envs = base_envs(&dir, &[]);
-    let mut child = spawn_hook(&["hook", "claude-code", "prompt"], &prompt_payload(), &envs);
-    let out = wait_bounded(&mut child, Duration::from_secs(15));
-    assert_eq!(out.status.code(), Some(0));
-    assert!(
-        std::fs::symlink_metadata(&rec)
-            .unwrap()
-            .file_type()
-            .is_fifo()
-    );
-}
-
 /// D-02: the plugin must have no file-append debug path left. Debug
 /// diagnostics are stderr-only and gated by NOSTATE, so
 /// SKILL_GRAPH_DEBUG=1 + SKILL_GRAPH_HOOK_NOSTATE=1 can never create

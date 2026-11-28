@@ -289,10 +289,11 @@ fn rec_event(
     emitted: bool,
 ) -> skill_graph::events::SkillUsageEvent {
     use skill_graph::events::{ObservedVia, RecommendedSkill, Runtime, Trigger};
+    let sid = skill_graph::events::SessionId::normalize(session);
     skill_graph::events::SkillUsageEvent::recommendation(
         Runtime::ClaudeCode,
         ObservedVia::Hook,
-        session,
+        &sid,
         ts,
         None,
         Trigger::PromptSubmit,
@@ -311,10 +312,11 @@ fn rec_event(
 
 fn load_event(session: &str, ts: &str, name: &str) -> skill_graph::events::SkillUsageEvent {
     use skill_graph::events::{Confidence, Detection, ObservedVia, Runtime};
+    let sid = skill_graph::events::SessionId::normalize(session);
     skill_graph::events::SkillUsageEvent::skill_load(
         Runtime::ClaudeCode,
         ObservedVia::Hook,
-        session,
+        &sid,
         ts,
         None,
         Some(name.to_string()),
@@ -408,7 +410,7 @@ fn summary_isolates_sessions_across_runtimes() {
 
     // Empty session id: still counted at top level, absent from by_session.
     let mut no_sid = load_event("", "2026-01-01T00:02:00Z", "gamma");
-    no_sid.session_id = String::new();
+    no_sid.session_id = skill_graph::events::SessionId::default();
     let obs2 = Observation {
         events: vec![no_sid],
         ..Default::default()
@@ -464,16 +466,22 @@ fn summary_reports_errors_and_session_cap() {
     assert_eq!(v["by_session_omitted"], 1);
 }
 
-/// Passthrough events are untrusted log input: session_id is normalized
-/// to the constructor bounds, oversized fields are capped, and a
-/// skill_load with an empty skill_name is counted in lines_skipped
-/// rather than vanishing silently.
+/// Passthrough events are untrusted log input: session_id must already
+/// be normalized contract form — a >128-char or non-charset id fails
+/// deserialization and the line is counted in lines_skipped rather
+/// than re-normalized into a different session (#225 r6). A
+/// skill_load with an empty skill_name is likewise counted in
+/// lines_skipped rather than vanishing silently.
 #[test]
 fn passthrough_normalizes_fields_and_counts_empty_name() {
     let dir = TempDir::new().unwrap();
-    let long_sid = "a".repeat(200);
+    let overlong_sid = "a".repeat(200);
+    let max_sid = "a".repeat(128);
     let event = format!(
-        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{long_sid}","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
+        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{overlong_sid}","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
+    );
+    let kept = format!(
+        r#"{{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"{max_sid}","timestamp":"2026-01-01T00:00:02Z","observed_via":"hook","skill_name":"alpha","detection":"file_read","confidence":"high"}}"#
     );
     write_transcript(
         &dir,
@@ -482,12 +490,14 @@ fn passthrough_normalizes_fields_and_counts_empty_name() {
             event.as_str(),
             // empty skill_name: present but unattributable -> skipped
             r#"{"schema_version":1,"kind":"skill_load","runtime":"claude-code","session_id":"s1","timestamp":"2026-01-01T00:00:01Z","observed_via":"hook","skill_name":"","detection":"file_read","confidence":"high"}"#,
+            kept.as_str(),
         ],
     );
     let obs = observe_path(dir.path()).unwrap();
     assert_eq!(obs.events.len(), 1);
-    assert_eq!(obs.lines_skipped, 1);
+    assert_eq!(obs.lines_skipped, 2);
     assert_eq!(obs.events[0].session_id.len(), 128);
+    assert_eq!(obs.events[0].session_id.as_str(), max_sid);
     assert!(
         obs.events[0]
             .session_id
@@ -643,8 +653,11 @@ fn summary_scopes_unnecessary_rate_to_session_loads() {
     assert_eq!(v["session_attributed_loads"], 1);
     assert_eq!(v["unnecessary_loads"], 0);
     assert_eq!(v["unnecessary_load_rate_pct"], 0.0);
-    // loads_per_session is a top-level metric over ALL loads.
-    assert_eq!(v["loads_per_session"], 2.0);
+    // loads_per_session shares the session-attributed population:
+    // numerator is session_attributed_loads (1), denominator is the
+    // session count (1) — the anonymous load is in load_grade_loads
+    // only (#225 E04).
+    assert_eq!(v["loads_per_session"], 1.0);
 }
 
 /// RFC 3339 fractional seconds keep millisecond precision — a 500ms
@@ -1001,4 +1014,238 @@ fn funnel_untimestamped_rec_compares_all_same_name_candidates() {
     // takes L2 -> 2 conversions. First-eligible-in-list-order would
     // give R1 the timestamped L2 and leave R2 nothing -> 1.
     assert_eq!(v["converted_recommendations"], 2);
+}
+
+/// #225 E01: the session join is computed once and shared by the
+/// overall, per-runtime, and per-session funnels — every level must
+/// report the same conversion numbers.
+#[test]
+fn summary_levels_agree_on_session_join() {
+    use skill_graph::events::Runtime;
+    use skill_graph::observe::{Observation, summary};
+
+    let mut events = Vec::new();
+    for (i, session) in ["s1", "s2", "s3"].iter().enumerate() {
+        for j in 0..4 {
+            events.push(rec_event(
+                session,
+                &format!("2026-01-01T00:0{}:00Z", i),
+                &["alpha"],
+                true,
+            ));
+            events.push(load_event(
+                session,
+                &format!("2026-01-01T00:0{}:30Z", i),
+                "alpha",
+            ));
+            let _ = j;
+        }
+    }
+    // Add a codex-runtime session too so by_runtime has two entries.
+    {
+        use skill_graph::events::{Confidence, Detection, ObservedVia, RecommendedSkill, Trigger};
+        let sid = skill_graph::events::SessionId::normalize("cx1");
+        events.push(skill_graph::events::SkillUsageEvent::recommendation(
+            Runtime::Codex,
+            ObservedVia::Hook,
+            &sid,
+            "2026-01-01T01:00:00Z",
+            None,
+            Trigger::PromptSubmit,
+            vec![RecommendedSkill {
+                name: "beta".to_string(),
+                digest: None,
+            }],
+            true,
+            "test",
+            None,
+        ));
+        events.push(skill_graph::events::SkillUsageEvent::skill_load(
+            Runtime::Codex,
+            ObservedVia::Hook,
+            &sid,
+            "2026-01-01T01:00:30Z",
+            None,
+            Some("beta".to_string()),
+            None,
+            Detection::FileRead,
+            Confidence::High,
+        ));
+    }
+    let obs = Observation {
+        events,
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    let total_converted = v["converted_recommendations"].as_u64().unwrap();
+    assert_eq!(total_converted, 13, "12 claude + 1 codex conversions");
+    // by_runtime must partition the same joins exactly.
+    let rt_sum: u64 = v["by_runtime"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|f| f["converted_recommendations"].as_u64().unwrap())
+        .sum();
+    assert_eq!(rt_sum, total_converted, "runtime funnels disagree");
+    // by_session likewise (all sessions fit under the cap).
+    let ss_sum: u64 = v["by_session"]
+        .as_object()
+        .unwrap()
+        .values()
+        .map(|f| f["converted_recommendations"].as_u64().unwrap())
+        .sum();
+    assert_eq!(ss_sum, total_converted, "session funnels disagree");
+    assert_eq!(v["conversion_status"], "complete");
+}
+
+/// #225 E02: when the pair-check budget is exhausted the funnel must
+/// say so — conversion/timeliness are withheld (null) and the status
+/// is "partial" at every aggregation level, never a complete-looking
+/// rate computed from truncated data.
+#[test]
+fn summary_marks_partial_when_pair_budget_exhausted() {
+    use skill_graph::observe::{Observation, summary};
+
+    // Untimestamped recs+loads on one name: the encounter-order
+    // fallback re-scans the remaining load list per rec, so
+    // 2000 x 6000 pairs (~10M) exceed MAX_FUNNEL_PAIR_CHECKS (8M).
+    let mut events = Vec::new();
+    for _ in 0..2000 {
+        events.push(rec_event("big", "", &["alpha"], true));
+    }
+    for _ in 0..6000 {
+        events.push(load_event("big", "", "alpha"));
+    }
+    let obs = Observation {
+        events,
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["conversion_status"], "partial");
+    assert!(v["conversion_rate_pct"].is_null());
+    assert!(v["timeliness_ms"].is_null());
+    // The session-level funnel for the same session agrees.
+    let sess = v["by_session"].as_object().unwrap();
+    let (key, f) = sess.iter().next().unwrap();
+    assert!(key.contains("big"));
+    assert_eq!(f["conversion_status"], "partial");
+    assert!(f["conversion_rate_pct"].is_null());
+}
+
+/// #225 E03: a load sharing the recommendation's timestamp only
+/// converts when it was also encountered later — `b >= a` alone let a
+/// load that happened BEFORE the recommendation convert it.
+#[test]
+fn summary_same_timestamp_requires_later_encounter() {
+    use skill_graph::observe::{Observation, summary};
+
+    // Load encountered BEFORE the rec at the same timestamp: no convert.
+    let obs = Observation {
+        events: vec![
+            load_event("s", "2026-01-01T00:00:00Z", "alpha"),
+            rec_event("s", "2026-01-01T00:00:00Z", &["alpha"], true),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 0);
+
+    // Same timestamp but load encountered AFTER the rec: converts.
+    let obs = Observation {
+        events: vec![
+            rec_event("s", "2026-01-01T00:00:00Z", &["alpha"], true),
+            load_event("s", "2026-01-01T00:00:00Z", "alpha"),
+        ],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+}
+
+/// #225 E05: conversion identity is (name, digest) — a same-name load
+/// of a DIFFERENT known revision neither converts nor counts as
+/// necessary; unknown digests on either side degrade to name-level.
+#[test]
+fn summary_conversion_respects_skill_digest() {
+    use skill_graph::events::RecommendedSkill;
+    use skill_graph::observe::{Observation, summary};
+
+    let mut rec = rec_event("s", "2026-01-01T00:00:00Z", &["alpha"], true);
+    rec.recommended = vec![RecommendedSkill {
+        name: "alpha".to_string(),
+        digest: Some("d1".to_string()),
+    }];
+
+    // Different known digest: no conversion, unnecessary load.
+    let mut wrong = load_event("s", "2026-01-01T00:01:00Z", "alpha");
+    wrong.skill_digest = Some("d2".to_string());
+    let obs = Observation {
+        events: vec![rec.clone(), wrong],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 0);
+    assert_eq!(v["unnecessary_loads"], 1);
+
+    // Same digest: converts.
+    let mut right = load_event("s", "2026-01-01T00:01:00Z", "alpha");
+    right.skill_digest = Some("d1".to_string());
+    let obs = Observation {
+        events: vec![rec.clone(), right],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+    assert_eq!(v["unnecessary_loads"], 0);
+
+    // Load digest unknown: name-level match still converts.
+    let obs = Observation {
+        events: vec![rec, load_event("s", "2026-01-01T00:01:00Z", "alpha")],
+        ..Default::default()
+    };
+    let v = summary(&obs);
+    assert_eq!(v["converted_recommendations"], 1);
+}
+
+/// #225 E06: the OpenCode DB path applies the same failure contract as
+/// live detection — a tool part whose state reports an error produces
+/// no skill_load, while a completed one still does.
+#[test]
+fn opencode_db_failed_tool_state_emits_no_load() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("opencode.db");
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, type TEXT NOT NULL, seq INTEGER NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL)",
+        [],
+    )
+    .unwrap();
+    let tool = |status: &str, error: serde_json::Value| {
+        serde_json::json!({"time":{"created":1793321019000i64},"content":[
+            {"type":"tool","name":"read","state":{"status":status,"input":{"path":"/repo/.opencode/skill/probe/SKILL.md"},"content":[{"type":"text","text":"---\nname: probe-skill\n---\nbody"}],"error":error}}
+        ]})
+        .to_string()
+    };
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m1','ses_1','assistant',1,1793321019000,1793321019000,?)",
+        [tool("error", serde_json::json!("boom"))],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_message VALUES ('m2','ses_1','assistant',2,1793321019001,1793321019001,?)",
+        [tool("completed", serde_json::Value::Null)],
+    )
+    .unwrap();
+    drop(conn);
+
+    let obs = observe_path(dir.path()).unwrap();
+    let loads: Vec<_> = obs
+        .events
+        .iter()
+        .filter(|e| e.kind == EventKind::SkillLoad)
+        .collect();
+    // Only the completed call loads; the errored one is skipped —
+    // same contract as detect_all_from_payload's failure gate.
+    assert_eq!(loads.len(), 1, "events: {:?}", obs.events.len());
+    assert_eq!(loads[0].skill_name.as_deref(), Some("probe-skill"));
 }

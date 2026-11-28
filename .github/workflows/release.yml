@@ -1,15 +1,26 @@
 name: Release
+# #225 A01/A02: the ONLY promotion path is an explicit dispatch pinned
+# to ONE approved freeze run AND the approved manifest's sha256. A
+# tag push no longer publishes anything — the tag-triggered
+# artifact-verify run is a fresh freeze whose bytes were never the
+# approval target.
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to (re)build release assets for"
+        description: "Existing tag to publish release assets for"
+        required: true
+      freeze_run_id:
+        description: "artifact-verify run ID whose frozen artifacts to promote (the APPROVED freeze run)"
+        required: true
+      freeze_manifest_sha256:
+        description: "sha256 of the APPROVED freeze-manifest.json (the approval record digest)"
         required: true
 
 permissions:
   contents: write
+  actions: read      # resolve the artifact-verify (freeze) run for the tag SHA
+  attestations: read # verify build-provenance attestations before publish
 
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
@@ -18,12 +29,15 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       tag_sha: ${{ steps.tag.outputs.tag_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          # Dispatch-only workflow: the tag input names the release
+          # tag; github.ref would be the dispatch branch, not the tag.
+          ref: ${{ github.event.inputs.tag }}
       - name: Bind checkout to the release tag commit
         id: tag
         env:
@@ -45,66 +59,184 @@ jobs:
           [ "$head_sha" = "$tag_sha" ] || {
             echo "checked-out HEAD $head_sha is not tag $RELEASE_TAG ($tag_sha)"; exit 1; }
           echo "tag_sha=$tag_sha" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           toolchain: 1.100.0
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-  build:
-    needs: verify
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # The peeled tag commit resolved and verified in `verify` —
-          # never the ambiguous tag/branch name (#144 r20).
-          ref: ${{ needs.verify.outputs.tag_sha }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.100.0
-          targets: ${{ matrix.target }}
-      - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package binary
-        run: |
-          bin="target/${{ matrix.target }}/release/skill-graph"
-          strip "$bin" 2>/dev/null || true
-          mkdir -p pkg
-          cp "$bin" pkg/skill-graph
-          tar -czf "skill-graph-${{ matrix.target }}.tar.gz" -C pkg skill-graph
-          rm -rf pkg
-      - uses: actions/upload-artifact@v4
-        with:
-          name: skill-graph-${{ matrix.target }}
-          path: skill-graph-${{ matrix.target }}.tar.gz
-
+  # NO build job: release does not rebuild. artifact-verify.yml is the
+  # single build+verify+freeze path — it produces the deterministic
+  # tarball, proves it natively on the target runner, install-verifies
+  # it auth-free, digests it, and attests provenance. The release job
+  # below PROMOTES those frozen bytes: it resolves the successful
+  # artifact-verify run for the tag commit, downloads the frozen
+  # artifacts, and re-verifies every sha256 digest before upload —
+  # published bytes are byte-identical to verified bytes (#225 r10).
   release:
-    needs: [verify, build]
+    needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.verify.outputs.tag_sha }}
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+      - name: Resolve the PINNED freeze run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_SHA: ${{ needs.verify.outputs.tag_sha }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          FREEZE_RUN_ID_INPUT: ${{ github.event.inputs.freeze_run_id }}
+        run: |
+          set -euo pipefail
+          # The approval target is pinned to ONE freeze run — never
+          # "whatever succeeded most recently" and never an implicitly
+          # resolved run (#225 A01/A02). workflow_dispatch requires an
+          # explicit freeze_run_id; there is no tag-push fallback.
+          validate_run() {
+            local id="$1" j
+            j="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id")" || return 1
+            # Promotable run definition (#225 A03): the artifact-verify
+            # workflow, a PUSH event (PR runs are never promotable —
+            # their checkout is a merge/PR head, not the released
+            # commit), completed+success, head_sha == the tag commit,
+            # and we capture run_attempt so the manifest's recorded
+            # attempt can be matched exactly (a re-run's artifacts
+            # supersede earlier attempts').
+            [ "$(jq -r '.path' <<< "$j")" = ".github/workflows/artifact-verify.yml" ] || {
+              echo "run $id is not artifact-verify.yml" >&2; return 1; }
+            [ "$(jq -r '.event' <<< "$j")" = "push" ] || {
+              echo "run $id event is not push" >&2; return 1; }
+            [ "$(jq -r '.head_sha' <<< "$j")" = "$TAG_SHA" ] || {
+              echo "run $id head_sha != tag commit $TAG_SHA" >&2; return 1; }
+            [ "$(jq -r '.status' <<< "$j")" = "completed" ] || return 1
+            [ "$(jq -r '.conclusion' <<< "$j")" = "success" ] || return 1
+            RUN_ATTEMPT="$(jq -r '.run_attempt' <<< "$j")"
+            RUN_EVENT="$(jq -r '.event' <<< "$j")"
+            RUN_REF="$(jq -r '.head_branch' <<< "$j")"
+          }
+          [[ "$FREEZE_RUN_ID_INPUT" =~ ^[0-9]+$ ]] || {
+            echo "invalid freeze_run_id: $FREEZE_RUN_ID_INPUT" >&2; exit 1; }
+          validate_run "$FREEZE_RUN_ID_INPUT"
+          run_id="$FREEZE_RUN_ID_INPUT"
+          # Re-validate the resolved run through the same promotable
+          # definition — the list query is a filter, not a proof.
+          validate_run "$run_id"
+          echo "promoting artifacts from PINNED artifact-verify run $run_id (attempt $RUN_ATTEMPT)"
+          {
+            echo "FREEZE_RUN_ID=$run_id"
+            echo "FREEZE_RUN_ATTEMPT=$RUN_ATTEMPT"
+            echo "FREEZE_RUN_REF=$RUN_REF"
+          } >> "$GITHUB_ENV"
+      - name: Download frozen artifacts; verify the APPROVED manifest and every digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_SHA: ${{ needs.verify.outputs.tag_sha }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          APPROVED_MANIFEST_SHA256: ${{ github.event.inputs.freeze_manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist frozen
+          gh run download "$FREEZE_RUN_ID" --dir frozen
+          # The approval record is the freeze-manifest.json produced by
+          # the pinned run's freeze-manifest job — NOT something this
+          # job regenerates (#225 A02). FIRST bind it to the digest
+          # the approver pinned as a separate dispatch input (#225
+          # A05): a manifest that merely parses is not THE approved
+          # record. THEN verify-freeze-manifest.py binds identity
+          # (run/attempt/sha/event/ref) and proves EVERY listed
+          # artifact exists exactly once across the downloaded
+          # frozen-* and approved-manifest dirs with its recorded
+          # sha256 (#225 A01/A03/A04).
+          manifest="frozen/approved-manifest/freeze-manifest.json"
+          [ -f "$manifest" ] || {
+            echo "approved-manifest artifact missing freeze-manifest.json" >&2; exit 1; }
+          [[ "$APPROVED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+            echo "invalid freeze_manifest_sha256 input" >&2; exit 1; }
+          got_manifest_sha="$(sha256sum "$manifest" | awk '{print $1}')"
+          [ "$got_manifest_sha" = "$APPROVED_MANIFEST_SHA256" ] || {
+            echo "freeze-manifest.json digest $got_manifest_sha != approved $APPROVED_MANIFEST_SHA256" >&2
+            echo "this is NOT the approved manifest — refusing to promote." >&2
+            exit 1; }
+          # The manifest's ref must correspond to the PINNED run's
+          # head_branch: refs/heads/<b> for branch pushes, refs/tags/<t>
+          # for tag pushes (#225 A04).
+          expect_refs=()
+          case "$FREEZE_RUN_REF" in
+            "") echo "pinned run head_branch unresolved" >&2; exit 1 ;;
+            *)
+              expect_refs+=(--expect-ref "refs/heads/$FREEZE_RUN_REF")
+              expect_refs+=(--expect-ref "refs/tags/$FREEZE_RUN_REF")
+              ;;
+          esac
+          python3 scripts/verify-freeze-manifest.py "$manifest" \
+            --run-id "$FREEZE_RUN_ID" \
+            --run-attempt "$FREEZE_RUN_ATTEMPT" \
+            --head-sha "$TAG_SHA" \
+            --event push \
+            "${expect_refs[@]}" \
+            --require-channel release \
+            --require-channel npm \
+            --require-channel npm-meta \
+            --require-channel crates \
+            --artifact-dir frozen
+          # Per-target freeze-meta must still bind this run/SHA —
+          # defense in depth behind the manifest check.
+          shopt -s nullglob
+          dirs=(frozen/frozen-*/)
+          [ "${#dirs[@]}" -eq 4 ] || {
+            echo "expected 4 frozen target artifacts, found ${#dirs[@]}" >&2; exit 1; }
+          for d in "${dirs[@]}"; do
+            meta="$d/freeze-meta.json"
+            [ -f "$meta" ] || { echo "missing freeze-meta.json in $d" >&2; exit 1; }
+            python3 - "$meta" "$FREEZE_RUN_ID" "$FREEZE_RUN_ATTEMPT" "$TAG_SHA" <<'PY'
+          import json, sys
+          meta, run_id, attempt, sha = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+          m = json.load(open(meta))
+          assert m["workflow"] == "artifact-verify.yml", m
+          assert m["run_id"] == int(run_id), m
+          assert m["run_attempt"] == int(attempt), m
+          assert m["head_sha"] == sha, m
+          assert m["asset"].startswith("skill-graph-") and m["asset"].endswith(".tar.gz"), m
+          assert len(m["sha256"]) == 64, m
+          PY
+            tarball="$(python3 -c "import json;print(json.load(open('$meta'))['asset'])")"
+            [ -f "$d/$tarball" ] || { echo "missing $tarball in $d" >&2; exit 1; }
+            mv "$d/$tarball" dist/
+          done
+          shopt -u nullglob
+          # The manifest verified above already proved every tarball
+          # digest; re-assert the release asset set is complete.
+          for asset in \
+            skill-graph-x86_64-unknown-linux-gnu.tar.gz \
+            skill-graph-aarch64-unknown-linux-gnu.tar.gz \
+            skill-graph-aarch64-apple-darwin.tar.gz \
+            skill-graph-x86_64-apple-darwin.tar.gz; do
+            [ -f "dist/$asset" ] || { echo "missing frozen asset $asset" >&2; exit 1; }
+          done
+          # Build-provenance attestation bound to the APPROVED source:
+          # signer workflow + source commit digest + signer repo — a
+          # valid signature from any other workflow/run/SHA is
+          # rejected (#225 A04). The run binding itself comes from the
+          # manifest (run_id+attempt) verified above.
+          cp "$manifest" freeze-manifest.json
+          for f in dist/*.tar.gz; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "rebuildup/skill-graph/.github/workflows/artifact-verify.yml" \
+              --signer-repo "rebuildup/skill-graph" \
+              --source-digest "$TAG_SHA"
+          done
+          gh attestation verify freeze-manifest.json --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "rebuildup/skill-graph/.github/workflows/artifact-verify.yml" \
+            --signer-repo "rebuildup/skill-graph" \
+            --source-digest "$TAG_SHA"
+          cat freeze-manifest.json
+          ls -l dist/
       - name: Verify tag and version consistency
         env:
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
           # Tag names reach shell via env only; validate before any use.
           [[ "$RELEASE_TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || {
             echo "invalid tag: $RELEASE_TAG"; exit 1; }
@@ -121,23 +253,22 @@ jobs:
             echo "checked-out HEAD $head_sha is not the verified tag commit"; exit 1; }
       - name: Checksums
         run: |
+          set -euo pipefail
           cd dist
           sha256sum *.tar.gz > ../sha256sums.txt
           cat ../sha256sums.txt
       - name: GitHub Release
+        # The publish/reconcile state machine lives in
+        # scripts/publish-release.sh so every decision branch — fresh
+        # create, identical no-op, additive recovery, and each refuse
+        # path — is covered by scripts/test-publish-release.sh (#225
+        # F01). This step only supplies inputs.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
+          set -euo pipefail
           tag="$RELEASE_TAG"
           notes="docs/release/${tag}.md"
           [ -f "$notes" ] || notes=""
-          # Idempotent on workflow_dispatch reruns: upload --clobber when a
-          # release already exists for the tag.
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/*.tar.gz sha256sums.txt --clobber
-          else
-            gh release create "$tag" dist/*.tar.gz sha256sums.txt \
-              --title "skill-graph $tag" \
-              ${notes:+--notes-file "$notes"} --verify-tag
-          fi
+          scripts/publish-release.sh "$tag" dist ${notes:+"$notes"}

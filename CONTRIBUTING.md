@@ -20,11 +20,21 @@ skill-graph は release-driven development で進める。GitHub Issue、Spec、
 
 ## Verification
 
-通常 ticket では次を最低限確認する。
+通常 ticket では `mise run check` を通す。これはローカルで完結する
+全 correctness gate を含む: `cargo fmt --check`、`cargo clippy`、
+`cargo test`、OpenCode plugin の bun contract test、release 系
+shell suite（`test-release-verify.sh` / `test-freeze-manifest.sh` /
+`test-npm-publish.sh`）。
 
-- `cargo fmt --check`
-- `cargo clippy --all-targets -- -D warnings`
-- `cargo test`
-- 変更に対応する fixture / contract test
+`mise run check` が**含まない**もの（#225 F07 — check green を
+包括保証と混同しない）:
+
+- plugin の host API 型検査（`mise run check-plugin-types`、
+  `@opencode/plugin` の install が必要）
+- 4 ターゲットの packaging / native install 検証
+  （`artifact-verify.yml`、freeze 時に集約）
+- bench / eval / perf（`mise run bench` / `mise run perf`、
+  release candidate での証跡測定）
+- npm/crates.io publish・provenance 等の公開後検証
 
 重い benchmark や実機検証は release candidate で集約する。ただし、実現可能性の判断に必要な最小計測は ticket 内で行ってよい。

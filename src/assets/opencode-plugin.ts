@@ -31,9 +31,19 @@ const absPath = (v: string | undefined): string | undefined =>
   v !== undefined && v !== "" && !v.includes("\uFFFD") && isAbsolute(v)
     ? v
     : undefined
+// Per-user state root — parity with the Rust hook's per_user_state_root
+// (#225 D06): shared TMPDIR defaults let two accounts collide on the
+// event log. XDG_STATE_HOME > HOME/.local/state > TMPDIR.
+const stateRoot = (() => {
+  const xdg = absPath(process.env.XDG_STATE_HOME)
+  if (xdg) return join(xdg, "skill-graph")
+  const home = absPath(process.env.HOME)
+  if (home) return join(home, ".local", "state", "skill-graph")
+  return join(absPath(tmpdir()) ?? "/tmp", "skill-graph")
+})()
 const EVENT_LOG =
   absPath(process.env.SKILL_GRAPH_EVENT_LOG) ??
-  join(absPath(tmpdir()) ?? "/tmp", "skill-graph-events.jsonl")
+  join(stateRoot, "events.jsonl")
 // Parity with the Rust hook: SKILL_GRAPH_HOOK_NOSTATE=1 suppresses all
 // event writes; SKILL_GRAPH_EVENT_LOG_MAX bounds the log (rotate to .1).
 const NOSTATE = process.env.SKILL_GRAPH_HOOK_NOSTATE === "1"
@@ -64,8 +74,6 @@ const MAX_PENDING_SESSIONS = 200
 // names retained per session for dedup (#144 r14).
 const MAX_PROMPT_SKILLS = 1_024
 const MAX_SEEN_SKILLS = 4_096
-const MAX_SESSION_CTX = 200
-const MAX_SESSION_NAMES = 32
 // detectLoad spawns one `skill-graph detect` subprocess per
 // SKILL.md-touching tool call; bound the count per session so a
 // pathological session cannot churn unbounded subprocesses. Legit
@@ -73,7 +81,6 @@ const MAX_SESSION_NAMES = 32
 // events) rather than hanging the event loop.
 const MAX_DETECT_PER_SESSION = 512
 const emitted = new Set<string>()
-const sessionCtx = new Map<string, string[]>()
 const detectCounts = new Map<string, number>()
 
 function sha256(text: string): string {
@@ -86,21 +93,86 @@ function validSkillName(name: string): boolean {
   return /^[a-z0-9-]{1,64}$/.test(name) && !name.startsWith("-") && !name.endsWith("-")
 }
 
-// Mirror events.rs's sanitize_session_id contract: absent/empty ids
+// Mirror events.rs's SessionId::normalize contract: absent/empty ids
 // stay unattributed (""), charset-valid ids pass through bounded, and
 // distinct all-invalid ids hash apart instead of collapsing into one
-// "unknown" funnel session.
-function safeSessionID(id: unknown): string {
+// "unknown" funnel session. Exported for the parity contract test
+// (opencode-plugin.test.ts) — the sanitize rules are part of the
+// cross-entrypoint event contract (#225).
+// Session-id contract (#225 r5, parity with events::SessionId::normalize):
+// the sanitized form must be INJECTIVE over arbitrary host input. The
+// previous head+8hex scheme let a charset-valid literal id collide with
+// another id's transformed output ("sess1-deadbeef" == sanitize("sess!1")).
+// The transform output shape — "-" + 32 lowercase hex at the end — is
+// RESERVED: any id matching it is itself transformed, so passthrough
+// and generated namespaces can never overlap. Idempotency is NOT a
+// contract (injectivity and idempotency are mutually exclusive for a
+// charset-lossy map); sanitize runs once per event at ingest.
+const ID_MAX_CHARS = 128
+const ID_HEAD_CHARS = 95 // 95 + 1 + 32 = 128
+const ID_SCAN_CHARS = 8192
+const ID_HASH_HEX = 32
+const ID_SAFE_CHAR = /[A-Za-z0-9._-]/
+const ID_RESERVED = /-[0-9a-f]{32}$/
+
+// Session-id transport boundary: the RAW host id is bounded BEFORE it
+// feeds both safeSessionID (state keys, emitted events) and the
+// detect payload. The slice MUST preserve the whole identity domain
+// decision: normalize maps ids of >ID_SCAN_CHARS(8192) code points to
+// the unattributed ("") namespace (#225 C01), so the slice must
+// (a) contain the ENTIRE string whenever it has <=8192 code points —
+// 8192 x 4-byte chars = 32768 bytes — and (b) contain >8192 code
+// points whenever the original does — a maximal prefix of B bytes
+// holds at least floor((B-3)/4) code points, so B >= 32772 guarantees
+// >=8193. 32784 satisfies both with margin. safeSessionID and
+// SessionId::normalize then agree EXACTLY on every input (#225 r9 —
+// the domain is a normalize contract, not a producer-local
+// truncation).
+const SESSION_ID_RAW_MAX_BYTES = 32784
+function rawSessionID(event: { sessionID?: unknown } | null | undefined): string {
+  const s = event?.sessionID
+  return typeof s === "string" ? utf8Slice(s, SESSION_ID_RAW_MAX_BYTES) : ""
+}
+
+export function safeSessionID(id: unknown): string {
   const s = typeof id === "string" ? id : ""
-  const filtered = s.replace(/[^A-Za-z0-9._-]/g, "")
-  // Distinct ids sharing a 128-char prefix must not collapse: bounded
-  // head plus a hash suffix of the original (parity with Rust).
-  if (filtered.length > 128) {
-    return `${filtered.slice(0, 119)}-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 8)}`
-  }
-  if (filtered) return filtered
   if (!s) return ""
-  return `unknown-${createHash("sha256").update(s, "utf8").digest("hex").slice(0, 16)}`
+  // Canonical fast path: inspect at most 129 code points — a hostile
+  // multi-MB id cannot force a full scan. for..of counts code points,
+  // matching Rust's chars() parity for astral input (which fails the
+  // charset check anyway).
+  const prefix: string[] = []
+  let count = 0
+  for (const ch of s) {
+    if (++count > ID_MAX_CHARS) break
+    prefix.push(ch)
+  }
+  if (count <= ID_MAX_CHARS) {
+    const whole = prefix.join("")
+    if (whole.length === s.length && [...whole].every((c) => ID_SAFE_CHAR.test(c)) && !ID_RESERVED.test(whole)) {
+      return whole
+    }
+  }
+  // Non-canonical: ids LONGER than the identity domain cannot be
+  // represented injectively within the bounded work budget — two
+  // distinct overlong ids agreeing on the first ID_SCAN_CHARS code
+  // points would collapse into ONE session and share its state.
+  // Collapse them into the unattributed ("") namespace instead,
+  // matching SessionId::normalize (#225 C01).
+  let domain = ""
+  let scanned = 0
+  for (const ch of s) {
+    scanned++
+    if (scanned > ID_SCAN_CHARS) return ""
+    domain += ch
+  }
+  let head = ""
+  for (const ch of domain) {
+    if (head.length >= ID_HEAD_CHARS) break
+    if (ID_SAFE_CHAR.test(ch)) head += ch
+  }
+  if (!head) head = "u"
+  return `${head}-${sha256(domain).slice(0, ID_HASH_HEX)}`
 }
 
 function emit(event: Record<string, unknown>): boolean {
@@ -112,8 +184,14 @@ function emit(event: Record<string, unknown>): boolean {
       // below refuses it anyway via O_NOFOLLOW).
       const st = lstatSync(EVENT_LOG)
       // isFile parity with the Rust hook: a directory must not be
-      // renamed away as if it were an oversized log.
-      if (!st.isSymbolicLink() && st.isFile() && st.size > EVENT_LOG_MAX) {
+      // renamed away as if it were an oversized log. #225 D03: the
+      // same trust contract as the append path applies BEFORE the
+      // rename — a foreign-owned or multiply-linked log is never
+      // rotated aside.
+      const trusted =
+        (typeof process.getuid !== "function" || st.uid === process.getuid()) &&
+        st.nlink === 1
+      if (!st.isSymbolicLink() && st.isFile() && st.size > EVENT_LOG_MAX && trusted) {
         renameSync(EVENT_LOG, EVENT_LOG + ".1")
       }
     } catch {}
@@ -137,6 +215,10 @@ function emit(event: Record<string, unknown>): boolean {
       const st = fstatSync(fd)
       if (!st.isFile()) return false
       if (typeof process.getuid === "function" && st.uid !== process.getuid()) return false
+      // Parity with the Rust hook's fd_writeable: a multiply-linked log
+      // is reachable through paths whose lifecycle we do not control —
+      // appending would modify every link, so refuse (#225).
+      if (st.nlink !== 1) return false
       // mode only applies at creation; tighten pre-existing logs too.
       // Isolated: on filesystems where fchmod fails post-open, the event
       // write must still succeed (0600 was already applied at O_CREAT).
@@ -176,12 +258,56 @@ const MAX_LOAD_RECOMMENDS = 8
 // Cap collected stdout: a runaway child must not buffer unbounded
 // output into plugin memory before the timeout fires.
 const MAX_PROC_OUTPUT_BYTES = 4 * 1024 * 1024
+// #225 C12: bound plugin-wide child concurrency — every hook path
+// shares this long-lived process, so unbounded spawns (detect +
+// recommend + deps across concurrent events) could exhaust the host.
+// Waiters are also bounded: a saturated queue fails open instead of
+// growing memory without limit.
+const MAX_CONCURRENT_PROCS = 4
+const MAX_PROC_WAITERS = 64
+let runningProcs = 0
+const procWaiters: (() => void)[] = []
 
-async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> {
+/// Resolve once a child slot is free; null when the waiter queue is
+/// saturated (caller fails open). The returned release MUST run in a
+/// finally block.
+async function acquireProc(): Promise<(() => void) | null> {
+  if (runningProcs >= MAX_CONCURRENT_PROCS) {
+    if (procWaiters.length >= MAX_PROC_WAITERS) return null
+    await new Promise<void>((resolve) => procWaiters.push(resolve))
+  }
+  runningProcs++
+  return () => {
+    runningProcs--
+    const next = procWaiters.shift()
+    if (next) next()
+  }
+}
+
+// #225 C11: callers must distinguish a clean exit-0 run from timeout,
+// signal kill, non-zero exit, or truncated stdout — a partial or
+// killed child's output is not a valid detect/recommend/deps result.
+type ProcResult = {
+  text: string
+  exitCode: number | null
+  timedOut: boolean
+  truncated: boolean
+  ok: boolean
+}
+
+async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<ProcResult> {
+  let truncated = false
   // Attach a catch immediately: a stream error before the read resolves
   // would otherwise be an unhandled rejection.
   const readAll = (async () => {
-    const reader = proc.stdout.getReader()
+    // Every spawn site uses stdout:"pipe", but Bun.spawn's return type
+    // admits `number | undefined` — narrow defensively (#225 F05).
+    const stream = proc.stdout
+    if (!stream || typeof stream === "number") {
+      try { proc.kill() } catch {}
+      return ""
+    }
+    const reader = stream.getReader()
     const chunks: Uint8Array[] = []
     let total = 0
     try {
@@ -190,10 +316,16 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
         if (done) break
         if (!value) continue
         const remaining = MAX_PROC_OUTPUT_BYTES - total
-        if (remaining <= 0) break
+        if (remaining <= 0) {
+          truncated = true
+          break
+        }
         chunks.push(value.length > remaining ? value.subarray(0, remaining) : value)
         total += Math.min(value.length, remaining)
-        if (total >= MAX_PROC_OUTPUT_BYTES) break
+        if (total >= MAX_PROC_OUTPUT_BYTES) {
+          truncated = true
+          break
+        }
       }
     } catch {}
     try { proc.kill() } catch {}
@@ -208,18 +340,21 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
     return new TextDecoder().decode(merged)
   })().catch(() => "")
   let timer: ReturnType<typeof setTimeout> | undefined
+  let timedOut = false
+  let exitCode: number | null = null
   try {
-    await Promise.race([
+    exitCode = await Promise.race([
       proc.exited,
-      new Promise<never>((_, reject) => {
+      new Promise<null>((resolve) => {
         timer = setTimeout(() => {
+          timedOut = true
           try { proc.kill() } catch {}
-          reject(new Error("skill-graph timed out"))
+          resolve(null)
         }, PROC_TIMEOUT_MS)
       }),
     ])
   } catch {
-    // timed out and killed; fall through to collect partial output
+    timedOut = true
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -234,14 +369,22 @@ async function collectProc(proc: ReturnType<typeof Bun.spawn>): Promise<string> 
       }, PROC_DRAIN_MS),
     ),
   ])
-  return drained
+  // ok requires a clean exit-0 within the timeout with complete
+  // (untruncated) stdout — anything else is a failed child, not data.
+  const ok = !timedOut && exitCode === 0 && !truncated
+  return { text: drained, exitCode, timedOut, truncated, ok }
 }
 
+// Returns null on FAILURE (spawn budget exhausted, timeout, non-zero
+// exit, truncated or unparseable output) and an array — possibly
+// empty — on success. The distinction matters for dedup (#225 C04):
+// a failed lookup must not mark the session's dedup key, or the next
+// identical prompt would be suppressed without ever being retried.
 async function recommendNames(
   query: string,
   max = 5,
   context = "",
-): Promise<{ name: string; digest?: string }[]> {
+): Promise<{ name: string; digest?: string }[] | null> {
   // No --root args: the spawned CLI inherits SKILL_GRAPH_ROOTS, and
   // resolve_roots gives that env var precedence over explicit args, so
   // argv roots would be dead whenever the env is set (#144 r17).
@@ -252,16 +395,28 @@ async function recommendNames(
     "--max", String(max), "--format", "json",
   ]
   if (context) args.push("--context", context)
-  const proc = Bun.spawn(args, {
-    stdin: "pipe",
-    stdout: "pipe",
-    stderr: "ignore",
-  })
-  proc.stdin.write(query)
-  proc.stdin.end()
-  const out = await collectProc(proc).catch(() => "")
+  const release = await acquireProc()
+  if (!release) return null
+  let res: ProcResult
   try {
-    const recs = JSON.parse(out) as { skill: { name: string; digest?: string } }[]
+    const proc = Bun.spawn(args, {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "ignore",
+    })
+    proc.stdin.write(query)
+    proc.stdin.end()
+    res = await collectProc(proc).catch(
+      (): ProcResult => ({ text: "", exitCode: null, timedOut: true, truncated: false, ok: false }),
+    )
+  } finally {
+    release()
+  }
+  // A timed-out, killed, non-zero, or truncated child produced no
+  // trustworthy result — do not parse partial output (#225 C11).
+  if (!res.ok) return null
+  try {
+    const recs = JSON.parse(res.text) as { skill: { name: string; digest?: string } }[]
     // `recommend` output is operator-trusted but still normalized like
     // every other plugin path: names must satisfy the skill-name
     // contract and the list is bounded before it can reach context.
@@ -270,7 +425,49 @@ async function recommendNames(
       .slice(0, 64)
       .map((r) => ({ name: r.skill.name, digest: r.skill.digest }))
   } catch {
-    return []
+    return null
+  }
+}
+
+// Declared-dependency lookup for the skill-load path (#225 B08):
+// `skill-graph deps` applies the SAME resolved-requires definition as
+// the Rust hook — generic recommendations are never mislabeled as
+// dependencies. Output is [{name, digest}] sorted by the CLI.
+const MAX_INJECTED_DEPS = 8
+// Same failure/success distinction as recommendNames (#225 C04):
+// null = lookup failed, retry must stay possible.
+async function declaredDeps(
+  skillName: string,
+): Promise<{ name: string; digest?: string }[] | null> {
+  const name = utf8Slice(skillName, 1024)
+  if (!validSkillName(name)) return []
+  const release = await acquireProc()
+  if (!release) return null
+  let res: ProcResult
+  try {
+    const proc = Bun.spawn(
+      [SKILL_GRAPH_BIN, "deps", name, "--format", "json"],
+      { stdin: "ignore", stdout: "pipe", stderr: "ignore" },
+    )
+    res = await collectProc(proc).catch(
+      (): ProcResult => ({ text: "", exitCode: null, timedOut: true, truncated: false, ok: false }),
+    )
+  } finally {
+    release()
+  }
+  if (!res.ok) return null
+  try {
+    const deps = JSON.parse(res.text) as { name?: unknown; digest?: unknown }[]
+    if (!Array.isArray(deps)) return null
+    return deps
+      .filter((d) => typeof d?.name === "string" && validSkillName(d.name))
+      .slice(0, 64)
+      .map((d) => ({
+        name: d.name as string,
+        digest: typeof d.digest === "string" ? d.digest : undefined,
+      }))
+  } catch {
+    return null
   }
 }
 
@@ -279,8 +476,8 @@ async function recommendNames(
 // several× amplified, before the child's own 16 MiB/4 MiB stdin caps
 // ever see it (#144 r18). Legitimate hook/plugin payloads are
 // KB-scale, so these bounds are generous.
-const MAX_RESULT_TEXT_BYTES = 64 * 1024
-const MAX_INPUT_JSON_BYTES = 1024 * 1024
+export const MAX_RESULT_TEXT_BYTES = 64 * 1024
+export const MAX_INPUT_JSON_BYTES = 1024 * 1024
 const MAX_PAYLOAD_BYTES = 1024 * 1024
 // Tool names are small identifiers; error/status text is forwarded
 // only for the Rust-side failure guard, which checks shape (== "error",
@@ -294,20 +491,22 @@ const utf8Bytes = (s: string) => Buffer.byteLength(s, "utf8")
 
 // Largest prefix of `s` within `maxBytes` UTF-8 bytes, never splitting
 // a code point (for..of iterates code points, not UTF-16 units).
-function utf8Slice(s: string, maxBytes: number): string {
-  if (utf8Bytes(s) <= maxBytes) return s
+// Work is O(budget), not O(input): iteration stops as soon as the byte
+// budget is exceeded, so a multi-hundred-MB host string cannot force a
+// full scan before being sliced (#225 re-review).
+export function utf8Slice(s: string, maxBytes: number): string {
   let out = ""
   let used = 0
   for (const ch of s) {
     const b = utf8Bytes(ch)
-    if (used + b > maxBytes) break
+    if (used + b > maxBytes) return out
     out += ch
     used += b
   }
-  return out
+  return s
 }
 
-function resultText(result: unknown): string {
+export function resultText(result: unknown): string {
   if (typeof result === "string") return utf8Slice(result, MAX_RESULT_TEXT_BYTES)
   try {
     const r = result as any
@@ -324,15 +523,36 @@ function resultText(result: unknown): string {
       parts.push(t)
       total += utf8Bytes(t) + 1
     }
-    const walk = (v: any) => {
-      if (total >= MAX_RESULT_TEXT_BYTES || !v || typeof v !== "object") return
+    // Depth AND node bounds: a deeply nested `output`/`content` chain
+    // with no text never exhausts `total`, and a giant flat array would
+    // still cost O(n) walk calls — both are capped so hostile result
+    // shapes cannot stall this long-lived plugin (#225 re-review).
+    let walked = 0
+    const walk = (v: any, depth: number) => {
+      // Count EVERY visited node — primitives included. Counting only
+      // objects let a flat array of 10M strings iterate to completion
+      // because `walked` never moved (#225 re-review).
+      if (++walked > MAX_INPUT_NODES) return
+      if (total >= MAX_RESULT_TEXT_BYTES || depth > MAX_INPUT_DEPTH || !v || typeof v !== "object") return
       if (typeof v.text === "string") push(v.text)
       if (typeof v.content === "string") push(v.content)
-      if (Array.isArray(v.content)) v.content.forEach(walk)
-      if (Array.isArray(v.output)) v.output.forEach(walk)
-      if (v.output && typeof v.output === "object") walk(v.output)
+      // for..of + break (not forEach): iteration itself must stop at
+      // the node budget, not merely skip recursion per element.
+      if (Array.isArray(v.content)) {
+        for (const c of v.content) {
+          if (walked > MAX_INPUT_NODES) break
+          walk(c, depth + 1)
+        }
+      }
+      if (Array.isArray(v.output)) {
+        for (const c of v.output) {
+          if (walked > MAX_INPUT_NODES) break
+          walk(c, depth + 1)
+        }
+      }
+      if (v.output && typeof v.output === "object") walk(v.output, depth + 1)
     }
-    walk(r)
+    walk(r, 0)
     return parts.join("\n")
   } catch {
     return ""
@@ -350,24 +570,111 @@ function boundedError(e: unknown): unknown {
   return e
 }
 
+// Input bounding happens BEFORE any serialization: the walker below
+// enforces depth/node/string-byte budgets while cloning, so a hostile
+// or accidental giant `event.input` costs O(budget) — never O(input) —
+// and JSON.stringify only ever sees the bounded clone (#225). JSON
+// escaping can still inflate the clone past MAX_INPUT_JSON_BYTES; the
+// post-serialize size check remains as the final gate.
+export const MAX_INPUT_DEPTH = 32
+export const MAX_INPUT_NODES = 8192
+export const BOUND_FAIL = Symbol("bound-fail")
+
+export interface BoundState {
+  nodes: number
+  strBytes: number
+}
+
+// Deep-clone `v` keeping only JSON-shaped data (null/bool/number/
+// string/array/plain object) within the budgets. Returns BOUND_FAIL on
+// any exceed or non-JSON value — callers skip detection (fail-open).
+export function boundJsonValue(v: unknown, depth: number, st: BoundState): unknown {
+  if (depth > MAX_INPUT_DEPTH || ++st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
+  if (v === null || typeof v === "boolean" || typeof v === "number") return v
+  if (typeof v === "string") {
+    // UTF-16 units lower-bound UTF-8 bytes: reject on units first so a
+    // giant string is refused without a full byte scan.
+    if (v.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+    st.strBytes += utf8Bytes(v)
+    if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+    return v
+  }
+  if (Array.isArray(v)) {
+    // Read length ONCE: a Proxy get trap could answer differently on
+    // a second read, making `new Array(len)` allocate far beyond the
+    // checked bound (#225 r5).
+    const len = v.length
+    if (!Number.isInteger(len) || len < 0 || len > MAX_INPUT_NODES) return BOUND_FAIL
+    const out: unknown[] = new Array(len)
+    for (let i = 0; i < len; i++) {
+      const c = boundJsonValue(v[i], depth + 1, st)
+      if (c === BOUND_FAIL) return BOUND_FAIL
+      out[i] = c
+    }
+    return out
+  }
+  if (typeof v === "object") {
+    const proto = Object.getPrototypeOf(v)
+    if (proto !== Object.prototype && proto !== null) return BOUND_FAIL
+    const out: Record<string, unknown> = {}
+    let n = 0
+    // for..in + hasOwnProperty keeps enumeration lazy: the runtime
+    // fetches each key's descriptor only as iteration reaches it, so
+    // the early break bounds per-key work. EVERY yielded key —
+    // inherited enumerable included — consumes the GLOBAL node budget
+    // before its value is read (#225 r9, C02). Residual boundary,
+    // stated honestly: ownKeys/getOwnPropertyDescriptor are each a
+    // single host-side call whose RESULT may be large (a Proxy trap
+    // could enumerate a million keys); JS offers no cheaper key-count
+    // primitive, so that one materialization is the trusted-host
+    // boundary. Everything the plugin itself iterates or reads is
+    // capped at MAX_INPUT_NODES keys / MAX_INPUT_JSON_BYTES strings.
+    for (const k in v as Record<string, unknown>) {
+      if (++n > MAX_INPUT_NODES || ++st.nodes > MAX_INPUT_NODES) return BOUND_FAIL
+      if (!Object.prototype.hasOwnProperty.call(v, k)) continue
+      if (k.length > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+      st.strBytes += utf8Bytes(k)
+      if (st.strBytes > MAX_INPUT_JSON_BYTES) return BOUND_FAIL
+      const c = boundJsonValue((v as Record<string, unknown>)[k], depth + 1, st)
+      if (c === BOUND_FAIL) return BOUND_FAIL
+      // defineProperty, not assignment: k can be "__proto__", where
+      // `out[k] = c` would invoke Object.prototype's setter and either
+      // drop the key or mutate the clone's prototype (#225 r6).
+      Object.defineProperty(out, k, {
+        value: c,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      })
+    }
+    return out
+  }
+  // undefined / function / symbol / bigint / exotic objects: not JSON
+  // data — refuse rather than let an unbounded toJSON through.
+  return BOUND_FAIL
+}
+
 async function detectLoad(event: any): Promise<Record<string, any>[]> {
   try {
     // Cheap pre-filter: only SKILL.md-touching tools reach the binary.
     // tool is host-supplied: bound it before toLowerCase/stringify so a
     // giant string cannot allocate twice in this long-lived process.
     const tool = utf8Slice(String(event.tool ?? ""), MAX_TOOL_NAME_BYTES)
-    const input = event.input ?? {}
-    const inputJson = JSON.stringify(input ?? {})
+    const bounded = boundJsonValue(event.input ?? {}, 0, { nodes: 0, strBytes: 0 })
+    if (bounded === BOUND_FAIL) return []
+    const input = (bounded ?? {}) as Record<string, any>
+    const inputJson = JSON.stringify(input)
     // An oversized input cannot fit the payload budget below anyway —
     // skip before the SKILL.md scan so a giant object is not walked
-    // twice (#144 r18).
+    // twice (#144 r18). The clone is already budget-bounded, so this
+    // stringify is bounded work.
     if (utf8Bytes(inputJson) > MAX_INPUT_JSON_BYTES) return []
     const isSkillTool = tool.toLowerCase() === "skill"
     const touches = inputJson.includes("SKILL.md") ||
       (typeof input?.path === "string" && input.path.endsWith("SKILL.md"))
     if (!isSkillTool && !touches) return []
 
-    const sid = safeSessionID(event.sessionID)
+    const sid = safeSessionID(rawSessionID(event))
     const status = (event as any).status
     const success = (event as any).success
 
@@ -375,7 +682,17 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       tool_name: tool,
       tool_input: input,
       tool_response: resultText(event.result),
-      session_id: sid,
+      // RAW session id (bounded by rawSessionID), not `sid`:
+      // `skill-graph detect` is an ingest boundary that runs
+      // SessionId::normalize exactly once. Sending the already-
+      // normalized sid would be transformed a SECOND time
+      // (non-canonical outputs match the reserved shape), splitting
+      // funnel state between plugin-emitted and detect-emitted events
+      // (#225 r7). safeSessionID and SessionId::normalize are parity
+      // implementations, so normalize(rawSlice) === sid — correlation
+      // is preserved. The slice is the SAME value sid was computed
+      // from, keeping both sides of the contract identical (#225 r8).
+      session_id: rawSessionID(event),
       // Forwarded defensively so the Rust-side error-status guard also
       // applies to plugin-originated payloads (the field name is
       // UNVERIFIED against the OpenCode event API). Rust only reads
@@ -397,6 +714,13 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
     // oversized events that skip spawn cannot burn the session's
     // detect budget, while 512 unrelated executions still cannot
     // silently disable detection (#144 r18 CR).
+    // detectCounts is keyed by the sanitized session id. The "" key is
+    // the anonymous aggregate: unattributable sessions have no identity
+    // to key on, so they share ONE fail-closed spawn budget — a flood
+    // of anonymous tool calls can exhaust detection for anonymous
+    // sessions only, never for attributed ones, and never grows state
+    // (#225 re-review). This is a resource bound, not recommendation
+    // state: no dedup/queue/context data is shared under "".
     const detects = detectCounts.get(sid) ?? 0
     if (detects >= MAX_DETECT_PER_SESSION) return []
     if (detectCounts.size >= MAX_PENDING_SESSIONS && !detectCounts.has(sid)) {
@@ -404,14 +728,26 @@ async function detectLoad(event: any): Promise<Record<string, any>[]> {
       if (oldest !== undefined) detectCounts.delete(oldest)
     }
     detectCounts.set(sid, detects + 1)
-    const proc = Bun.spawn(
-      [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
-      { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
-    )
-    proc.stdin.write(body)
-    proc.stdin.end()
-    const out = await collectProc(proc).catch(() => "")
-    const trimmed = out.trim()
+    const release = await acquireProc()
+    if (!release) return []
+    let res: ProcResult
+    try {
+      const proc = Bun.spawn(
+        [SKILL_GRAPH_BIN, "detect", "--runtime", "opencode", "--via", "plugin"],
+        { stdin: "pipe", stdout: "pipe", stderr: "ignore" },
+      )
+      proc.stdin.write(body)
+      proc.stdin.end()
+      res = await collectProc(proc).catch(
+        (): ProcResult => ({ text: "", exitCode: null, timedOut: true, truncated: false, ok: false }),
+      )
+    } finally {
+      release()
+    }
+    // Timeout / kill / non-zero / truncated output is a failed detect,
+    // not partial detection data (#225 C11).
+    if (!res.ok) return []
+    const trimmed = res.text.trim()
     if (!trimmed) return []
     // `detect` emits one JSON object per line (a payload may touch
     // several SKILL.md files); parse each line independently. Cap at
@@ -442,8 +778,34 @@ export default Plugin.define({
   id: "skill-graph",
   async setup(ctx) {
     dbg("setup called")
-    // sessionID -> queued injections for the next context hook
-    const pending = new Map<string, { kind: "prompt" | "deps"; names: string[] }[]>()
+    // #225 C03: NOSTATE suppresses RETAINED session state — dedup
+    // sets and event emission — matching the Rust hook's
+    // state_disabled contract. The pending queue is NOT retained
+    // state: it is transient transport between the prompt/tool hooks
+    // and the context hook, bounded per session and drained (or
+    // recorded evicted) on every context call. Disabling it under
+    // NOSTATE would make recommendation injection impossible for
+    // attributable sessions — the hook contract requires delivery.
+    // detectCounts stays unconditional: it is a subprocess resource
+    // bound, not user-visible state.
+    const STATE_ON = !NOSTATE
+    // sessionID -> queued injections for the next context hook. Each
+    // entry carries everything needed to emit its recommendation event
+    // at DRAIN time (#225 C09): emitted:true is only written when the
+    // injection actually reaches the model's context, and an entry
+    // evicted before drain is recorded emitted:false/"evicted" rather
+    // than silently lost or falsely delivered.
+    type PendingEntry = {
+      kind: "prompt" | "deps"
+      names: string[]
+      recs: { name: string; digest?: string }[]
+      trigger: "prompt_submit" | "skill_load"
+      prompt_hash?: string
+      // Set by queue() on insertion; optional at the type level so
+      // call sites do not repeat the timestamp.
+      at?: number
+    }
+    const pending = new Map<string, PendingEntry[]>()
     // sessionID -> skills already dependency-recommended (parity with the
     // Rust hook's `skill:<name>` dedup markers).
     const loadDedup = new Map<string, Set<string>>()
@@ -456,40 +818,66 @@ export default Plugin.define({
     // sessions, but a session whose context hook never drains would
     // otherwise grow `list` for its whole lifetime (#144 r18).
     const MAX_PENDING_ENTRIES_PER_SESSION = 64
-    const queue = (sessionID: string, kind: "prompt" | "deps", names: string[]) => {
-      if (!names.length) return
+    // A queued entry older than this never reached a context hook —
+    // the session is gone or the host stopped calling it. Evict with
+    // an emitted:false record instead of holding it forever (#225
+    // C09). The context hook normally drains within seconds.
+    const MAX_PENDING_AGE_MS = 15 * 60 * 1000
+    // Dropped queue entries still get a terminal funnel record — a
+    // recommendation that never reached the model must not vanish
+    // silently (#225 C09).
+    const emitEvicted = (sessionID: string, entries: PendingEntry[], reason = "evicted") => {
+      for (const e of entries) {
+        if (!e.recs.length) continue
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: e.trigger,
+          prompt_hash: e.prompt_hash,
+          recommended: e.recs,
+          emitted: false,
+          reason,
+        })
+      }
+    }
+    // Expire stale entries in one session's queue; returns survivors.
+    const sweepExpired = (sessionID: string, list: PendingEntry[]) => {
+      const now = Date.now()
+      const fresh = list.filter((e) => now - (e.at ?? now) <= MAX_PENDING_AGE_MS)
+      if (fresh.length < list.length) {
+        emitEvicted(sessionID, list.filter((e) => now - (e.at ?? now) > MAX_PENDING_AGE_MS), "expired")
+      }
+      return fresh
+    }
+    const queue = (sessionID: string, entry: PendingEntry) => {
+      if (!entry.names.length) return
+      entry.at = Date.now()
       if (!pending.has(sessionID) && pending.size >= MAX_PENDING_SESSIONS) {
         // FIFO-evict the oldest session; its queued context is dropped.
         const oldest = pending.keys().next().value
-        if (oldest !== undefined) pending.delete(oldest)
+        if (oldest !== undefined) {
+          const dropped = pending.get(oldest)
+          pending.delete(oldest)
+          if (dropped) emitEvicted(oldest, dropped)
+        }
       }
       const list = pending.get(sessionID) ?? []
-      list.push({ kind, names })
-      if (list.length > MAX_PENDING_ENTRIES_PER_SESSION) {
-        list.splice(0, list.length - MAX_PENDING_ENTRIES_PER_SESSION)
+      const fresh = sweepExpired(sessionID, list)
+      fresh.push(entry)
+      if (fresh.length > MAX_PENDING_ENTRIES_PER_SESSION) {
+        emitEvicted(sessionID, fresh.splice(0, fresh.length - MAX_PENDING_ENTRIES_PER_SESSION))
       }
-      pending.set(sessionID, list)
+      pending.set(sessionID, fresh)
     }
-
-    // Session continuity parity with the Rust hook (issue #128): names a
-    // session's prompt mode surfaced become context for later skill-load
-    // dependency lookups. Bounded like `pending`.
-    const rememberSession = (sessionID: string, names: string[]) => {
-      if (!names.length) return
-      // Accumulate like the Rust hook's .recommended file: dedup, keep
-      // the most recent MAX_SESSION_NAMES names per session.
-      const merged = [...(sessionCtx.get(sessionID) ?? [])]
-      for (const n of names) {
-        if (validSkillName(n) && !merged.includes(n)) merged.push(n)
-      }
-      const capped = merged.slice(-MAX_SESSION_NAMES)
-      if (!capped.length) return
-      if (!sessionCtx.has(sessionID) && sessionCtx.size >= MAX_SESSION_CTX) {
-        const oldest = sessionCtx.keys().next().value
-        if (oldest !== undefined) sessionCtx.delete(oldest)
-      }
-      sessionCtx.set(sessionID, capped)
-    }
+    // #225 C09: if the process exits with undrained queues, every
+    // queued recommendation would vanish unrecorded. emit() is
+    // synchronous, so an exit handler can still write the terminal
+    // emitted:false records. Under NOSTATE emit() is a no-op, matching
+    // the Rust hook's nostate contract.
+    process.on("exit", () => {
+      for (const [sid, list] of pending) emitEvicted(sid, list, "process_exit")
+      pending.clear()
+    })
 
     await ctx.session.hook("prompt", async (event) => {
       // prompt.text is host-supplied and unbounded: it feeds sha256
@@ -501,7 +889,7 @@ export default Plugin.define({
       const rawText = (event.prompt as any)?.text
       const text =
         typeof rawText === "string" ? utf8Slice(rawText, MAX_PAYLOAD_BYTES) : ""
-      const sessionID = safeSessionID(event.sessionID)
+      const sessionID = safeSessionID(rawSessionID(event))
       if (text) {
         emit({
           ...base("prompt_submit"),
@@ -514,9 +902,17 @@ export default Plugin.define({
       // session state, and re-emitting per prompt would inflate
       // load-grade counts.
       const skills = (event.prompt as any)?.skills
+      // Unattributable sessions (sanitized id "") share NO per-session
+      // state — parity with the Rust hook's state_disabled: dedup,
+      // recommendation queues, and session continuity are all bypassed
+      // so distinct anonymous sessions cannot merge or leak into each
+      // other (#225 re-review). Under NOSTATE dedup is bypassed too,
+      // but the transient queue still delivers injections (#225 C03).
+      const dedup = STATE_ON && sessionID !== ""
+      const injectable = sessionID !== ""
       if (Array.isArray(skills) && skills.length > 0) {
-        let seen = promptSkillSeen.get(sessionID)
-        if (!seen) {
+        let seen = dedup ? promptSkillSeen.get(sessionID) : undefined
+        if (dedup && !seen) {
           if (promptSkillSeen.size >= MAX_PENDING_SESSIONS) {
             const oldest = promptSkillSeen.keys().next().value
             if (oldest !== undefined) promptSkillSeen.delete(oldest)
@@ -529,8 +925,8 @@ export default Plugin.define({
         for (const s of skills.slice(0, MAX_PROMPT_SKILLS)) {
           const name = typeof s === "string" ? s : s?.name ?? s?.id
           if (typeof name !== "string" || !name || !validSkillName(name)) continue
-          if (seen.has(name)) continue
-          if (seen.size >= MAX_SEEN_SKILLS) continue
+          if (seen?.has(name)) continue
+          if (seen && seen.size >= MAX_SEEN_SKILLS) continue
           // Register the dedup key only when the event was actually
           // written — a transient log failure must not suppress retries.
           if (emit({
@@ -540,35 +936,73 @@ export default Plugin.define({
             detection: "inferred",
             confidence: "medium",
             tool: "prompt.skills",
-          })) seen.add(name)
+          })) seen?.add(name)
         }
       }
       // Empty prompts carry no signal — the Rust hook exits before
       // emitting any recommendation event for them.
       if (!text) return
-      const key = sha256(`${sessionID}\n${text}`)
-      if (emitted.has(key)) return
-      if (emitted.size >= MAX_EMITTED) {
-        const oldest = emitted.values().next().value
-        if (oldest !== undefined) emitted.delete(oldest)
+      // Dedup is per-session RETAINED state: unattributable sessions
+      // and NOSTATE bypass it entirely (parity with the Rust hook's
+      // markers), so identical prompts are not suppressed across
+      // sessions or under nostate.
+      const dedupKey = dedup ? sha256(`${sessionID}\n${text}`) : ""
+      if (dedupKey && emitted.has(dedupKey)) return
+      // #225 C04: null = lookup FAILED — return WITHOUT marking dedup
+      // so the next identical prompt retries instead of being
+      // suppressed by a key marked on a failed attempt.
+      const recs = await recommendNames(text, 3)
+      if (recs === null) return
+      if (dedupKey) {
+        if (emitted.size >= MAX_EMITTED) {
+          const oldest = emitted.values().next().value
+          if (oldest !== undefined) emitted.delete(oldest)
+        }
+        emitted.add(dedupKey)
       }
-      emitted.add(key)
-      const recs = await recommendNames(text, 3).catch(() => [])
       // recommended[] must equal the injected set for funnel integrity.
       const names = recs.map((r) => r.name)
-      rememberSession(sessionID, names)
-      emit({
-        ...base("recommendation"),
-        session_id: sessionID,
-        trigger: "prompt_submit",
-        prompt_hash: text ? sha256(text) : undefined,
-        recommended: recs,
-        emitted: names.length > 0,
-        reason: names.length > 0 ? "recommended" : "no_recommendations",
-      })
-      if (names.length > 0) {
-        queue(sessionID, "prompt", names)
+      const phash = sha256(text)
+      if (names.length === 0) {
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: "prompt_submit",
+          prompt_hash: phash,
+          recommended: [],
+          emitted: false,
+          reason: "no_recommendations",
+        })
+        return
+      }
+      if (injectable) {
+        // #225 C09: the recommendation event is DEFERRED to the
+        // context-hook drain — emitted:true is only written when the
+        // injection actually reaches the model. A queued entry that
+        // never drains is recorded emitted:false ("evicted"/"expired"/
+        // "process_exit") rather than silently lost.
+        queue(sessionID, {
+          kind: "prompt",
+          names,
+          recs,
+          trigger: "prompt_submit",
+          prompt_hash: phash,
+        })
         console.log(`[skill-graph] recommended: ${names.join(", ")}`)
+      } else {
+        // Anonymous sessions cannot be correlated with a later context
+        // hook — queueing under "" would leak one session's
+        // recommendations into another's (#225 re-review), so the event
+        // is emitted immediately with emitted:false.
+        emit({
+          ...base("recommendation"),
+          session_id: sessionID,
+          trigger: "prompt_submit",
+          prompt_hash: phash,
+          recommended: recs,
+          emitted: false,
+          reason: "recommended",
+        })
       }
     })
 
@@ -577,7 +1011,11 @@ export default Plugin.define({
       // never loaded, so it must not emit skill_load or queue dependency
       // recommendations (parity with load-grade detection intent).
       if ((event as any).status === "error") return
-      const sessionID = safeSessionID(event.sessionID)
+      const sessionID = safeSessionID(rawSessionID(event))
+      // Dedup is retained state (bypassed under NOSTATE / anonymous);
+      // injection transport is not — see the prompt hook (#225 C03).
+      const dedup = STATE_ON && sessionID !== ""
+      const injectable = sessionID !== ""
       const detected = await detectLoad(event)
       if (!detected.length) return
       // Parity with the Rust hook's MAX_LOAD_RECOMMENDS: one tool call
@@ -591,12 +1029,13 @@ export default Plugin.define({
         if (!skillName || !DEP_TRIGGER.has(detection ?? "")) continue
 
         // Dependency lookup for the just-loaded skill (same contract as
-        // the shell adapters' skill-load mode, including session-context
-        // continuity). recommended[] records exactly the injected set
+        // the shell adapters' skill-load mode: declared requires only,
+        // #225 B08). recommended[] records exactly the injected set
         // for funnel integrity.
-        // Skip skills this session already got a dependency pass for.
-        let done = loadDedup.get(sessionID)
-        if (!done) {
+        // Skip skills this session already got a dependency pass for —
+        // unattributable sessions share no dedup state (#225 re-review).
+        let done = dedup ? loadDedup.get(sessionID) : undefined
+        if (dedup && !done) {
           if (loadDedup.size >= MAX_PENDING_SESSIONS) {
             const oldest = loadDedup.keys().next().value
             if (oldest !== undefined) loadDedup.delete(oldest)
@@ -604,56 +1043,119 @@ export default Plugin.define({
           done = new Set()
           loadDedup.set(sessionID, done)
         }
-        if (done.has(skillName)) continue
+        if (done?.has(skillName)) continue
         // Budget check before marking done: a skill skipped for budget
         // was never recommended, so a later payload may still surface it
         // (same ordering as the Rust hook).
         if (recommendBudget <= 0) continue
-        done.add(skillName)
         recommendBudget -= 1
-        const sessionNames = sessionCtx.get(sessionID) ?? []
-        const deps = await recommendNames(
-          skillName,
-          5,
-          sessionNames.join(" "),
-        ).catch(() => [])
-        const injected = deps.filter((d) => d.name !== skillName).slice(0, 3)
-        const names = injected.map((r) => r.name)
-        emit({
-          ...base("recommendation"),
-          session_id: sessionID,
-          trigger: "skill_load",
-          recommended: injected,
-          emitted: names.length > 0,
-          reason: names.length > 0 ? "recommended" : "no_recommendations",
-        })
-        if (names.length > 0) queue(sessionID, "deps", names)
+        // #225 B08: surface only DECLARED dependencies — the same
+        // `deps` definition the Rust hook uses — never generic
+        // recommendations mislabeled as dependencies.
+        // #225 C04: mark done ONLY when the lookup SUCCEEDED (null =
+        // failure) — a failed declaredDeps must not suppress the retry
+        // a later payload deserves.
+        const deps = await declaredDeps(skillName)
+        if (deps === null) continue
+        done?.add(skillName)
+        const injected = deps.slice(0, MAX_INJECTED_DEPS)
+        const names = injected.map((d) => d.name)
+        if (names.length > 0 && injectable) {
+          // #225 C09: same deferred-emission contract as the prompt
+          // path — emitted:true is written only at context drain.
+          queue(sessionID, {
+            kind: "deps",
+            names,
+            recs: injected,
+            trigger: "skill_load",
+          })
+        } else {
+          emit({
+            ...base("recommendation"),
+            session_id: sessionID,
+            trigger: "skill_load",
+            recommended: injected,
+            // Unattributed sessions cannot receive the queued
+            // injection, so emitted stays false even when names were
+            // recommended (#225 re-review). Under NOSTATE emit()
+            // itself is a no-op.
+            emitted: false,
+            reason: names.length > 0 ? "recommended" : "no_declared_dependencies",
+          })
+        }
       }
     })
 
     await ctx.session.hook("context", (event) => {
-      const sessionID = safeSessionID(event.sessionID)
-      const list = pending.get(sessionID)
-      if (!list?.length) return
-      pending.delete(sessionID)
-      // The context-hook payload shape is runtime-defined; `system` may
-      // be absent or non-array. Fail open rather than throw inside the
-      // plugin host — this is the only unguarded path left.
-      if (!Array.isArray(event.system)) {
-        try {
-          ;(event as { system?: unknown }).system = []
-        } catch {
+      // #225 C10: this is the plugin's only synchronous context-
+      // mutation path — a frozen/non-writable `system`, a hostile
+      // getter, or any throw must fail open without breaking the
+      // host's context assembly.
+      try {
+        const sessionID = safeSessionID(rawSessionID(event))
+        // Anonymous sessions never queue (see the prompt hook) — an
+        // empty-key lookup must not drain another session's entries.
+        // NOSTATE still drains: the queue is transient transport, not
+        // retained state (#225 C03); emit() inside is a no-op there.
+        if (!sessionID) return
+        const list = pending.get(sessionID)
+        if (!list?.length) return
+        const fresh = sweepExpired(sessionID, list)
+        if (!fresh.length) {
+          pending.delete(sessionID)
           return
         }
-      }
-      const system = event.system as { type: string; text: string }[]
-      for (const entry of list) {
-        const text =
-          entry.kind === "deps"
-            ? `skill-graph: a skill declares dependencies — ${entry.names.join(", ")}. Read the matching SKILL.md files if the task needs them.`
-            : `skill-graph: skills relevant to this task — ${entry.names.join(", ")}. Read the matching SKILL.md before relying on it.`
-        system.push({ type: "text", text })
-      }
+        // The context-hook payload shape is runtime-defined; `system`
+        // may be absent or non-array. Ensure it BEFORE consuming the
+        // queue: if the assignment fails, the entries are recorded
+        // evicted rather than silently dropped with pending.delete
+        // already done (#225 C10).
+        if (!Array.isArray(event.system)) {
+          try {
+            ;(event as { system?: unknown }).system = []
+          } catch {
+            pending.delete(sessionID)
+            emitEvicted(sessionID, fresh, "inject_failed")
+            return
+          }
+        }
+        pending.delete(sessionID)
+        const system = event.system as { type: string; text: string }[]
+        for (const entry of fresh) {
+          const text =
+            entry.kind === "deps"
+              ? `skill-graph: a skill declares dependencies — ${entry.names.join(", ")}. Read the matching SKILL.md files if the task needs them.`
+              : `skill-graph: skills relevant to this task — ${entry.names.join(", ")}. Read the matching SKILL.md before relying on it.`
+          try {
+            system.push({ type: "text", text })
+          } catch {
+            // Push failed: the injection did NOT reach the model, so
+            // no emitted:true record may be written (#225 C09/C10).
+            emit({
+              ...base("recommendation"),
+              session_id: sessionID,
+              trigger: entry.trigger,
+              prompt_hash: entry.prompt_hash,
+              recommended: entry.recs,
+              emitted: false,
+              reason: "inject_failed",
+            })
+            continue
+          }
+          // #225 C09: emitted:true is written only AFTER the injection
+          // succeeded — the funnel's delivery metric now means "the
+          // model's context actually received this recommendation".
+          emit({
+            ...base("recommendation"),
+            session_id: sessionID,
+            trigger: entry.trigger,
+            prompt_hash: entry.prompt_hash,
+            recommended: entry.recs,
+            emitted: true,
+            reason: "recommended",
+          })
+        }
+      } catch {}
     })
   },
 })

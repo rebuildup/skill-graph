@@ -3,6 +3,8 @@
 `docs/specs/` には2種類の文書がある。要求・受入条件の最終正本は常に
 GitHub Issue / PR であり、Spec はその設計記録である。
 
+> 旧称注記: 本文書群中の `project-init` は `rebuildup/project-init` の旧称であり、現行の canonical repository は `rebuildup/aude-skills`（改名追跡: rebuildup/aude-skills#212）。
+
 ## 継続正本（evergreen）
 
 製品全体に効き続ける契約。変更時は実装と同時に更新する。
@@ -24,7 +26,7 @@ GitHub Issue / PR であり、Spec はその設計記録である。
 
 1. GitHub Issue / PR（要求・受入条件）
 2. `docs/adr/`（確定した設計判断）
-3. 最新の版 spec（現行ターゲットは `v1.0.0.md`）
+3. 最新の版 spec（現行チェーン: 先行完成版 `v0.5.0.md` → 正式完成版 `v1.0.0.md`）
 4. evergreen spec（上表）
 
 | File | 対象 |
@@ -36,4 +38,5 @@ GitHub Issue / PR であり、Spec はその設計記録である。
 | `v0.3.0-integration-boundaries.md` | v0.3.0 4者責務境界（#80） |
 | `v0.3.0-observation-pilot.md` | v0.3.0 観測パイロット指標 |
 | `v0.4.0-package-manager-distribution.md` | v0.4.0 パッケージ配布仕様 |
-| `v1.0.0.md` | v1.0.0 現行ターゲット仕様（Status: draft。完了までは現行正本として扱う） |
+| `v0.5.0.md` | v0.5.0 先行完成版仕様（全配布チャネル正式公開 + 実利用検証。現行リリースターゲット） |
+| `v1.0.0.md` | v1.0.0 正式完成版仕様（Status: draft。v0.5.0 実利用結果を踏まえ完成を確定） |

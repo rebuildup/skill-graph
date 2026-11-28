@@ -31,6 +31,14 @@ fn assert_skill_summary(value: &Value) {
         .and_then(Value::as_str)
         .expect("availability");
     assert!(matches!(availability, "available" | "parse_error"));
+    // #225 B07: spec conformance is a separate axis from parse errors.
+    assert!(
+        value
+            .get("spec_violations")
+            .and_then(Value::as_array)
+            .is_some(),
+        "missing spec_violations"
+    );
 }
 
 #[test]
@@ -240,14 +248,14 @@ fn skill_usage_events_validate_against_event_schema() {
         SkillUsageEvent::prompt_submit(
             Runtime::ClaudeCode,
             ObservedVia::Hook,
-            "s1",
+            &skill_graph::events::SessionId::normalize("s1"),
             "2026-01-01T00:00:00Z",
             "hello",
         ),
         SkillUsageEvent::recommendation(
             Runtime::Codex,
             ObservedVia::Plugin,
-            "s1",
+            &skill_graph::events::SessionId::normalize("s1"),
             "2026-01-01T00:00:01Z",
             None,
             Trigger::SkillLoad,
@@ -262,7 +270,7 @@ fn skill_usage_events_validate_against_event_schema() {
         SkillUsageEvent::skill_load(
             Runtime::Opencode,
             ObservedVia::Transcript,
-            "s2",
+            &skill_graph::events::SessionId::normalize("s2"),
             "2026-01-01T00:00:02Z",
             Some("Read".into()),
             Some("beta-skill".into()),
@@ -286,12 +294,35 @@ fn passthrough_events_validate_against_event_schema() {
     let lines = [
         r#"{"schema_version":1,"kind":"prompt_submit","runtime":"claude-code","session_id":"s1","timestamp":"2026-01-01T00:00:00Z","observed_via":"hook","prompt_hash":"abc123"}"#,
         r#"{"schema_version":1,"kind":"recommendation","runtime":"codex","session_id":"s1","timestamp":"2026-01-01T00:00:01Z","observed_via":"plugin","trigger":"prompt_submit","recommended":[{"name":"alpha-skill","digest":"d1"},{"name":"beta-skill"}],"emitted":true,"reason":"recommended","recommend_ms":42}"#,
-        r#"{"schema_version":1,"kind":"skill_load","runtime":"opencode","session_id":"!!!invalid!!!","timestamp":"","observed_via":"db","skill_name":"gamma-skill","skill_path":"/x/SKILL.md","skill_digest":"dd","detection":"file_read","confidence":"high","tool":"Read"}"#,
+        r#"{"schema_version":1,"kind":"skill_load","runtime":"opencode","session_id":"s3","timestamp":"","observed_via":"db","skill_name":"gamma-skill","skill_path":"/x/SKILL.md","skill_digest":"dd","detection":"file_read","confidence":"high","tool":"Read"}"#,
+        // Reserved-shape ids (transform outputs) pass through
+        // UNCHANGED — observe must never re-run the transform (#225 r6).
+        r#"{"schema_version":1,"kind":"prompt_submit","runtime":"claude-code","session_id":"sess1-f1437b8fb22261cc21b7a104ca00e1b1","timestamp":"2026-01-01T00:00:02Z","observed_via":"hook","prompt_hash":"yyy"}"#,
+        // A session_id that is not normalized contract form fails
+        // deserialization and the whole line is skipped — the stored
+        // form is never re-normalized into a different session (#225 r6).
+        r#"{"schema_version":1,"kind":"prompt_submit","runtime":"claude-code","session_id":"!!!invalid!!!","timestamp":"2026-01-01T00:00:03Z","observed_via":"hook","prompt_hash":"zzz"}"#,
     ];
     let path = dir.path().join("events.jsonl");
     std::fs::write(&path, lines.join("\n") + "\n").unwrap();
     let obs = skill_graph::observe::observe_path(dir.path()).unwrap();
-    assert_eq!(obs.events.len(), 3, "events: {:?}", obs.events);
+    assert_eq!(obs.events.len(), 4, "events: {:?}", obs.events);
+    assert_eq!(
+        obs.lines_skipped, 1,
+        "invalid session_id must skip the line"
+    );
+    // The reserved-shape id survived verbatim: a second transform would
+    // have produced a different, longer id and split the session.
+    assert!(
+        obs.events
+            .iter()
+            .any(|e| e.session_id == "sess1-f1437b8fb22261cc21b7a104ca00e1b1"),
+        "reserved-shape session_id must pass through unchanged: {:?}",
+        obs.events
+            .iter()
+            .map(|e| e.session_id.as_str())
+            .collect::<Vec<_>>()
+    );
     let schema = include_str!("../contracts/v1/skill-usage-event.schema.json");
     for e in &obs.events {
         let v = serde_json::to_value(e).unwrap();

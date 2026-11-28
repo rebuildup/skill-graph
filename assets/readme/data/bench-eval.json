@@ -1,0 +1,975 @@
+{
+  "summary": {
+    "cases": 58,
+    "required_hits": 52,
+    "required_hits_at3": 52,
+    "required_hits_at5": 52,
+    "required_total": 52,
+    "forbidden_hits": 0,
+    "optional_hits": 16,
+    "optional_total": 31,
+    "recommended_total": 88,
+    "empty_recommendations": 6,
+    "elapsed_ms": 38,
+    "max": 3,
+    "required_recall": 1.0,
+    "required_recall_at3": 1.0,
+    "required_recall_at5": 1.0,
+    "precision_required": 0.5909090909090909,
+    "precision_acceptable": 0.7727272727272727
+  },
+  "cases": [
+    {
+      "id": "rust-impl",
+      "recommended": [
+        "alpha-skill",
+        "beta-skill"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Rust implementation task; alpha owns implementation, beta is the declared test dependency.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "release-notes",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Release communication task; only gamma matches release notes/changelog.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "tests",
+      "recommended": [
+        "beta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Verification task; beta owns tests, alpha is the implementation context.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "rust-checks",
+      "recommended": [
+        "alpha-skill",
+        "beta-skill"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Cargo/module-boundary inspection is alpha's stated scope.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "release-announcement",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Version announcement is release communication, not implementation.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "verification-only",
+      "recommended": [
+        "beta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Harness repair is verification-only; implementation skill is not required.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "rust-dependency",
+      "recommended": [
+        "alpha-skill",
+        "beta-skill"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "session_start",
+      "rationale": "Session-start Rust services/CLI task maps to alpha.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "docs-review",
+      "recommended": [
+        "delta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Reader-facing prose review is delta's scope.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "ui-component",
+      "recommended": [
+        "epsilon-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Frontend component/styling change is epsilon's scope.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "incident-recovery",
+      "recommended": [
+        "zeta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Incident recovery/rollback is zeta's scope.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "parallel-worktrees",
+      "recommended": [
+        "eta-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Parallel worktree/agent coordination is eta's scope.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "schema-migration-none",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_hits_at3": 0,
+      "required_hits_at5": 0,
+      "required_total": 0,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "No fixture skill covers database schema migration; empty recommendation is acceptable.",
+      "case_kind": "negative"
+    },
+    {
+      "id": "none",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_hits_at3": 0,
+      "required_hits_at5": 0,
+      "required_total": 0,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Unrelated task should produce no recommendation.",
+      "case_kind": "negative"
+    },
+    {
+      "id": "jp-release-notes",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Japanese task text with English context keywords should still reach the English-described release skill.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "jp-local-edit-none",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_hits_at3": 0,
+      "required_hits_at5": 0,
+      "required_total": 0,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Vague local edit without skill-specific context should not force a recommendation.",
+      "case_kind": "negative"
+    },
+    {
+      "id": "agent-session-recovery",
+      "recommended": [
+        "agent-recovery"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Session/sandbox interruption recovery is agent-recovery's stated scope.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "jp-agent-session-recovery",
+      "recommended": [
+        "agent-recovery",
+        "interaction-discipline",
+        "code-review"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Japanese interruption report with mixed context should reach agent-recovery.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "code-naming-review",
+      "recommended": [
+        "code-naming",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Naming/rename responsibility design is code-naming; system-quality is its declared dependency.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "jp-code-naming",
+      "recommended": [
+        "code-naming",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Japanese naming request with English/Japanese context should reach code-naming.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "pr-review",
+      "recommended": [
+        "code-review",
+        "github-delivery",
+        "writing-discipline"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 2,
+      "timing": "mid_task",
+      "rationale": "Reviewing PR changes against standards/spec is code-review; github-delivery is related PR workflow context. writing-discipline self-declares 'Pull Requests' and 'review comments' as trigger domains, so it is a legitimate optional match for PR review output.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "correctness-invariants",
+      "recommended": [
+        "correctness-assurance",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Invariant/pre/postcondition assurance design is correctness-assurance.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "design-refinement",
+      "recommended": [
+        "design-refinement",
+        "dark-mode-design",
+        "interaction-discipline"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Separating facts from undecided design questions is design-refinement.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "bug-diagnosis",
+      "recommended": [
+        "diagnosing-bugs"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Hard bug/performance regression diagnosis is diagnosing-bugs.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "github-delivery-work",
+      "recommended": [
+        "github-delivery",
+        "writing-discipline"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Materializing release-driven Issues/PRs is github-delivery.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "user-facing-progress",
+      "recommended": [
+        "interaction-discipline",
+        "code-review"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Keeping user-facing work actionable with evidence is interaction-discipline.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "japanese-prose",
+      "recommended": [
+        "natural-japanese",
+        "writing-discipline"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Japanese reader-facing prose quality is natural-japanese; writing-discipline is related prose discipline.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "jp-natural-japanese",
+      "recommended": [
+        "natural-japanese"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Japanese prose request with English keywords should reach natural-japanese.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "onboarding-docs",
+      "recommended": [
+        "onboarding",
+        "quality-gate",
+        "layout-system"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Documentation for new contributors to start/verify a project is onboarding.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "jp-onboarding",
+      "recommended": [
+        "onboarding"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Japanese onboarding request should reach onboarding via mixed context.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "policy-evaluation",
+      "recommended": [
+        "policy-evaluation",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Evaluating policy/constitution outcomes with grader controls is policy-evaluation.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "quality-gate",
+      "recommended": [
+        "quality-gate",
+        "system-quality",
+        "code-naming"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Designing/running project quality gates is quality-gate; correctness-assurance is related assurance design.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "jp-quality-gate",
+      "recommended": [
+        "quality-gate",
+        "system-quality",
+        "code-naming"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Japanese quality-gate request with English/Japanese context should reach quality-gate.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "security-maintenance",
+      "recommended": [
+        "security-maintenance",
+        "quality-gate",
+        "system-quality"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Dependency/framework vulnerability impact triage is security-maintenance.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "skill-selection",
+      "recommended": [
+        "skill-selection",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "session_start",
+      "rationale": "Choosing/installing project-local Agent Skills is skill-selection.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "system-quality",
+      "recommended": [
+        "system-quality",
+        "quality-gate",
+        "design-refinement"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Whole-system quality/design restructuring is system-quality; code-naming is its declared dependency and design-refinement is related design-decision work.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "writing-discipline",
+      "recommended": [
+        "writing-discipline"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Persistent prose such as ADRs/PRs/commit messages is writing-discipline.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "kappa-japanese",
+      "recommended": [
+        "kappa-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Japanese-only query reaches an English-description skill via declared keywords (#61).",
+      "case_kind": "positive"
+    },
+    {
+      "id": "kappa-english",
+      "recommended": [
+        "kappa-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "English query reaches the same skill through its description.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "kappa-negative",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_hits_at3": 0,
+      "required_hits_at5": 0,
+      "required_total": 0,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Keywords must not cause unrelated admissions.",
+      "case_kind": "negative"
+    },
+    {
+      "id": "gloss-en-to-jp-desc",
+      "recommended": [
+        "code-naming"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "#78: English query must reach a Japanese-only description via built-in glossary, no keywords declared.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "gloss-jp-to-en-desc",
+      "recommended": [
+        "code-review"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "#78: Japanese query must reach an English-only description via built-in glossary.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "gloss-en-prose-natural",
+      "recommended": [
+        "natural-japanese"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "#78: prose-nature query reaches natural-japanese without admitting the negated code-naming distractor.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "gloss-weather-none",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_hits_at3": 0,
+      "required_hits_at5": 0,
+      "required_total": 0,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "#78: unrelated Japanese query must not admit via glossary expansion.",
+      "case_kind": "negative"
+    },
+    {
+      "id": "holdout-root-cause-bug",
+      "recommended": [
+        "diagnosing-bugs"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural bug-hunt phrasing; no skill names or description keywords.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-session-resume",
+      "recommended": [
+        "agent-recovery"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural session-interruption phrasing.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-cve-triage",
+      "recommended": [
+        "security-maintenance"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural vulnerability-impact phrasing.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-pr-second-eyes",
+      "recommended": [
+        "code-review"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural pre-PR review request.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-new-teammate",
+      "recommended": [
+        "onboarding"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Holdout: natural newcomer-documentation request.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-doc-stands-alone",
+      "recommended": [
+        "design-refinement",
+        "writing-discipline",
+        "system-quality"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural prose-rewrite request without discipline vocabulary.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-pick-approach",
+      "recommended": [
+        "engineering-decisions",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural decision-delegation phrasing.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-japanese-minutes",
+      "recommended": [
+        "natural-japanese",
+        "typesetting",
+        "layout-system"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural Japanese prose request.",
+      "case_kind": "cross-lingual"
+    },
+    {
+      "id": "holdout-coherence",
+      "recommended": [
+        "system-quality",
+        "code-naming"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 1,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural whole-system coherence request.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-which-skills",
+      "recommended": [
+        "skill-selection",
+        "code-review",
+        "system-quality"
+      ],
+      "recommended_count": 3,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Holdout: natural capability-selection request.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-release-tracking",
+      "recommended": [
+        "github-delivery"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Holdout: natural release-tracking request.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-fresh-machine-checks",
+      "recommended": [
+        "quality-gate",
+        "system-quality"
+      ],
+      "recommended_count": 2,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural verification-setup request.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-kappa-bug-reports",
+      "recommended": [
+        "kappa-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural bug-report triage phrasing against fixture skills.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-gamma-hotfix-note",
+      "recommended": [
+        "gamma-skill"
+      ],
+      "recommended_count": 1,
+      "required_hits": 1,
+      "required_hits_at3": 1,
+      "required_hits_at5": 1,
+      "required_total": 1,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "mid_task",
+      "rationale": "Holdout: natural release-announcement phrasing against fixture skills.",
+      "case_kind": "positive"
+    },
+    {
+      "id": "holdout-lunch-none",
+      "recommended": [],
+      "recommended_count": 0,
+      "required_hits": 0,
+      "required_hits_at3": 0,
+      "required_hits_at5": 0,
+      "required_total": 0,
+      "forbidden_hits": 0,
+      "optional_hits": 0,
+      "timing": "session_start",
+      "rationale": "Holdout: unrelated everyday request should produce no recommendation.",
+      "case_kind": "negative"
+    }
+  ]
+}

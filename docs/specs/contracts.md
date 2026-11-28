@@ -10,15 +10,41 @@ JSON Schema の正本は `contracts/v1/` に置く。CLI の `--format json` 出
 | `resolve-result.schema.json` | `resolve --format json` |
 | `skill-usage-event.schema.json` | hook/plugin が発行し `observe` が正規化する Skill Usage Event（JSONL, v1） |
 
+## 横断的な不変条件（#144 監査の構造的要件）
+
+22 ラウンドの監査で反復発見された欠陥クラスを構造的に排除するため、
+全実装が従う 3 つの不変条件をここに明文化する。監査は個別 bound の
+有無ではなく、これらの不変条件が全入力経路で成立するかを検査する。
+
+1. **保持量の有限性** — 外部入力 (ファイル、stdin、JSON payload、
+   transcript、plugin event、dataset) から保持する全 collection
+   (Vec/HashMap/String/PathBuf) は byte 数・要素数のいずれかの上限を
+   持つ。上限超過時は detail を捨てて counter/診断のみ残すか、入力を
+   reject する。retained 推定は実際の割当を過小評価してはならない
+   (clone・展開・前処理を含む保守的見積)。
+2. **charge-before-work** — 入力サイズに比例する仕事 (走査・比較・
+   分類・正規化・直列化) は、実行前に保守的な上限を work/byte
+   budget へ課金する。cap が保持量にしか効かず、保持ゼロのまま
+   CPU だけ消費する経路を残してはならない。
+3. **順序保存 truncation** — 件数・byte 上限による打ち切りは、定義
+   された順序 (observe では feed-line seq、その他では決定的 sort)
+   の真の prefix を emit する。category 順・発見順など入力順と
+   異なる順での打ち切りは、優先順位の偏りを生むため禁止。
+   打ち切り後の counter は全入力を集計し続ける (detail のみ欠落)。
+
 ## MCP tool surface（`skill-graph mcp`、ADR-0005）
 
 MCP server は read-only 3 tools を公開し、戻り値は対応する CLI
 `--format json` 出力と同一の JSON shape を `structuredContent` と
-text content の両方で返す。
+text content の両方で返す。ただし `structuredContent` は protocol
+規約上 JSON object を要求される（legacy peer では非 object は
+strip される）ため、recommend の配列は `{"recommendations": [...]}`
+の object envelope に包む。配列要素の shape は
+`recommendation.schema.json` と同一。
 
 | MCP tool | 対応 CLI | 返す contract |
 |---|---|---|
-| `recommend` | `recommend --format json` | `recommendation.schema.json`（recommendation 配列） |
+| `recommend` | `recommend --format json` | `{"recommendations": [...]}`（要素は `recommendation.schema.json`） |
 | `discover` | `discover --format json` | `discovery-output.schema.json` |
 | `resolve` | `resolve --format json` | `resolve-result.schema.json` |
 
@@ -32,7 +58,14 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 （`observed_via` に `mcp` は存在しない）。tool 計算は 1 件ずつ
 直列化される: client が call を pipeline しても同時に走る graph
 構築は 1 つまでで、待機は async 側で行うため blocking pool を
-消費しない（#144 r19）。
+消費しない（#144 r19）。待機 queue は持たない: permit は
+`try_acquire` で取り、計算中の call がある間に届いた pipelined
+call は `internal_error` ("skill-graph is busy") で即 reject する。
+各 handler task は parse 済みの引数 `JsonObject` を保持するため、
+queue 無制限は rmcp の 16 MiB/line 上限を Value 増幅 (~16-30×)
+で迂回する OOM 経路になる（#144 R23）。逐次 request/response
+の client は影響を受けない。引数 tree は clone せず blocking task
+へ move する。
 
 ## observe 出力の扱い
 
@@ -51,19 +84,63 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
 - event log の JSONL 行は `kind` / `schema_version` を持つ行のみ
   contract イベントとして deserialize され、`schema_version` が
   `SCHEMA_VERSION` と一致しない行は `lines_skipped` に計上される。
-- passthrough event の payload 由来文字列フィールドは emit 側
-  constructor と同じ上限に正規化される: `session_id` は
-  `[A-Za-z0-9._-]`・128 文字（`unknown-<hash>` 正規化と同様に、
-  128 文字を超える id は先頭 119 文字 + `-` + hash 8 桁で区別される）、
-  `skill_path` 1024、`tool`/`skill_name`/`recommended[].name` 256、
+- passthrough event の `session_id` は**正規化済み contract 形のみ**
+  受理される（`SessionId` の Deserialize が charset `[A-Za-z0-9._-]`・
+  128 文字以内を検証し、不適合行は `lines_skipped`）。正規化の
+  transform は ingest boundary（hook payload・plugin event・
+  transcript/db row）で `SessionId::normalize` が**一度だけ**適用し、
+  それ以降の全経路 — event constructor・state key・observe
+  passthrough — は `SessionId` 型を持つため再変換が型レベルで
+  不可能（#225 r6: 旧実装では正規化済み id を constructor が再度
+  transform し、prompt 系と load 系で session_id が乖離して funnel
+  が分裂した）。canonical な raw id（全て valid charset・128 文字
+  以内・generated 形状でない）は素通しし、それ以外は valid 文字の
+  先頭 95 文字 + `-` + 元 id の SHA-256 先頭 32 hex（計 ≤128 文字）
+  に変換される。generated 形状（末尾が `-` + 32 桁 lowercase hex）は
+  reserved であり literal id としても変換対象になるため、
+  passthrough 名前空間と生成名前空間は構造的に衝突しない（#225 r5:
+  旧 8 hex 接尾辞では literal id が別 id の変換結果と一致し得た）。
+  charset フィルタで文字が除去された id・128 文字超の id・全滅 id
+  （`u-<hash>`）はいずれも元 id の hash を含むため merge されない
+  （`sess!1` と `sess?1`、および `sess!1` の変換結果に等しい
+  literal id は別 id）。冪等性は契約ではない: charset 損失を伴う
+  写像では冪等性と単射性は両立しないため、transform は ingest で
+  一度だけ適用する。`skill-graph detect` の stdin payload
+  （`session_id`/`sessionID`/`sessionId`）は **raw の外部識別子**を
+  運ぶ契約であり、detect がこの境界で一度だけ正規化する。producer
+  が正規化済み id を送ってはならない — OpenCode plugin は自身の
+  state key 用に `safeSessionID` を適用しつつ、detect payload には
+  生の `event.sessionID` を転送する（parity により
+  `SessionId::normalize(raw) === safeSessionID(raw)` で相関は保た
+  れる。#225 r7: 旧実装は正規化済み sid を送り、reserved shape に
+  合致した変換結果が detect 側で**二度目の transform** を受け、
+  plugin 発・detect 発の event で session_id が乖離した）。
+  plugin は raw id を **UTF-8 先頭 32 KiB byte** に slice してから
+  `safeSessionID` と detect payload の両方に使う（#225 r9: slice は
+  identity domain 全体を必ず含む輸送境界 — 8192 chars × 最大 4
+  byte/char = 32 KiB — であり、比較 domain そのものではない）。
+  **identity domain は `SessionId::normalize`/`safeSessionID` が
+  内部で一度だけ定義する「先頭 8192 code points」**で、head・hash
+  の双方がこの domain のみから導出される（#225 r9: 旧実装は hash
+  を全文に対して計算し仕事量が O(input) だった上、plugin 側の
+  8 KiB slice が実効 domain を producer-local にずらしていた。
+  domain を normalize 契約の内側に置くことで、hook・plugin・
+  detect・observe の全 producer が同一 domain・同一結果を保証し、
+  かつ任意長入力に対し O(8192) に有界化される）。同一 domain を
+  共有する raw id は契約上同一 session であり、domain 内で異なる
+  id は区別される。**identity domain（8192 code points）を超える
+  raw id は帰属不能（空）へ収束する**（#225 C01: 超過 id は domain
+  内で衝突し得るため、状態を共有しない unattributed namespace に
+  落とす — session 分離を後退させない）。`skill_path` 1024、`tool`/`skill_name`/
+  `recommended[].name` 256、
   `reason` 1024、`prompt_hash`/`skill_digest`/`recommended[].digest` 128、
   `timestamp` 64 文字。`recommended` は最大 32 件
   （`MAX_RECOMMENDED`）で打ち切られる。`skill_load.skill_name` は
   `recommended[].name` と同じ valid skill name 規則を要求し、違反行は
   `lines_skipped` に計上される（constructor が emit し得ない名前を
-  funnel join キーに流入させない）。charset フィルタで除去される
-  文字を含む `session_id` は merge されうる（例: `a:b` と `ab` は
-  共に `ab`）— これは sanitize の定義済み動作。`recommended[].name` は
+  funnel join キーに流入させない）。OpenCode plugin の `safeSessionID` は同一規則を
+  実装し、`src/assets/opencode-plugin.test.ts` が parity を検証する。
+  `recommended[].name` は
   schema の `minLength: 1` より厳しく valid skill name を要求する —
   schema 適合でも観測側の join キーにならない名前は `lines_skipped`
   に計上される。`recommend_ms` は schema 上 `integer` だが観測側は
@@ -76,14 +153,22 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   残すが、OpenCode plugin は dedup 時に event を出さない。`reason`
   語彙と dedup event の有無は runtime 間で一致せず、delivery_rate の
   分母構造が異なる（pilot spec は runtime 間比較を前提としない）。
-  plugin の `emitted` は injection キュー投入時点の値であり、context
-  hook での実注入までは保証しない（pending FIFO eviction で未注入に
-  なりうる）。
-- `SKILL_GRAPH_HOOK_NOSTATE=1` の dedup 意味論は adapter 間で異なる:
-  Rust hook は state marker を無効化し repeat prompt 毎に recommend を
-  再実行するが、OpenCode plugin の in-memory dedup map は NOSTATE 下でも
-  有効で、repeat `(session, prompt)` と skill-load 依存パスを抑制し続ける。
-  NOSTATE は永続化の抑止であり、plugin のメモリ内重複排除は残る。
+  plugin の `emitted` は context hook での実注入成功時にのみ true
+  として記録される（#225 C09: queue 投入時点ではなく drain 時点）。
+  drain 前に queue から落ちた entry は `emitted:false` で終端記録
+  される — 理由語彙は `evicted`（session/entry 上限超過）・
+  `expired`（15 分超の未 drain）・`process_exit`（exit 時の未 drain
+  flush）・`inject_failed`（system 注入失敗）の 4 種。
+- `SKILL_GRAPH_HOOK_NOSTATE=1` は**保持される session state**（dedup
+  marker・prompt dedup set・skill-load dedup set・event log）を抑止
+  する。Rust hook は repeat prompt 毎に recommend を再実行し、
+  OpenCode plugin も dedup map を bypass して同じ意味論を持つ
+  （#225 C03 で旧契約「plugin の in-memory dedup は残る」を撤回）。
+  prompt→context の pending queue は**一時輸送**であり保持 state
+  ではない — NOSTATE 下でも帰属可能 session への注入は維持され、
+  emit() は no-op のまま（event は記録されない）。process exit 時に
+  未 drain の queue は `process_exit` として flush を試みるが、
+  NOSTATE では emit が no-op のため記録は残らない。
 - `observe --summary` の `by_session` は `(runtime, session_id)` キーの
   辞書順先頭 500 session まで。`collection_errors` / `errors` /
   `errors_omitted` / `by_session_omitted` で打ち切り・収集失敗を通知する。
@@ -168,7 +253,15 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   `detect` 子プロセスの stdout から parse する event は
   1 payload あたり 64 件まで（Rust 側 `MAX_EVENTS_PER_PAYLOAD`
   と同じ）。pending 注入キューは session あたり 64 entry で
-  打ち切る。
+  打ち切る。session id を帰属不能（sanitize 結果が空）とする
+  prompt/tool event は per-session state を一切共有しない:
+  dedup・recommendation queue・session continuity（`sessionCtx`）
+  を bypass し、context hook は空 id で早期 return する
+  （Rust hook の `state_disabled` と同じ契約 — 匿名 session 同士が
+  状態を merge・漏洩しない）。`detect` spawn 予算のみ、帰属不能
+  session 全体で共有する単一の fail-closed 上限を持つ
+  （resource bound であり recommendation state ではない。
+  枯渇時は匿名 session の detection のみ止まる）。
 - `observe --summary` の conversion 集計は決定的に制限される:
   name 別 load リストの cursor で通常時はほぼ線形だが、timestamp
   欠落時の encounter-order fallback は rec×load の組合せ検査を
@@ -194,10 +287,22 @@ log・dedup state・設定を変更せず、Skill Usage Event を発行しない
   feed 順に制限する。budget が最初に event を拒否した時点で
   `closed` latch が立ち、以降の event は全て detail を捨てて
   counter map のみ更新するため、emit される event 列は常に feed
-  順の真の prefix になる（passthrough pending buffer と同じ
-  意味論）。tool_use 1 件あたりの classification 数も
+  順の真の prefix になる（passthrough pending buffer も同一の
+  `closed` latch 意味論: `PendingBuffer` が count+byte 予算の
+  初回拒否で latch し、以降の event は counter のみ更新する）。
+  tool_use 1 件あたりの classification 数も
   `MAX_EVENTS_PER_PAYLOAD`（64）で打ち切る（hook の per-payload
-  cap と同じ上限）。
+  cap と同じ上限）。1 file scan 中の transient 保持は pending
+  buffer・両 scanner の内部状態・emit runs・`obs.retained` の各段が
+  独立に `MAX_OBSERVE_EVENTS`/`MAX_OBSERVE_RETAINED_BYTES` または
+  `MAX_SCAN_BYTES`（scanner 毎）で bound されるため、peak は推定
+  ~320 MiB — 各段の予算は同一定数を再利用する受容 residual
+  （#144 R25 LOW）。`--summary` の `session_events`/`funnel_for`
+  は集計用の transient map（`runtime:session_id` キー等）を
+  event 数比例で構築するため、最悪入力では retained
+  `MAX_OBSERVE_RETAINED_BYTES` budget の数倍の peak memory に
+  なる — CPU は共有 pair-check 予算で有限であり、memory 増幅は
+  受容 residual として記録する（#144 R23 LOW）。
 - `timeliness_ms` は RFC 3339 timestamp のミリ秒精度（小数秒は ms に
   丸め）で rec→load の差分を取る。offset は必須（`Z`/`z` または
   `±hh:mm`、コロン必須）で、小文字 `t`/`z` は RFC 3339 が許容する
@@ -242,7 +347,17 @@ Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts
   （Rust: `symlink_metadata`、TS: `lstatSync`）。symlink は rename しない。
 - open 済み fd の metadata で `uid == euid`・regular file を検証し、
   書き込み対象はさらに `nlink == 1` を要求する。不一致・非 regular・
-  hardlink は fail-open で書き込まない（plugin は uid 検査のみ）。
+  hardlink は fail-open で書き込まない（plugin も `nlink` を検査し
+  Rust と parity を保つ）。
+- Rust の state dir（`${TMPDIR}/skill-graph-hook-state`）は open 時に
+  `O_NOFOLLOW|O_DIRECTORY` で dirfd を取得し euid 所有を検証したうえで、
+  全 state file 操作を `openat`/`fstatat` でその fd 相対に行う。
+  dir 自体の permission tightening も検証済み dirfd への `fchmod` で
+  行い、dirfd 確立前後を通じて path 再解決に依存する操作を残さない。
+  検査と操作の間に state dir エントリを差し替える競合は構造的に
+  不可能（#225）。state file 名は `<runtime>-<session>` を含み、
+  runtime 間・未知 session 間で dedup/recommended state を共有しない
+  （session id が sanitize で空になる場合は state 自体を無効化）。
 - 権限 tightening は fd ベース（`fchmod` / `File::set_permissions`）のみ。
   path ベースの chmod は TOCTOU で symlink 先を変更しうるため禁止。
 - 読み取り側も同じ fd 検査を通し、信用できない state は空として扱う。
@@ -254,6 +369,68 @@ Rust hook（`src/hook.rs`）と OpenCode plugin（`src/assets/opencode-plugin.ts
 
 - `availability` は discovery 時点の `available` / `parse_error` のみを表す。
 - installed / available / loaded / applied / unobservable の区別のうち、loaded・applied・観測不能は runtime 側の観測が必要であり、この v1 contract では `availability` に混ぜない。
+- Agent Skills 規格適合は `availability` とは独立の軸で、`spec_violations`
+  （string array、skill-summary schema の required field）が担う
+  （#225 B07）。3 層を区別する:
+  - **valid**: `spec_violations == []` かつ `parse_error` なし。
+  - **compatibility（互換受理）**: frontmatter は parse できるが
+    規格違反がある（name の charset/長/連続ハイフン/dir 名一致、
+    description の欠損・空・1024 超、frontmatter 自体の欠落）。
+    name は規格適合名へ sanitize した上で skill は推薦可能のまま
+    残し、違反内容を `spec_violations` に記録する — 正当な既存
+    skill を規格違反だけで拒否しない。
+  - **parse error**: YAML 破損・hazard・oversized・非 regular file
+    等の hard failure。`availability: parse_error` で推薦対象外。
+  - name の規格判定は `valid_skill_name`（`[a-z0-9-]`、1–64、
+    先頭/末尾 `-` 禁止、**連続ハイフン `--` 禁止** — 現行
+    agentskills.io specification に一致）と、dir 名一致の2規則。
+    dir 名一致は declared name が規格適合かつ dir 名も規格適合な
+    場合のみ検査する。
+
+## 本文アクセスと Progressive Disclosure（#225 B04）
+
+core-contract の「全 `SKILL.md` 本文を常時読み込まない」は
+**モデルへの注入**を制約する規則であり、内部解析の禁止ではない。
+両者を区別する:
+
+- **注入面**: LLM-facing 出力（`additionalContext`、MCP
+  `structuredContent`/`content`、`.recommended`、event log、
+  `discover`/`resolve`/`recommend` の JSON）は `SkillSummary` 以下の
+  metadata のみを運び、`body_text` を含まない
+  （`skill-summary.schema.json` の `additionalProperties: false` が
+  構造的に排除する）。
+- **内部解析**: parser は ≤1 MiB（`MAX_SKILL_BYTES`）の body を読み、
+  link 抽出・resolver の mention 派生・search の weak-signal
+  scoring（`MAX_BODY_SCAN_BYTES`/`MAX_BODY_TERM_WORK` で bound）に
+  使う。これは agent context への注入ではなく、保持量は discovery
+  512 MiB / resolve 128 MiB の budget で bound 済み。
+- したがって「本文を読まない」は「本文を推薦根拠テキストとして
+  モデルへ渡さない」の意味であり、graph 構築のための bounded な
+  内部走査は契約違反ではない。参照ファイル（`references/` 等）の
+  本文は一切読まない — markdown link は target 文字列の字句解析
+  のみで、link 先 file の open は発生しない。
+
+## link 解決の意味論（#225 B06）
+
+`SkillLink.resolved_name` / `resolved_path` の意味を固定する:
+
+- `resolved_name`: link target が**発見済み skill に解決**した
+  場合のみ設定される（Markdown/dir link は `by_path`、Requires/
+  Mention は `by_name`）。実在しない target・範囲外 target では
+  設定されない。
+- `resolved_path`: Markdown link の target を正規化した path を
+  記録する。by_path による skill 解決に加え、`.md` target が
+  **link 元 skill のディレクトリ配下に字句的に収まる**場合にも
+  設定される — この場合は**実在確認を行わない字句解決の記録**で
+  あり、file の存在・skill であることを主張しない（link 先本文は
+  読まない）。skill dir 外への `..` 脱出・絶対 path・root 外は
+  `resolved_path` を持たない。
+- したがって `resolved_name.is_some()` ⟺ skill への解決、
+  `resolved_path.is_some() && resolved_name.is_none()` ⟺
+  skill dir 内の字句解決（dangling を含みうる）、両方 None ⟺
+  解決なし（外部・範囲外・未解決）。backlink 集計は
+  `resolved_path` を `by_path` で再照合するため、実在しない
+  字句 path は backlink を生成しない。
 
 ## 曖昧性と no-output
 
@@ -394,7 +571,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   `~/.local/share` の canonical path）の配下にある dir に限定
   される。spec decode だけでは任意の `*/skill-graph/opencode-plugin`
   を削除対象にできない（#144 r19）。最終 component が symlink の
-  場合は link 自体を unlink し、target は削除しない。残余: enable
+  場合は canonicalize した **parent** が managed parent
+  （`<canonical base>/skill-graph`）に一致する時のみ link 自体を
+  unlink し、target は削除しない — foreign dir の symlink も
+  attacker-directed deletion になりうるため同じ base-membership
+  gate を通す（#144 r22）。残余: enable
   当時の custom `XDG_DATA_HOME` が unset 等で base 集合から外れた
   payload は orphan として残る（削除を拒否する方向の fail-safe）。
 - materialize される OpenCode plugin payload は XDG data dir 配下に
@@ -455,7 +636,11 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   bound するため、flat な anchor/alias 対で ~10^10 node の materialize
   （OOM）に至りうる（#144 r17）。anchor 定義のみ・alias 非含有の
   document は影響を受けない。判定は serde_yaml と同一の libyaml
-  event stream で行うため parser と乖離しない。
+  event stream で行うため parser と乖離しない。同一 scan で
+  container nesting depth 128 を超える document も reject する:
+  serde_yaml の再帰 deserializer は深い nesting で call stack を
+  使い切り（≤1 MiB の `[[[[…` で ~50 万 frame）、他の bound が
+  効く前に stack overflow しうる（#144 structural）。
 - `parse_skill` の `O_NOFOLLOW` は最終 component のみを守る。
   WalkDir 収集後に skill ディレクトリや祖先 component が symlink
   へ差し替えられる窓は残るが、影響は ≤1 MiB の untrusted parse
@@ -475,7 +660,26 @@ cwd 基準で解決するため、cwd が一致しない環境では診断と実
   受容 residual。
 - `bench`（eval::run）は dataset 64 MiB・case 10,000 件に加え、
   graph build の総数 256・recommend cutoff `--max` 64・収集する
-  discovery error 合計 4,096 件で bound する。LRU は保持 graph を
+  discovery error 合計 4,096 件で bound する。LRU（bench 内部の
+  計測用 cache — 製品 runtime は call 毎に graph を再構築し
+  永続 cache を持たない）は保持 graph を
   32 に抑えるが総 build work・error 蓄積・case 毎 result 膨張は
   別系統の bound が必要（#144 r19）。CLI `search`/`recommend` の
   `--max` も 64 に clamp する（MCP tool と同じ出力上限）。
+
+## 保証と検証の対応（#225）
+
+各保証対象について「不変条件 → 構造的機構 → 検証」を対応付ける。
+検証は性質（正常系だけでなく境界値・敵対的入力・異常系を含む）に
+対して行い、修正前実装で失敗することを確認した回帰テストを伴う。
+
+| 保証対象 | 不変条件 | 構造的機構 | 検証 |
+|---|---|---|---|
+| 入力境界（plugin） | 敵対的・巨大な host payload に対し、plugin が反復・読取する処理量が O(budget) で有界。**全 key 反復（own・継承 enumerable を含む）がグローバル node 予算を消費する** — per-object 計上だけでは nodes×keys の総量が bound を逸脱し得る。**明示的境界（#225 C02）**: JS には key 数を実体化せずに列挙する primitive がなく、Proxy の ownKeys/getOwnPropertyDescriptor trap が返す key 配列は host 側で一度 materialize される — この1回の host materialization は plugin の制御外であり trusted-host 境界として契約に明記する。plugin 自身が反復・保持・serialize する量は全て MAX_INPUT_NODES / MAX_INPUT_JSON_BYTES で cap される | `boundJsonValue`（depth 32 / nodes 8192 / 1 MiB、for..in 遅延走査＋early break、**yield された全 key が `n` と `st.nodes` の双方を消費**、array length は一度だけ読む — Proxy get trap の再読で確保量が検査をすり抜けない、clone は defineProperty で `__proto__` 等の特殊キーを own data property として保持）、`resultText`（全ノード計上・64 KiB）、`utf8Slice`（O(budget)）、`detectLoad` の事前 filter | `opencode-plugin.test.ts` の性質テスト: Proxy iterator/descriptor トラップで**走査量そのもの**を観測（旧実装で iters=200,001 / gopd≈50,000 を検出）、**継承 enumerable key がグローバル予算を消費することを検証**、2000 件 seeded sweep で safeSessionID 契約、200 件の乱数 result で byte budget、`__proto__` own-property 保持テスト（旧実装で key 喪失を検出） |
+| session 識別・状態分離 | session_id の正規化は ingest boundary で**一度だけ**。正規化済み id と raw id は `SessionId` 型で分離され、再 transform は型レベルで不可能。producer→detect の payload は raw id を運ぶ契約（plugin は `safeSessionID` 済み値を送らない）。sanitize は単射的（literal id が別 id の生成形状と衝突しない — `-`+32hex suffix は reserved）。正規化結果が空の session は per-session state を共有しない。runtime・正規化済み id で dedup 名前空間を分離。session_id ≤128 chars | `SessionId::normalize` が唯一の transform 地点。event constructor は `&SessionId` のみ受付。hook `event_session_id`・observe の `Rc<SessionId>`・passthrough の Deserialize 検証（不適合は lines_skipped）。detect stdin は raw 契約で `detect_all_from_payload` が一度だけ normalize。plugin detect payload は raw session_id（UTF-8 先頭 32 KiB 輸送 slice — identity domain 全体を必ず内包）を転送。**identity domain = 先頭 8192 code points は normalize 契約の内側で一度だけ定義**され、head・hash がともに domain のみから導出されるため任意長入力で O(8192) に有界。Rust `state_disabled` + `<runtime>-<session>` state file 名。plugin は dedup/injection を分離する（#225 C03/C04）: **dedup**（prompt emitted set・loadDedup・promptSkillSeen）は STATE_ON かつ帰属可能 session のみ、**injection transport**（pending queue→context drain）は帰属可能 session なら NOSTATE 下でも動作し、drain 時に `emitted:true` を記録。dedup mark は recommend/declaredDeps 成功後にのみ立つ（失敗で retry を阻害しない）。queue entry は 15 分で expire・process exit で `process_exit` flush され、未 drain 損失は全て `emitted:false` で終端記録される。`emitted` は実際に注入成功した時のみ true | `SessionId::normalize` property sweep（3000 件 adversarial: ≤128・charset・決定性・非衝突）+ reserved-shape 衝突拒否 + `sanitize_session_id_identity_domain_is_first_8192_chars`（domain 共有 id の同一性・domain 内差異の区別・1 MiB+ 入力の有界性 — **旧実装の全文 hash で FAIL を実証**）+ `noncanonical_session_id_normalizes_once_across_entrypoints`（prompt/skill-load で同一 session_id — **旧実装で二重 transform を実際に検出**）+ `detect_normalizes_raw_session_id_once`/`detect_treats_reserved_shape_input_as_raw`（**実バイナリ**で normalize 出力と contract 形を検証）+ plugin の detect stdin が raw session_id を運ぶことを spawn capture で検証（**旧実装で normalized sid 送信を検出**）+ 20K-emoji session id が ≤32 KiB slice に制限され `safeSessionID(slice)===safeSessionID(full)` であることを spawn capture で検証 + passthrough reserved-shape verbatim + invalid session_id → lines_skipped、TS 側 parity、`anonymous session state isolation` |
+| イベント観測（funnel） | `emitted` は「model が実際に見た注入」のみを表す。recommended[] は注入集合と一致 | plugin は匿名 session に注入経路を持たないため `emitted:false` を記録（Rust は同期 response で匿名注入可能なため true で正しい — 非対称は構造由来） | session 分離テストの `emitted` assertion（匿名 false / attributed true） |
+| ファイル所有権・状態安全 | 検査と操作の間に path が差し替えられない。symlink・他人所有・hardlink を拒否。権限は 0700/0600 | state dir を `O_NOFOLLOW|O_DIRECTORY` dirfd で anchor し全操作を openat/fstatat/fchmod 化。plugin `emit()` は O_NOFOLLOW+O_NONBLOCK+uid 検査 | `tests/` の hook/adapter 系 + contracts.md TMPDIR 契約。dirfd 確立前の path 操作は存在しないことをコード構造で保証 |
+| clean-legacy 所有権 | v0.3.x 成果物のみ削除。`current` は payload 持ち X.Y.Z dir を指す symlink のみ。release dir は `skill-graph` file AND `adapters/` dir の両 marker 必須 | 二相化（全 entry を削除前 FS で classify→delete） | `tests/adapter.rs` clean_legacy 5 件（lookalike・dangling symlink・bin link・nonlegacy target）。旧実装で `current`/marker 無し dir の誤削除を実証 |
+| 配布成果物同一性 | 公開経路の全分岐で「registry/ release が提供する内容」==「**承認済み freeze manifest が digest した固定成果物の bytes**」。**release は再ビルドしない**: artifact-verify.yml が唯一の build→native verify→install verify→digest→attest 経路であり、その最終 job `freeze-manifest` が**承認記録 `freeze-manifest.json` を公開前に一度だけ生成**する — schema・workflow・event(push)・ref・head_sha・run_id・run_attempt・全配布成果物（4 release tarball + 4 platform npm tgz + metapackage tgz + .crate、計 10 件）の sha256/channel/target を束縛。release.yml / npm-publish.yml / crates 検証は**この manifest を承認入力として消費**し、再生成も再解釈もしない: pin された freeze run（`freeze_run_id` dispatch input、または tag push が trigger した run のみ — event=push・head_sha=tag commit・completed/success・run_attempt 一致を API で検証）から artifact を download し、`verify-freeze-manifest.py` が identity 全フィールドと**全 artifact の存在・一意性・digest**を照合、不一致・欠落・重複は拒否。provenance は `gh attestation verify --signer-workflow …/artifact-verify.yml --signer-repo … --source-digest <tag_sha>` で承認 workflow・commit に拘束（run 結合は manifest の run_id+attempt が担う）。既公開 release では公開済み manifest と承認 manifest の **byte 一致**を要求（同 digest でも異なる identity は拒否）。部分公開（manifest のみ・tarball 0 件等）からは欠損分のみ additive に復旧し、不一致 asset は上書きせず拒否。**公開される npm bytes は frozen .tgz そのもの**（`publish-npm.sh` は .tgz 引数を re-pack せず、その bytes を publish → registry は byte-identical に serve）| `freeze-manifest.sh`: 全 frozen-*/freeze-meta.json が当該 run_id/run_attempt/head_sha/workflow に一致することを検査→全 digest 再計算→platform 非依存成果物（meta tgz・crate）を packaged-paths-clean 条件で一度だけ生成→manifest 出力。`verify-freeze-manifest.py`: identity 照合 + artifact dir 群を walk して各 manifest entry が**丁度 1 回・digest 一致**で存在することを証明。`publish-npm.sh`: .tgz 入力は archive gate→extract preflight のみで re-pack せず固定 artifact として Phase D/E を通す。`verify-crate-artifact.sh`（公開前）/`verify-crates-published.sh`（公開後）はともに manifest digest を権威として照合 | `test-freeze-manifest.sh`: valid 受理 + wrong run_id/attempt/sha/event・欠落 channel・corrupt/missing/duplicate artifact・foreign freeze-meta の全拒否。`test-npm-publish.sh`: .tgz 入力で registry が入力 bytes と byte-identical に serve することを実証。release/npm-publish 両 workflow が同一 `verify-freeze-manifest.py` を呼ぶ構造で経路間の契約ドリフトを排除 |
+| 配布チャネル導入（auth-free local） | 全配布チャネルで、**凍結成果物を修復せずに** install → exec → version → **決定的コーパスに対する具体的な機能出力** → uninstall のライフサイクルを公開前に検証できる。検証対象は各チャネルが実際に公開する bytes と同一: crate は freeze-manifest の crates channel digest を持つ .crate で、`verify-crate-artifact.sh` が `cargo publish` 前に packaged bytes == manifest digest を要求（`cargo package` は決定的 — 同一 source/checkout で byte-identical、実測済み）、`verify-crates-published.sh` が公開後に static.crates.io の .crate を同 digest と比較（crates.io version は immutable で再 publish 不可のため、不一致時の復旧は同 version 再公開を前提としない — yank + 原因調査 + 必要なら新版）。npm は frozen .tgz をそのまま publish した bytes を install、brew/mise は frozen release tarball を消費。**npm-publish.yml にも chmod 修復は存在しない**（`cp -p` + `[ -x ]` assert — exec bit 喪失は修復ではなく失敗） | `verify-install-local.sh`: exec bit は artifact 由来のみ（chmod 修復なし — package-target.sh / verify-install-local.sh / npm-publish.yml の全経路で排除済み）。基本機能は **5 プロンプトの決定的コーパス**で、各プロンプトがこのリポジトリの skill 集合に対してエンジンが実際に推薦する skill リストと**完全一致**する `additionalContext` を要求（単一プロンプトの fail-open でも、常に同一出力を返す binary でも通らない。skill/ranking 変更時はコーパスを意識的に更新する）。`interface_smoke` が hook 以外の全公開 I/F を packaged binary 上で検証する: `discover`/`resolve`(name・unresolved)/`recommend`/`deps` の JSON contract、MCP stdio の initialize+tools/list（recommend/discover/resolve tool 存在）、`observe --summary` の funnel shape、`adapter status` + 隔離 HOME での enable→status→disable lifecycle（管理 hook の除去を JSON 検査）。upgrade は同 version の再 install（cargo/npm 双方で冪等に検証済み）、rollback は公開済み旧 version が前提のため公開前検証の対象外として明示する。cargo は freeze された .crate を展開して `cargo install --path`、npm は platform+metapackage の実 tgz を `npm install`（.bin shim→platform payload exec）、brew は `file://` frozen tarball を指す local tap formula で install/uninstall。mise の `github:` backend は release asset を取得するため lifecycle は公開後（asset 契約は本検証で証明済み） | artifact-verify.yml が全 4 target の native runner で `package-target.sh` → `package-npm-platform.sh` → `verify-install-local.sh` → freeze/upload の順に実行し、`freeze-manifest` job が manifest を集約（失敗 run は promotable artifact を残さない）。ローカル実測: crate/npm install・version・hook corpus・uninstall 全 PASS（linux-x64） |
+| 性能 | 推薦・discovery・CLI の latency/throughput/memory が spec 範囲内 | オンメモリ engine（runtime は call 毎に graph を再構築 — 永続 cache・常駐なし。`bench`/`perf` 内部の LRU graph cache は計測専用で製品経路ではない）、全走査に上限 | `docs/evidence/` の測定記録（env/SHA/コーパス/再現コマンド）。process latency は 30 samples の p50/p95/max（p95 が max に退化しない件数）、RSS は `/usr/bin/time -v` を各点 20 回計測した最大値で `assets/readme/data/memory.json` に一元化。README/SVG は `perf-500.json`/`bench-eval.json`/`memory.json` から `gen-readme-assets.py` で再生成 |
