@@ -381,7 +381,8 @@ pub fn recommend(graph: &Graph, query: &str, context: &str, max: usize) -> Vec<R
     //   single low-df term of meaningful length);
     // - description hits admit when at least two independent query terms match
     //   and at least one is low-df, so generic words in broad descriptions do
-    //   not admit by themselves;
+    //   not admit by themselves; a single ASCII hit admits when the term is
+    //   unique to that skill (df == 1) and meaningful-length (#319);
     // - at least two independent context-term hits in the description admit;
     // - an explicit `requires` declaration admits its dependency when the
     //   declaring skill is admitted (necessity, one hop only);
@@ -700,6 +701,21 @@ fn directly_admitted(
     // description terms from admitting alone but lets e.g. "PR review" reach
     // `code-review` on real-size corpora.
     let name_plus_description = !info.name_hits.is_empty() && info.description_hits.len() >= 2;
+    // A single description hit admits only when the term is unique to
+    // this skill across the corpus (df == 1): one shared-but-ambiguous
+    // term cannot distinguish between the skills that contain it, so
+    // df > 1 stays on the multi-hit independence path. ASCII-only (a
+    // lone CJK bigram must never self-admit, #78) and meaningful
+    // length. Real prompts routinely share only one content word with
+    // a skill's description vocabulary ("--verbose and --output FILE
+    // flags" vs "command-line interfaces ... flags"), and requiring
+    // two hits made recommend() abstain on exactly those cases at
+    // corpus scale (#319). Multi-hit clusters still need the
+    // independence rule below.
+    let single_rare_description_hit = info.description_hits.len() == 1 && {
+        let term = qterm(info.description_hits[0]);
+        term.is_ascii() && term.len() >= 4 && df(term) == 1
+    };
     // Description-only admission (no name anchor) requires hits from at
     // least two distinct query-term sources: a single CJK substring emits a
     // bigram cluster plus glossary terms, and those must not count as
@@ -730,6 +746,7 @@ fn directly_admitted(
     multiple_name_hits
         || unique_name_hit
         || name_plus_description
+        || single_rare_description_hit
         || description_admitted
         || context_admitted
 }
