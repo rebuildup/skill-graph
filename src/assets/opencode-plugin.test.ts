@@ -19,7 +19,11 @@ const testDir = mkdtempSync(join(tmpdir(), "sg-plugin-test-"))
 const fakeBin = join(testDir, "skill-graph")
 writeFileSync(
   fakeBin,
-  '#!/bin/sh\ncat >/dev/null 2>&1 || true\n' +
+  // detect stdin is captured to <fakeBin>.capture: Bun.spawn does not
+  // see runtime process.env mutations, so a fixed sibling path is the
+  // reliable observation point.
+  '#!/bin/sh\ninput="$(cat 2>/dev/null || true)"\n' +
+    'if [ "$1" = "detect" ]; then printf \'%s\' "$input" > "$0.capture"; fi\n' +
     'if [ "$1" = "recommend" ]; then ' +
     'printf \'%s\' \'[{"skill":{"name":"alpha","digest":"d1"}},{"skill":{"name":"beta","digest":"d2"}}]\'\n' +
     "fi\n",
@@ -169,6 +173,32 @@ function recommendationEvents() {
     .map((l) => JSON.parse(l))
     .filter((e) => e.kind === "recommendation")
 }
+
+describe("detect payload contract (#225 r7)", () => {
+  test("detect stdin carries the RAW session id — detect normalizes once", async () => {
+    // `skill-graph detect` is an ingest boundary: it runs
+    // SessionId::normalize on whatever session_id it receives. If the
+    // plugin forwarded its already-normalized `sid`, a non-canonical id
+    // would be transformed a SECOND time (transform outputs match the
+    // reserved shape) and detect-emitted events would carry a different
+    // session_id than plugin-emitted ones — splitting funnel state.
+    const capture = `${fakeBin}.capture`
+    const handlers = await setupPlugin()
+    const after = handlers["tool:execute.after"]
+
+    const raw = "sess!1" // non-canonical: safeSessionID transforms it
+    await after({
+      sessionID: raw,
+      tool: "read",
+      input: { path: "/tmp/skills/foo/SKILL.md" },
+      result: "file contents",
+    })
+
+    const body = JSON.parse(readFileSync(capture, "utf8"))
+    expect(body.session_id).toBe(raw)
+    expect(body.session_id).not.toBe(safeSessionID(raw))
+  })
+})
 
 describe("anonymous session state isolation (#225)", () => {
   test("unattributed prompts share no dedup and queue nothing", async () => {

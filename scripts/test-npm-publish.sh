@@ -8,7 +8,7 @@
 # serves file:// tarballs to the real verify-npm-registry.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-PUB="$(pwd)/scripts/publish-npm.sh"
+PUB="${PUB:-$(pwd)/scripts/publish-npm.sh}"
 
 fails=0
 say() { printf '%s\n' "$*"; }
@@ -20,11 +20,15 @@ trap 'rm -rf "$work"' EXIT
 
 # --- stub npm ----------------------------------------------------------
 # Registry state: $FAKE_NPM_ROOT/{published/<key>,tarballs/<key>.tgz}
-# key = name@version with / and @ flattened. `npm publish` packs the
-# dir exactly like npm (single package/ root) unless
-# FAKE_NPM_TAMPER=1, which ships a tampered tarball to exercise the
-# post-publish identity check.
+# key = name@version with / and @ flattened. `npm publish`/`npm view`
+# are stubbed (no NPM_TOKEN, no network), but `npm pack` DELEGATES TO
+# REAL NPM: the artifact under test must be what npm actually produces,
+# not a stub fabrication — the r7 review found the previous stub masked
+# a real defect (bare "npm/foo" pack args resolve as GitHub repos).
 mkdir -p "$work/bin" "$work/binfail" "$work/registry"
+REAL_NPM="$(command -v npm)"
+[ -n "$REAL_NPM" ] || { echo "real npm not found — required for pack fidelity" >&2; exit 2; }
+export REAL_NPM
 cat > "$work/bin/npm" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -117,21 +121,60 @@ case "${1:-}" in
     echo "PUBLISH $name@$ver" >> "$root/publish.log"
     ;;
   pack)
-    dir="$2"; dest=""
-    while [ $# -gt 0 ]; do [ "$1" = "--pack-destination" ] && { dest="$2"; break; }; shift; done
-    [ -n "$dest" ] || { echo "stub npm pack: no --pack-destination" >&2; exit 2; }
-    name="$(field "$dir" name)"; ver="$(field "$dir" version)"
-    out="$dest/$(key_of "$name")-$ver.tgz"
-    pack_dir "$dir" "$out"
-    echo "$out"
+    # FAKE_NPM_BADPACK fabricates a normalization-colliding member that
+    # real npm cannot be made to emit; FAKE_NPM_DROP_MEMBER repacks a
+    # REAL npm artifact minus one files[] payload to exercise the
+    # artifact member-set check. Everything else uses REAL npm pack.
+    if [ "${FAKE_NPM_BADPACK:-0}" = "1" ]; then
+      dir="$2"; dest=""
+      while [ $# -gt 0 ]; do [ "$1" = "--pack-destination" ] && { dest="$2"; break; }; shift; done
+      [ -n "$dest" ] || { echo "stub npm pack: no --pack-destination" >&2; exit 2; }
+      name="$(field "$dir" name)"; ver="$(field "$dir" version)"
+      out="$dest/$(key_of "$name")-$ver.tgz"
+      FAKE_NPM_BADPACK=0 pack_dir "$dir" "$out"
+      # inject the colliding member into the fabricated tarball
+      tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-badpack.XXXXXX")"
+      tar -xzf "$out" -C "$tmp"
+      printf 'evil\n' > "$tmp/package/evil"
+      tar --transform 's|^package/evil$|package//evil|' -czf "$out" -C "$tmp" package
+      rm -rf "$tmp"
+      echo "$out"
+      exit 0
+    fi
+    if [ "${FAKE_NPM_DROP_MEMBER:-0}" = "1" ]; then
+      # Real pack, then strip one payload member and repack — simulates
+      # an artifact missing a declared files[] entry.
+      dest=""
+      prev=""
+      for a in "$@"; do [ "$prev" = "--pack-destination" ] && dest="$a"; prev="$a"; done
+      [ -n "$dest" ] || { echo "stub npm pack: no --pack-destination" >&2; exit 2; }
+      "$REAL_NPM" "$@" >/dev/null
+      tgz="$(find "$dest" -name '*.tgz' -print -quit)"
+      tmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-drop.XXXXXX")"
+      tar -xzf "$tgz" -C "$tmp"
+      rm -f "$tmp/package/payload.txt"
+      tar -czf "$tgz" -C "$tmp" package
+      rm -rf "$tmp"
+      echo "$tgz"
+      exit 0
+    fi
+    exec "$REAL_NPM" "$@"
     ;;
   *) echo "stub npm: unhandled args: $*" >&2; exit 2 ;;
 esac
 SH
 chmod +x "$work/bin/npm"
-# Variant stub whose publish always fails (matches the whole branch).
-sed 's|^  publish)|  publish) exit 1 ;;|' "$work/bin/npm" > "$work/binfail/npm"
-grep -q 'publish) exit 1' "$work/binfail/npm" || { echo "binfail stub broken" >&2; exit 2; }
+# Variant stub whose `npm publish` always fails while pack/view still
+# work — isolates Phase E2 failure propagation (the previous sed
+# variant broke the case grammar and failed at pack instead).
+cat > "$work/binfail/npm" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = "publish" ]; then
+  echo "stub npm publish: forced failure" >&2
+  exit 1
+fi
+exec "$work/bin/npm" "\$@"
+SH
 chmod +x "$work/binfail/npm"
 export FAKE_NPM_ROOT="$work/registry"
 
@@ -185,7 +228,7 @@ if PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out3" 2>&1; then
   fail "divergent published content was accepted"
 else
   ok "divergent published content rejected"
-  grep -q "refusing to skip" "$work/out3" \
+  grep -q "refusing to publish anything" "$work/out3" \
     && ok "rejection names the skip path" || fail "rejection message unclear"
 fi
 printf 'payload-A-v1\n' > pkgA/payload.txt
@@ -402,6 +445,93 @@ fi
 grep -q 'PUBLISH @test/pkg-a@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
   && grep -q 'PUBLISH @test/pkg-meta@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
   && ok "publish order preserved (dep then dependent)" || fail "order wrong"
+
+# --- round-7 guarantees: real npm pack, slash-relative args, pre-publish
+# registry reconciliation, artifact member-set/identity (#225 r7) ------
+
+echo "== slash-relative package dir packs the LOCAL directory =="
+# Real npm resolves a bare "dir/sub" argument as a GitHub repository
+# spec (github:dir/sub), NOT a filesystem path — verified against npm
+# 11: it runs `git ls-remote ssh://git@github.com/dir/sub.git`. The
+# publish path must therefore never hand npm a non-absolute path.
+reset_registry
+mkdir -p pkgs
+(cd pkgs && mkpkg pkgC "@test/pkg-c" "payload-C-v1")
+if PATH="$work/bin:$PATH" bash "$PUB" pkgs/pkgC >"$work/out19" 2>&1; then
+  ok "slash-relative package dir accepted"
+else
+  fail "slash-relative package dir rejected: $(cat "$work/out19")"
+fi
+grep -q 'PUBLISH @test/pkg-c@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
+  && ok "local package published, not a GitHub fetch" \
+  || fail "publish log wrong: $(cat "$FAKE_NPM_ROOT/publish.log" 2>/dev/null)"
+# The registry tarball must carry THIS fixture's payload — proof the
+# packed artifact came from pkgs/pkgC, not some other source.
+key="$(printf '%s' '@test/pkg-c@1.0.0' | tr '/@' '__')"
+tar -xzOf "$FAKE_NPM_ROOT/tarballs/$key.tgz" package/payload.txt 2>/dev/null \
+  | grep -q 'payload-C-v1' \
+  && ok "registry artifact contains local payload" \
+  || fail "registry artifact content wrong"
+
+echo "== divergent ALREADY-PUBLISHED later package blocks ALL publishes =="
+# pkgB@1.0.0 exists in the registry with DIFFERENT content. The old
+# interleaved Phase E would publish fresh pkgA first and only discover
+# the divergence afterwards — a partial release. E1 reconciliation
+# must reject before a single publish.
+reset_registry
+# Seed a divergent published artifact for pkgB (real pack shape).
+divtmp="$(mktemp -d "${TMPDIR:-/tmp}/sg-div.XXXXXX")"
+mkdir -p "$divtmp/package"
+cp -r pkgB/. "$divtmp/package/"
+printf 'payload-B-DIVERGENT\n' > "$divtmp/package/payload.txt"
+tar -czf "$work/divergent.tgz" -C "$divtmp" package
+rm -rf "$divtmp"
+bkey="$(printf '%s' '@test/pkg-b@1.0.0' | tr '/@' '__')"
+cp "$work/divergent.tgz" "$FAKE_NPM_ROOT/tarballs/$bkey.tgz"
+echo "1.0.0" > "$FAKE_NPM_ROOT/published/$bkey"
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA pkgB >"$work/out20" 2>&1; then
+  fail "divergent pre-published package was accepted"
+else
+  ok "divergent pre-published package rejected"
+  grep -q "refusing to publish anything" "$work/out20" \
+    && ok "rejection names pre-publish reconciliation" || fail "unclear rejection"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "ZERO publishes when a later package diverges" \
+  || fail "partial publish occurred: $(cat "$FAKE_NPM_ROOT/publish.log")"
+
+echo "== identical pre-published later package skips, fresh one publishes =="
+reset_registry
+# Seed an IDENTICAL artifact for pkgB by publishing it once, then
+# rerun pkgA(fresh)+pkgB(published): only pkgA may be published.
+if PATH="$work/bin:$PATH" bash "$PUB" pkgB >"$work/out21" 2>&1; then
+  ok "seed publish of pkgB succeeded"
+else
+  fail "seed publish failed: $(cat "$work/out21")"
+fi
+: > "$FAKE_NPM_ROOT/publish.log"
+if PATH="$work/bin:$PATH" bash "$PUB" pkgA pkgB >"$work/out22" 2>&1; then
+  ok "mixed fresh/published run accepted"
+else
+  fail "mixed run rejected: $(cat "$work/out22")"
+fi
+grep -q 'PUBLISH @test/pkg-a@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
+  && ! grep -q 'PUBLISH @test/pkg-b@1.0.0' "$FAKE_NPM_ROOT/publish.log" \
+  && ok "only the missing package was published" \
+  || fail "publish set wrong: $(cat "$FAKE_NPM_ROOT/publish.log")"
+
+echo "== artifact missing a declared files[] member is rejected =="
+reset_registry
+if FAKE_NPM_DROP_MEMBER=1 PATH="$work/bin:$PATH" bash "$PUB" pkgA >"$work/out23" 2>&1; then
+  fail "artifact missing files[] payload was published"
+else
+  ok "member-set-deficient artifact rejected"
+  grep -q "missing from artifact" "$work/out23" \
+    && ok "rejection names the missing payload" || fail "unclear rejection: $(cat "$work/out23")"
+fi
+[ ! -e "$FAKE_NPM_ROOT/publish.log" ] \
+  && ok "member-set failure prevented ALL publishes" \
+  || fail "partial publish on member-set failure"
 
 if [ "$fails" -gt 0 ]; then
   say "$fails publish-path test(s) FAILED"
