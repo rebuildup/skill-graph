@@ -906,10 +906,14 @@ pub fn classify_tool_access_all(
 ) -> Vec<LoadClassification> {
     let lower = tool.to_ascii_lowercase();
     if lower == "skill" {
+        // Claude Code uses `skill`; OpenCode's native skill tool uses
+        // `id`. The tool-name gate already scopes this branch, so the
+        // generic `id` key is unambiguous here.
         let raw = input
             .get("skill")
             .or_else(|| input.get("name"))
             .or_else(|| input.get("skill_name"))
+            .or_else(|| input.get("id"))
             .and_then(Value::as_str)
             .unwrap_or("");
         return vec![LoadClassification {
@@ -1802,6 +1806,12 @@ mod tests {
         let c = classify_tool_access("Skill", &input, "").unwrap();
         assert_eq!(c.detection, Detection::NativeInvocation);
         assert_eq!(c.skill_name.as_deref(), Some("alpha-skill"));
+
+        // OpenCode's native `skill` tool takes `id`, not `skill`.
+        let input = json!({"id": "api-error-handling"});
+        let c = classify_tool_access("skill", &input, "").unwrap();
+        assert_eq!(c.detection, Detection::NativeInvocation);
+        assert_eq!(c.skill_name.as_deref(), Some("api-error-handling"));
     }
 
     #[test]
