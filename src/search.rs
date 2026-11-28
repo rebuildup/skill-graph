@@ -1128,12 +1128,10 @@ fn terms_tagged(text: &str, en_expand: bool) -> Vec<(String, Rc<str>)> {
                 // English synonym expansion (#319): aliases share the
                 // parent term's provenance so the whole cluster is ONE
                 // evidence unit, matching the CJK bigram+gloss rule.
-                if en_expand {
-                    if let Some(aliases) = en_gloss_aliases(&lower) {
-                        for alias in aliases.split_whitespace() {
-                            if alias.len() >= 2 && !STOPWORDS.contains(&alias) {
-                                out.push((alias.to_string(), source.clone()));
-                            }
+                if en_expand && let Some(aliases) = en_gloss_aliases(&lower) {
+                    for alias in aliases.split_whitespace() {
+                        if alias.len() >= 2 && !STOPWORDS.contains(&alias) {
+                            out.push((alias.to_string(), source.clone()));
                         }
                     }
                 }
